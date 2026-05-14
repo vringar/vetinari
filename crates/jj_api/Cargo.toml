@@ -1,0 +1,15 @@
+[package]
+name = "vetinari-jj-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Insulation layer between the orchestrator and jj-lib (REQ-1c). Real adapter
+# surface lands in crosslink issue #4 (F4). F1 carries only the crate identity.
+
+[dependencies]
+vetinari-error.workspace = true
+miette = { workspace = true }
+thiserror = { workspace = true }

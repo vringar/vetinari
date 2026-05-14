@@ -1,0 +1,19 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Build-script style helper binary. The no-shell-out lint (AC-24, REQ-1a) lands
+# in crosslink issue #6 (F6). F1 carries only the crate skeleton.
+
+[dependencies]
+miette = { workspace = true }
+anyhow = "1.0"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"

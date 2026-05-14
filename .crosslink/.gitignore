@@ -1,0 +1,13 @@
+# Multi-agent collaboration (machine-local)
+agent.json
+repo-id
+.hub-cache/
+.knowledge-cache/
+# per-machine hydration marker (last git ref issues.db was hydrated from)
+.last-hydrated-ref
+keys/
+integrations/
+
+# Machine-local overrides
+hook-config.local.json
+rules.local/

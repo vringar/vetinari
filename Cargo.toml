@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/orchestrator",
+    "crates/crosslink_api",
+    "crates/jj_api",
+    "crates/error",
+    "crates/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vringar/vetinari"
+
+[workspace.dependencies]
+miette = { version = "7.2", features = ["fancy"] }
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Internal crates
+vetinari-error = { path = "crates/error" }
+vetinari-crosslink-api = { path = "crates/crosslink_api" }
+vetinari-jj-api = { path = "crates/jj_api" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+debug = 1

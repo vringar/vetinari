@@ -1,0 +1,17 @@
+[package]
+name = "vetinari-crosslink-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate is the insulation layer between the orchestrator and crosslink's
+# Rust crates (REQ-3a). It is intentionally minimal in F1 — the real adapter
+# surface lands in #3 (F3: crosslink_api insulation crate). For now it carries
+# only the crate identity so the workspace builds.
+
+[dependencies]
+vetinari-error.workspace = true
+miette = { workspace = true }
+thiserror = { workspace = true }

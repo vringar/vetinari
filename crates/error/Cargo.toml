@@ -1,0 +1,17 @@
+[package]
+name = "vetinari-error"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+miette = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "dep:serde_json"]
