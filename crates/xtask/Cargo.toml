@@ -7,12 +7,14 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-# Build-script style helper binary. The no-shell-out lint (AC-24, REQ-1a) lands
-# in crosslink issue #6 (F6). F1 carries only the crate skeleton.
+# Repo-local maintenance helper. The `lint` subcommand is the no-shell-out hard
+# lint (AC-24, REQ-1a): a build-failing CI gate. It parses orchestrator-side
+# crates with `syn` rather than grepping, so comments and doc strings can never
+# false-positive and `#[cfg(test)]` code can be exempted precisely.
 
 [dependencies]
-miette = { workspace = true }
-anyhow = "1.0"
+syn = { version = "2.0", features = ["full", "visit"] }
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
 
 [[bin]]
 name = "xtask"

@@ -45,11 +45,11 @@ test:
         cargo test --workspace; \
     fi
 
-# Format check + clippy (deny warnings) + xtask lint (when implemented).
+# Format check + clippy (deny warnings) + xtask no-shell-out lint (AC-24).
 #
-# `xtask lint` exits 2 when the subcommand is recognized but not yet
-# implemented; we let that pass. Exit 1 (or any other non-zero) is a real
-# failure that should fail the recipe.
+# `xtask lint` exits 0 (clean) or 1 (forbidden shell-out found). Exit 2 is
+# reserved for xtask subcommands that are recognized but not yet implemented
+# and is treated as a clean skip; any other non-zero code fails the recipe.
 lint:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings

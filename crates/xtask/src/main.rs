@@ -1,16 +1,19 @@
 //! `xtask` — repo-local maintenance commands.
 //!
-//! The no-shell-out lint (AC-24, REQ-1a) lands in crosslink issue #6. For F1
-//! the binary exists so the workspace produces a discoverable
-//! `target/debug/xtask` that `just lint` and friends can target once #6
-//! implements the subcommands. Until then unknown subcommands exit `2` so the
-//! just recipe can distinguish "not yet implemented" (skip cleanly) from "lint
-//! found violations" (fail the build).
+//! `xtask lint` runs the no-shell-out audit (REQ-1a, AC-24): it parses every
+//! orchestrator-side crate's `src/` tree and fails the build if any non-test
+//! code constructs a `std::process::Command` targeting `jj`, `git`, `gh`,
+//! `crosslink`, or `zellij`. Those operations must go through library
+//! bindings; shelling out to them is the regression this gate prevents.
 
 use std::process::ExitCode;
 
-/// Exit code used for "subcommand is recognized but not yet implemented".
-/// `just lint` treats this as a skip; any other non-zero is a real failure.
+mod lint;
+
+/// Exit code for an `xtask` subcommand that is recognized but not yet
+/// implemented. `just lint` treats this as a clean skip; any other non-zero
+/// code is a real failure. No current subcommand returns it — it is kept so
+/// future subcommands can land incrementally without breaking the recipe.
 const EXIT_NOT_IMPLEMENTED: u8 = 2;
 
 fn main() -> ExitCode {
@@ -20,12 +23,7 @@ fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
-        Some("lint") => {
-            eprintln!(
-                "xtask lint: not yet implemented (lands in crosslink issue #6, F6). Skipping."
-            );
-            ExitCode::from(EXIT_NOT_IMPLEMENTED)
-        }
+        Some("lint") => lint::run(),
         Some(other) => {
             eprintln!("xtask: unknown subcommand `{other}` (try `xtask help`)");
             ExitCode::FAILURE
@@ -38,9 +36,12 @@ fn print_help() {
     println!();
     println!("Usage: xtask <command>");
     println!();
-    println!("Commands (all unimplemented until #6 lands):");
+    println!("Commands:");
     println!("  lint    no-shell-out audit (REQ-1a, AC-24)");
+    println!("  help    show this message");
     println!();
-    println!("This is a skeleton from #1 (F1). See crosslink issue #6 for the");
-    println!("implementation that wires real subcommands.");
+    println!(
+        "Recognized-but-unimplemented subcommands exit {EXIT_NOT_IMPLEMENTED}; \
+         `just lint` skips that cleanly."
+    );
 }
