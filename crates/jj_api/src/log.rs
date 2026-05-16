@@ -25,6 +25,9 @@ pub struct CommitInfo {
     pub author_email: String,
     /// Full commit ids of this commit's parents.
     pub parent_ids: Vec<String>,
+    /// Whether this commit's tree contains conflicts. The orchestrator uses
+    /// this to detect a rebase that produced conflict markers (REQ-19).
+    pub has_conflict: bool,
 }
 
 impl CommitInfo {
@@ -38,6 +41,7 @@ impl CommitInfo {
             author_name: author.name.clone(),
             author_email: author.email.clone(),
             parent_ids: commit.parent_ids().iter().map(ObjectId::hex).collect(),
+            has_conflict: commit.has_conflict(),
         }
     }
 }
