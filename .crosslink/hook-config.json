@@ -102,6 +102,6 @@
   "sentinel.escalation.model": "(text)",
   "sentinel.sources.github_labels.enabled": false,
   "signing_enforcement": "disabled",
-  "tracker_remote": "(text)",
+  "tracker_remote": "origin",
   "tracking_mode": "relaxed"
 }

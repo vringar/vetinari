@@ -11,4 +11,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- F6: xtask — no-shell-out hard lint (AC-24) + workspace lint (#6)
 - F1: Project skeleton (flake.nix + cargo workspace + just + error crate) (#1)
