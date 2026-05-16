@@ -23,6 +23,17 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# jj-lib's API is async-heavy; the jj_api insulation crate presents a
+# synchronous surface to the orchestrator by driving futures to completion on
+# the current thread (pollster) — no tokio runtime is pulled into the binary.
+pollster = "0.4"
+futures = "0.3"
+tempfile = "3"
+# Only the `clock` feature is needed: jj-lib's revset parser requires a
+# `DatePatternContext` built from a `chrono` timestamp. The 0.4 requirement
+# unifies with the `chrono` jj-lib itself pulls in.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 # jj-lib is resolved from the pinned jujutsu source tree, not crates.io: the
 # `[patch.crates-io]` block in the generated `.cargo/config.toml` (see
 # `just bootstrap`) redirects it to `$JJ_SRC/lib`. The version requirement

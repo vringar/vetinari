@@ -6,13 +6,25 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Insulation layer between the orchestrator and jj-lib (REQ-1c). Real adapter
-# surface lands in crosslink issue #4 (F4). F1 carries only the crate identity.
+# Insulation layer between the orchestrator and jj-lib (REQ-1c). All jj-lib API
+# churn is contained to this crate: the rest of the orchestrator depends only
+# on the stable adapter surface and the self-contained `JjError` defined here,
+# never on jj-lib types directly.
 
 [dependencies]
-vetinari-error.workspace = true
 miette = { workspace = true }
 thiserror = { workspace = true }
 # Resolved to the pinned jujutsu source via `.cargo/config.toml` (see the
 # workspace manifest and `just bootstrap`).
 jj-lib = { workspace = true }
+# jj-lib operations are `async`; pollster drives them on the current thread so
+# the adapter surface stays synchronous (REQ-1a — no tokio in the orchestrator).
+pollster = { workspace = true }
+# Stream/TryStream adapters for revset and tree-diff iteration.
+futures = { workspace = true }
+# Supplies the timestamp jj-lib's revset parser needs (DatePatternContext).
+chrono = { workspace = true }
+
+[dev-dependencies]
+# AC-25 integration test builds a throwaway repository on disk.
+tempfile = { workspace = true }

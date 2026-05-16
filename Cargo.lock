@@ -2694,10 +2694,13 @@ dependencies = [
 name = "vetinari-jj-api"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "futures",
  "jj-lib",
  "miette",
+ "pollster",
+ "tempfile",
  "thiserror 1.0.69",
- "vetinari-error",
 ]
 
 [[package]]
