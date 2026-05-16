@@ -13,3 +13,6 @@ repository.workspace = true
 vetinari-error.workspace = true
 miette = { workspace = true }
 thiserror = { workspace = true }
+# Resolved to the pinned jujutsu source via `.cargo/config.toml` (see the
+# workspace manifest and `just bootstrap`).
+jj-lib = { workspace = true }

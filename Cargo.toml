@@ -23,6 +23,13 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# jj-lib is resolved from the pinned jujutsu source tree, not crates.io: the
+# `[patch.crates-io]` block in the generated `.cargo/config.toml` (see
+# `just bootstrap`) redirects it to `$JJ_SRC/lib`. The version requirement
+# here must match the pinned jujutsu; a mismatch surfaces as a hard cargo
+# error, which is the intended signal to file a pin-bump issue (REQ-1c).
+jj-lib = "0.41.0"
+
 # Internal crates
 vetinari-error = { path = "crates/error" }
 vetinari-crosslink-api = { path = "crates/crosslink_api" }
