@@ -27,9 +27,11 @@ mod rebase;
 mod revset;
 mod status;
 mod workspace;
+mod workspaces;
 
 pub use bookmark::BookmarkInfo;
 pub use error::{JjError, Result};
 pub use log::CommitInfo;
 pub use status::{ChangeKind, FileChange, WorkspaceStatus};
 pub use workspace::JjWorkspace;
+pub use workspaces::WorkspaceEntry;
