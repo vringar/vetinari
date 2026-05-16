@@ -23,6 +23,7 @@ mod describe;
 mod diff;
 mod error;
 mod log;
+mod push;
 mod rebase;
 mod revset;
 mod status;
