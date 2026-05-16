@@ -2694,6 +2694,7 @@ dependencies = [
 name = "vetinari-jj-api"
 version = "0.1.0"
 dependencies = [
+ "bstr",
  "chrono",
  "futures",
  "jj-lib",

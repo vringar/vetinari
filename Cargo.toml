@@ -33,6 +33,9 @@ tempfile = "3"
 # `DatePatternContext` built from a `chrono` timestamp. The 0.4 requirement
 # unifies with the `chrono` jj-lib itself pulls in.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# jj-lib's diff API hands back `bstr` byte-string types; the 1.x requirement
+# unifies with the `bstr` jj-lib pulls in.
+bstr = "1.12"
 
 # jj-lib is resolved from the pinned jujutsu source tree, not crates.io: the
 # `[patch.crates-io]` block in the generated `.cargo/config.toml` (see

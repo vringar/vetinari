@@ -18,6 +18,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod diff;
 mod error;
 mod log;
 mod revset;

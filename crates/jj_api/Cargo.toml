@@ -24,6 +24,8 @@ pollster = { workspace = true }
 futures = { workspace = true }
 # Supplies the timestamp jj-lib's revset parser needs (DatePatternContext).
 chrono = { workspace = true }
+# Byte-string types that appear in jj-lib's diff API.
+bstr = { workspace = true }
 
 [dev-dependencies]
 # AC-25 integration test builds a throwaway repository on disk.

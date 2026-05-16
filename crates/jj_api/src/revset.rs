@@ -83,6 +83,23 @@ impl JjWorkspace {
             source: Box::new(source),
         })
     }
+
+    /// Resolve `revset_str` to exactly one commit, erroring if it matches zero
+    /// or more than one. Write operations (`describe`, `rebase`, bookmark
+    /// moves) and `diff` endpoints require an unambiguous target.
+    pub(crate) fn resolve_single(&self, repo: &dyn Repo, revset_str: &str) -> Result<Commit> {
+        let mut commits = self.evaluate_revset(repo, revset_str)?;
+        match commits.len() {
+            0 => Err(JjError::NoSuchRevision {
+                revset: revset_str.to_owned(),
+            }),
+            1 => Ok(commits.pop().expect("length checked to be 1")),
+            count => Err(JjError::AmbiguousRevision {
+                revset: revset_str.to_owned(),
+                count,
+            }),
+        }
+    }
 }
 
 /// Translate a resolution failure: a "no such revision" becomes the dedicated
