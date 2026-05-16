@@ -21,8 +21,10 @@
 mod error;
 mod log;
 mod revset;
+mod status;
 mod workspace;
 
 pub use error::{JjError, Result};
 pub use log::CommitInfo;
+pub use status::{ChangeKind, FileChange, WorkspaceStatus};
 pub use workspace::JjWorkspace;
