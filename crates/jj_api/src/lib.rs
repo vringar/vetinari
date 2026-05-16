@@ -18,6 +18,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod bookmark;
 mod describe;
 mod diff;
 mod error;
@@ -26,6 +27,7 @@ mod revset;
 mod status;
 mod workspace;
 
+pub use bookmark::BookmarkInfo;
 pub use error::{JjError, Result};
 pub use log::CommitInfo;
 pub use status::{ChangeKind, FileChange, WorkspaceStatus};
