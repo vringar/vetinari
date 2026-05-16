@@ -28,5 +28,9 @@ chrono = { workspace = true }
 bstr = { workspace = true }
 
 [dev-dependencies]
-# AC-25 integration test builds a throwaway repository on disk.
+# AC-25 integration test builds a throwaway repository on disk. An integration
+# test is a separate crate, so the deps it shares with the adapter — used here
+# only to construct the fixture repository — must be redeclared.
 tempfile = { workspace = true }
+jj-lib = { workspace = true }
+pollster = { workspace = true }

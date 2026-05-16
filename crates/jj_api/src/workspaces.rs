@@ -98,8 +98,20 @@ impl JjWorkspace {
             .map_err(|source| workspace_forget_error(name, source))?;
 
         let mut tx = repo.start_transaction();
-        pollster::block_on(tx.repo_mut().remove_wc_commit(&name_buf))
-            .map_err(|source| workspace_forget_error(name, source))?;
+        pollster::block_on(async {
+            // remove_wc_commit abandons the working-copy commit if it is
+            // discardable, which is a rewrite — descendants must be rebased
+            // before the transaction can be committed.
+            tx.repo_mut()
+                .remove_wc_commit(&name_buf)
+                .await
+                .map_err(|source| workspace_forget_error(name, source))?;
+            tx.repo_mut()
+                .rebase_descendants()
+                .await
+                .map_err(|source| workspace_forget_error(name, source))?;
+            Ok::<(), JjError>(())
+        })?;
         workspace_store
             .forget(&[name_buf.as_ref()])
             .map_err(|source| workspace_forget_error(name, source))?;
