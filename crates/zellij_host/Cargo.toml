@@ -1,0 +1,20 @@
+[package]
+name = "vetinari-zellij-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Worker-host adapter (REQ-1d). Wraps the `zellij` CLI behind a stable surface
+# so the orchestrator hosts each worker in a named zellij pane. Driving zellij
+# via its CLI — rather than the `zellij-server`/`zellij-utils` library crates —
+# is a deliberate, scoped exception to REQ-1a; see REQ-1d in
+# `.design/vdd-orchestrator.md` for the rationale. This is the one crate the
+# AC-24 no-shell-out lint does not scan.
+
+[dependencies]
+miette = { workspace = true }
+thiserror = { workspace = true }
+# `zellij action list-panes --json` output is parsed for pane liveness.
+serde_json = { workspace = true }

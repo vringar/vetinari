@@ -4,6 +4,7 @@ members = [
     "crates/orchestrator",
     "crates/crosslink_api",
     "crates/jj_api",
+    "crates/zellij_host",
     "crates/error",
     "crates/xtask",
 ]
@@ -48,6 +49,7 @@ jj-lib = "0.41.0"
 vetinari-error = { path = "crates/error" }
 vetinari-crosslink-api = { path = "crates/crosslink_api" }
 vetinari-jj-api = { path = "crates/jj_api" }
+vetinari-zellij-host = { path = "crates/zellij_host" }
 
 [profile.release]
 lto = "thin"
