@@ -24,8 +24,10 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod pane;
 mod session;
 mod zellij;
 
 pub use error::{Result, ZellijError};
+pub use pane::{pane_alive, pane_close, pane_create, PaneHandle};
 pub use session::{session_ensure, SessionHandle};
