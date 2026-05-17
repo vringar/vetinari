@@ -48,3 +48,12 @@ Cargo.lock.bak
 # Local crossbridge socket roots / test artifacts
 /tmp-crossbridge/
 
+# Orchestrator runtime state. `.orchestrator/` also holds committed templates
+# (config.toml, static_qa.sh, prompts/); only these per-run artifacts are
+# machine-local and never committed.
+.orchestrator/state.db
+.orchestrator/state.db-wal
+.orchestrator/state.db-shm
+.orchestrator/events.jsonl
+.orchestrator/heartbeat-*.json
+

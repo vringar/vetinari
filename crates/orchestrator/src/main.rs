@@ -26,6 +26,15 @@ fn main() -> miette::Result<()> {
         })?;
     tracing::info!(claude_sandbox = %pinned, "claude-sandbox pin resolved");
 
+    // REQ-2 / AC-2: the orchestrator's authoritative state lives in
+    // `.orchestrator/state.db`. Open (and, on first run, migrate) it now so a
+    // missing or unwritable state directory fails fast at startup rather than
+    // mid-tick. The pump (#15) takes ownership of the handle; the skeleton
+    // only proves the migration runs.
+    let state_path = std::path::PathBuf::from(".orchestrator/state.db");
+    orchestrator::state::StateDb::open(&state_path)?;
+    tracing::info!(state_db = %state_path.display(), "state.db ready (schema migrated)");
+
     tracing::warn!("orchestrator is a skeleton — pump, spawn, landing all unimplemented (see crosslink issues #8..#19)");
     Ok(())
 }

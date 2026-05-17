@@ -58,6 +58,11 @@ pub enum OrchestratorError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Artifact(#[from] ArtifactError),
+
+    /// Failure in the SQLite-backed `state.db` layer — see [`StateError`].
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    State(#[from] StateError),
 }
 
 /// Convenience `Result` alias.
@@ -514,6 +519,65 @@ pub enum ArtifactError {
 }
 
 // ============================================================================
+// State persistence errors (REQ-2, REQ-2a, REQ-3b, AC-2)
+// ============================================================================
+
+/// Errors raised by the SQLite-backed `state.db` layer.
+///
+/// `state.db` is the orchestrator's authoritative state (REQ-2). A failure
+/// here means the orchestrator can no longer trust its own bookkeeping, so it
+/// stops the whole run rather than mis-routing a single issue.
+#[derive(Debug, Error, Diagnostic)]
+#[non_exhaustive]
+pub enum StateError {
+    /// The `state.db` file (or its parent directory) could not be created or
+    /// opened.
+    #[error("could not open state.db at `{path}`")]
+    #[diagnostic(
+        code(vetinari::state::open),
+        help(
+            "Check that `.orchestrator/` is writable and not locked by another orchestrator process."
+        )
+    )]
+    Open {
+        /// Path the orchestrator tried to open.
+        path: PathBuf,
+        /// Underlying SQLite or I/O error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// A schema migration failed to apply, or the database is at a schema
+    /// version newer than this binary understands.
+    #[error("state.db migration to schema v{target_version} failed")]
+    #[diagnostic(
+        code(vetinari::state::migration),
+        help("The schema is forward-only — never run an older orchestrator against a newer state.db. A failed migration leaves the database on its prior version.")
+    )]
+    Migration {
+        /// Schema version the migration was advancing to.
+        target_version: u32,
+        /// Underlying cause.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// A read or write against `state.db` failed.
+    #[error("state.db operation failed ({context})")]
+    #[diagnostic(
+        code(vetinari::state::query),
+        help("`context` names the failing operation; the source carries the SQLite detail. An unrecognized enum value here means the database was written by a newer binary.")
+    )]
+    Query {
+        /// Human-readable name of the failing operation, e.g. `upsert issue`.
+        context: String,
+        /// Underlying SQLite (or payload (de)serialization) error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+}
+
+// ============================================================================
 // Convenience constructors
 // ============================================================================
 
@@ -569,6 +633,9 @@ mod tests {
             "vetinari::artifact::checksum_mismatch",
             "vetinari::artifact::read_failed",
             "vetinari::artifact::duplicate_posting",
+            "vetinari::state::open",
+            "vetinari::state::migration",
+            "vetinari::state::query",
         ];
         let mut seen = std::collections::HashSet::new();
         for c in codes {

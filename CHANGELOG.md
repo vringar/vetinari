@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- F2: state.db schema (issues/active_workers/posted_artifacts/events) + recovery scaffolding (#2)
 - F3: crosslink_api insulation crate (#3)
 - F5: zellij_host crate — IPC client wrapper (#5)
 - F4: jj_api insulation crate (#4)

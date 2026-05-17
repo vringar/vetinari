@@ -17,6 +17,17 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = "1.0"
+# `bundled` compiles a vendored SQLite into the binary: the orchestrator's
+# state.db schema is then independent of whatever libsqlite3 the host carries
+# (REQ-2). rusqlite's synchronous API matches the single-threaded tick loop —
+# no async runtime is pulled in. The version MUST track the `rusqlite` that the
+# pinned `crosslink` source depends on: `libsqlite3-sys` carries `links =
+# "sqlite3"`, so the whole dependency graph must resolve to one copy. A version
+# mismatch surfaces as a hard cargo `links` conflict — the signal to re-align.
+rusqlite = { version = "0.38", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [[bin]]
 name = "orchestrator"
