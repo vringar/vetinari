@@ -29,9 +29,17 @@ use syn::visit::Visit;
 /// subprocess, in orchestrator-side code.
 const BANNED: &[&str] = &["jj", "git", "gh", "crosslink", "zellij"];
 
-/// Crates under `crates/` that the audit does not scan. `xtask` is itself a
-/// dev tool, not orchestrator runtime code, so it is free to shell out.
-const EXEMPT_CRATES: &[&str] = &["xtask"];
+/// Crates under `crates/` that the audit does not scan.
+///
+/// - `xtask` is itself a dev tool, not orchestrator runtime code, so it is
+///   free to shell out.
+/// - `zellij_host` deliberately drives the `zellij` CLI as a subprocess: a
+///   feasibility spike found zellij's library crates cannot host worker panes
+///   without a daemonized server process and offer no per-pane environment
+///   API. This is a scoped exception to REQ-1a, recorded in REQ-1d of
+///   `.design/vdd-orchestrator.md`; the orchestrator core still reaches zellij
+///   only through `zellij_host`'s adapter surface.
+const EXEMPT_CRATES: &[&str] = &["xtask", "zellij_host"];
 
 /// A single forbidden `Command::new(...)` call site.
 struct Violation {
