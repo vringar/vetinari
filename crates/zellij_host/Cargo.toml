@@ -18,3 +18,7 @@ miette = { workspace = true }
 thiserror = { workspace = true }
 # `zellij action list-panes --json` output is parsed for pane liveness.
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# AC-27 integration test uses a throwaway working directory for the worker.
+tempfile = { workspace = true }
