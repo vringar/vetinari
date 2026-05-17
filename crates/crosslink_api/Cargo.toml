@@ -15,7 +15,13 @@ repository.workspace = true
 miette = { workspace = true }
 thiserror = { workspace = true }
 # The crosslink library crate. crosslink is not published to crates.io, so it
-# is a path dependency through the `.crosslink-src` symlink that `just
-# bootstrap` points at the npins-pinned crosslink source (see the workspace
-# justfile and shell.nix). Bump via `npins update crosslink`.
+# is a path dependency through the `.crosslink-src` tree that `just bootstrap`
+# copies from the npins-pinned crosslink source (see the workspace justfile and
+# shell.nix). Bump via `npins update crosslink`.
 crosslink = { path = "../../.crosslink-src/crosslink" }
+
+[dev-dependencies]
+# The integration test builds a throwaway crosslink repository on disk; an
+# integration test is a separate crate, so it redeclares these.
+crosslink = { path = "../../.crosslink-src/crosslink" }
+tempfile = { workspace = true }
