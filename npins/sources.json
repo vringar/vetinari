@@ -1,5 +1,18 @@
 {
   "pins": {
+    "crosslink": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "forecast-bio",
+        "repo": "crosslink"
+      },
+      "branch": "develop",
+      "submodules": false,
+      "revision": "571343ba8e0ef5b26b943612f635c42cc8953c8f",
+      "url": "https://github.com/forecast-bio/crosslink/archive/571343ba8e0ef5b26b943612f635c42cc8953c8f.tar.gz",
+      "hash": "sha256-8rsZEJTfEY85cP7RCSLSL7zvZhbkYlG90izsArxCkSs="
+    },
     "nixpkgs": {
       "type": "Git",
       "repository": {

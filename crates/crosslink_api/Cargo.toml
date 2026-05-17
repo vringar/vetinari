@@ -6,12 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# This crate is the insulation layer between the orchestrator and crosslink's
-# Rust crates (REQ-3a). It is intentionally minimal in F1 — the real adapter
-# surface lands in #3 (F3: crosslink_api insulation crate). For now it carries
-# only the crate identity so the workspace builds.
+# Insulation layer between the orchestrator and crosslink's Rust crates
+# (REQ-3a). All crosslink API churn is contained to this crate: the rest of the
+# orchestrator depends only on the stable adapter surface and the self-contained
+# `CrosslinkError` defined here, never on crosslink types directly.
 
 [dependencies]
-vetinari-error.workspace = true
 miette = { workspace = true }
 thiserror = { workspace = true }
+# The crosslink library crate. crosslink is not published to crates.io, so it
+# is a path dependency through the `.crosslink-src` symlink that `just
+# bootstrap` points at the npins-pinned crosslink source (see the workspace
+# justfile and shell.nix). Bump via `npins update crosslink`.
+crosslink = { path = "../../.crosslink-src/crosslink" }
