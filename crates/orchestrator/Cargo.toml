@@ -10,6 +10,7 @@ repository.workspace = true
 vetinari-error.workspace = true
 vetinari-crosslink-api.workspace = true
 vetinari-jj-api.workspace = true
+vetinari-zellij-host.workspace = true
 miette = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

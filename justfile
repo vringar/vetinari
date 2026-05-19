@@ -95,9 +95,14 @@ lint:
 fmt:
     cargo fmt --all
 
-# Run the orchestrator against this repo. The full pump-driven behavior lands
-# across #7..#19. For now this just runs the skeleton main() so we can confirm
-# the toolchain end-to-end.
+# Run the orchestrator against this repo. On startup it ensures the long-lived
+# headless zellij session `vdd-orchestrator` exists (REQ-1d, #7) — created on
+# first run, reused afterwards. Inspect a running worker live by attaching to
+# it from another terminal:
+#
+#     zellij attach vdd-orchestrator
+#
+# The full pump-driven behavior lands across #8..#19.
 orchestrate:
     cargo run --release -p orchestrator
 

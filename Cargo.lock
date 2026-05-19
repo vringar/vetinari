@@ -3014,6 +3014,7 @@ dependencies = [
  "vetinari-crosslink-api",
  "vetinari-error",
  "vetinari-jj-api",
+ "vetinari-zellij-host",
 ]
 
 [[package]]

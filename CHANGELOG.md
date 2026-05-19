@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Z1: orchestrator startup ensures the headless `vdd-orchestrator` zellij session (#7)
 - F2: state.db schema (issues/active_workers/posted_artifacts/events) + recovery scaffolding (#2)
 - F3: crosslink_api insulation crate (#3)
 - F5: zellij_host crate — IPC client wrapper (#5)

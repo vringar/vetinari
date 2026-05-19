@@ -1,5 +1,11 @@
 use miette::IntoDiagnostic;
 use tracing_subscriber::EnvFilter;
+use vetinari_error::SpawnError;
+
+/// Name of the long-lived headless zellij session that hosts every worker
+/// pane (REQ-1d). Fixed, not configurable — humans and other agents rely on
+/// it to `zellij attach` for live inspection.
+const SESSION_NAME: &str = "vdd-orchestrator";
 
 fn main() -> miette::Result<()> {
     tracing_subscriber::fmt()
@@ -34,6 +40,20 @@ fn main() -> miette::Result<()> {
     let state_path = std::path::PathBuf::from(".orchestrator/state.db");
     orchestrator::state::StateDb::open(&state_path)?;
     tracing::info!(state_db = %state_path.display(), "state.db ready (schema migrated)");
+
+    // REQ-1d / issue #7: every worker is hosted in a pane of a long-lived
+    // headless zellij session. Ensure it exists now (create-or-attach is
+    // idempotent) so each worker spawn (#8) only has to add a pane.
+    vetinari_zellij_host::session_ensure(SESSION_NAME).map_err(|e| {
+        SpawnError::ZellijSessionUnavailable {
+            session_name: SESSION_NAME.to_string(),
+            source: Some(Box::new(e)),
+        }
+    })?;
+    tracing::info!(
+        session = SESSION_NAME,
+        "zellij worker-host session ready — run `zellij attach vdd-orchestrator` to inspect workers live"
+    );
 
     tracing::warn!("orchestrator is a skeleton — pump, spawn, landing all unimplemented (see crosslink issues #8..#19)");
     Ok(())
