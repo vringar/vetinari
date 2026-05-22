@@ -48,6 +48,9 @@ Cargo.lock.bak
 # Local crossbridge socket roots / test artifacts
 /tmp-crossbridge/
 
+# direnv + nix-direnv per-machine cache (created by `direnv allow`)
+.direnv/
+
 # Orchestrator runtime state. `.orchestrator/` also holds committed templates
 # (config.toml, static_qa.sh, prompts/); only these per-run artifacts are
 # machine-local and never committed.
