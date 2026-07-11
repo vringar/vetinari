@@ -46,6 +46,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # jj-lib's diff API hands back `bstr` byte-string types; the 1.x requirement
 # unifies with the `bstr` jj-lib pulls in.
 bstr = "1.12"
+# Short unique suffixes for per-worker workspace names (REQ-12). Only the `v4`
+# generator is needed; the version unifies with the `uuid` jj-lib already pulls
+# in so the whole graph resolves to one copy.
+uuid = { version = "1", features = ["v4"] }
 
 # jj-lib is resolved from the pinned jujutsu source tree, not crates.io: the
 # `[patch.crates-io]` block in the generated `.cargo/config.toml` (see

@@ -26,9 +26,15 @@ anyhow = "1.0"
 # "sqlite3"`, so the whole dependency graph must resolve to one copy. A version
 # mismatch surfaces as a hard cargo `links` conflict — the signal to re-align.
 rusqlite = { version = "0.38", features = ["bundled"] }
+# Short unique suffixes for per-worker workspace names (REQ-12, workspace.rs).
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Property-based tests for the workspace-name scheme (round-trip, collision-
+# freedom, filesystem-safety) and idempotent-cleanup observational equivalence.
+# `kani` is unavailable in the dev shell, so proptest is the proof tool.
+proptest = "1"
 
 [[bin]]
 name = "orchestrator"

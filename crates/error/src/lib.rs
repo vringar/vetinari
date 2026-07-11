@@ -187,6 +187,23 @@ pub enum SpawnError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A `jj_api` workspace-lifecycle operation (add / forget / list) failed
+    /// while the spawn helper was preparing a worker's workspace (REQ-12). The
+    /// underlying `jj-lib` cause is wrapped by `jj_api`; this adds the
+    /// workspace path for context.
+    #[error("jj workspace preparation failed for `{path}`")]
+    #[diagnostic(
+        code(vetinari::spawn::workspace_prep),
+        help("Inspect `jj op log` and the workspace path; a prior crash may have left the repository view inconsistent.")
+    )]
+    WorkspacePrep {
+        /// Workspace directory being prepared.
+        path: PathBuf,
+        /// Underlying `jj_api` cause.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 }
 
 // ============================================================================
@@ -613,6 +630,7 @@ mod tests {
             "vetinari::spawn::bwrap_failed",
             "vetinari::spawn::hook_config_missing",
             "vetinari::spawn::io",
+            "vetinari::spawn::workspace_prep",
             "vetinari::qa::script_not_found",
             "vetinari::qa::script_errored",
             "vetinari::qa::tool_non_zero",
