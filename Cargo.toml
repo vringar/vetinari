@@ -13,7 +13,10 @@ members = [
 # this exclude cargo would adopt the `crosslink` path dependency as an implicit
 # workspace member — building and linting crosslink's own code. It must stay a
 # plain dependency.
-exclude = [".crosslink-src"]
+# `tests/fixtures/hello` is the dogfood fixture crate (AC-11a). It is copied
+# into a temp dir and built there by the build_fixture() test helper; excluding
+# it keeps `cargo build --workspace` from adopting it as a member.
+exclude = [".crosslink-src", "tests/fixtures/hello"]
 
 [workspace.package]
 version = "0.1.0"

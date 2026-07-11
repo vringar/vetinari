@@ -1,0 +1,15 @@
+# Build output.
+/target
+
+# Orchestrator worker scratch: inputs (task.md, diff.patch) and outputs
+# (result.md, findings.jsonl, progress.jsonl, DONE) live here. The orchestrator
+# reads them straight off the workspace filesystem; they must never be snapshot
+# into the Implementer's change, or they would land on `main` (REQ-3, REQ-17).
+/_orchestrator/
+
+# Orchestrator runtime state, written to `.orchestrator/` in the repo root
+# (state.db, events.jsonl, heartbeat-*.json). Same bug class as the worker
+# scratch above: a QA or landing run must not snapshot these into a change. The
+# committed `.orchestrator/static_qa.sh` is whitelisted back in below.
+/.orchestrator/*
+!/.orchestrator/static_qa.sh

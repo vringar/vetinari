@@ -1,0 +1,14 @@
+# Fixture crate for the orchestrator dogfood (AC-11a).
+#
+# This is NOT a member of the vetinari workspace. `build_fixture()` (see
+# crates/orchestrator/tests/common/mod.rs) copies this tree into a temp dir,
+# stands up a jj + crosslink repo around it, and builds it there. The workspace
+# root lists `tests/fixtures/hello` in its `exclude` so a bare
+# `cargo build --workspace` never adopts it as a member.
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
