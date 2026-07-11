@@ -487,6 +487,55 @@ pub enum ArtifactError {
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
+    /// The `_orchestrator/DONE` sentinel exists but its JSON body is not
+    /// well-formed against the REQ-3b schema (`{"exit_status": ..,
+    /// "artifacts": [{"path": .., "sha256": ..}]}`). This is the AC-23
+    /// torn-write class where DONE itself landed half-written; treat as crash.
+    #[error("DONE sentinel at `{path}` is malformed: {reason}")]
+    #[diagnostic(
+        code(vetinari::artifact::done_malformed),
+        help("DONE was written truncated or with the wrong shape. Re-spawn the worker from the prior phase.")
+    )]
+    DoneMalformed {
+        /// Path to the `_orchestrator/DONE` file.
+        path: PathBuf,
+        /// One-line summary of what failed to parse.
+        reason: String,
+    },
+
+    /// The DONE sentinel lists an artifact path that is not confined to the
+    /// worker's workspace — absolute, or escaping via `..`. `verify` runs
+    /// orchestrator-side (outside the sandbox), so joining such a path would let
+    /// a garbled or malicious worker DONE point the orchestrator at an arbitrary
+    /// host file (AC-23). Rejected before any read; treat as crash.
+    #[error("DONE sentinel lists unsafe artifact path `{artifact}` (must be workspace-relative)")]
+    #[diagnostic(
+        code(vetinari::artifact::done_artifact_path_unsafe),
+        help("A well-behaved worker writes artifacts under `_orchestrator/`. An absolute or `..`-escaping path means the DONE was garbled or hostile. Re-spawn.")
+    )]
+    DoneArtifactPathUnsafe {
+        /// The offending path exactly as DONE spelled it.
+        artifact: PathBuf,
+    },
+
+    /// The DONE sentinel lists an artifact path that does not exist on disk.
+    /// A torn write where DONE was fsynced before its artifacts (AC-23);
+    /// treat as crash.
+    #[error("DONE sentinel lists artifact `{artifact}` that is missing on disk")]
+    #[diagnostic(
+        code(vetinari::artifact::done_artifact_missing),
+        help(
+            "The DONE sentinel references an artifact the worker never finished writing. Re-spawn."
+        )
+    )]
+    DoneArtifactMissing {
+        /// Artifact path DONE claimed.
+        artifact: PathBuf,
+        /// Underlying I/O error encountered when reading the artifact.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The DONE sentinel's recorded checksum doesn't match what's on disk.
     /// Indicates a partial write where DONE landed before the artifact was
     /// fully fsynced — treat as crash.
@@ -648,6 +697,9 @@ mod tests {
             "vetinari::recovery::jj_log_mismatch",
             "vetinari::artifact::done_missing",
             "vetinari::artifact::schema_violation",
+            "vetinari::artifact::done_malformed",
+            "vetinari::artifact::done_artifact_path_unsafe",
+            "vetinari::artifact::done_artifact_missing",
             "vetinari::artifact::checksum_mismatch",
             "vetinari::artifact::read_failed",
             "vetinari::artifact::duplicate_posting",

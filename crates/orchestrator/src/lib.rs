@@ -10,10 +10,13 @@
 //!   deterministic table lands in P2 (#16).
 //! - [`workspace`] — the per-worker jj workspace lifecycle behind the
 //!   serializing `.jj/` gate (REQ-5a, REQ-12).
+//! - [`artifacts`] — the worker → orchestrator artifact contract, the DONE
+//!   sentinel gate, and idempotent translation planning (REQ-3, REQ-3b).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod artifacts;
 pub mod recovery;
 pub mod state;
 pub mod workspace;

@@ -28,6 +28,14 @@ anyhow = "1.0"
 rusqlite = { version = "0.38", features = ["bundled"] }
 # Short unique suffixes for per-worker workspace names (REQ-12, workspace.rs).
 uuid = { workspace = true }
+# SHA-256 for the DONE-sentinel artifact verification (REQ-3b, artifacts.rs):
+# the worker lists each artifact's `sha256sum` in `_orchestrator/DONE`, and a
+# `DoneSentinel` can only be constructed after recomputing every digest and
+# confirming it matches. Pure-Rust; no `Command::new` shell-out (AC-24). Pinned
+# to 0.10 to unify with the `sha2 0.10.x` already in the dependency graph
+# (transitively via the pinned crosslink/jj-lib trees) so `digest` resolves to
+# one copy.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }
