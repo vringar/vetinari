@@ -59,13 +59,14 @@ fn state_db_survives_a_restart() {
         db.upsert_issue(&issue).unwrap();
         db.upsert_worker(&worker).unwrap();
         assert!(db.record_posted(&posted).unwrap());
-        db.append_event(
-            EventKind::Transition,
-            Some("#42"),
-            Some("worker-uuid-7"),
-            &serde_json::json!({"from": "implementing", "to": "landing"}),
-        )
-        .unwrap();
+        let (_id, _ts) = db
+            .append_event(
+                EventKind::Transition,
+                Some("#42"),
+                Some("worker-uuid-7"),
+                &serde_json::json!({"from": "implementing", "to": "landing"}),
+            )
+            .unwrap();
         // `db` dropped here — closes the connection, as if the orchestrator
         // process were killed mid-tick.
     }

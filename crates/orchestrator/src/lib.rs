@@ -12,11 +12,14 @@
 //!   serializing `.jj/` gate (REQ-5a, REQ-12).
 //! - [`artifacts`] — the worker → orchestrator artifact contract, the DONE
 //!   sentinel gate, and idempotent translation planning (REQ-3, REQ-3b).
+//! - [`events`] — the append-only `events.jsonl` writer and the heartbeat
+//!   reader / staleness check (REQ-14, AC-9, AC-14).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod artifacts;
+pub mod events;
 pub mod recovery;
 pub mod state;
 pub mod workspace;

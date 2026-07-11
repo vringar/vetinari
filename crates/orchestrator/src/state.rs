@@ -640,24 +640,31 @@ impl StateDb {
 
     // --- events -------------------------------------------------------------
 
-    /// Append an event, returning its new autoincrement id.
+    /// Append an event, returning its new autoincrement `id` and the `ts` (unix
+    /// seconds) stamped onto it.
+    ///
+    /// The `ts` is computed **once** here and returned so a caller mirroring the
+    /// event elsewhere (e.g. [`crate::events::emit`] into `events.jsonl`) can
+    /// carry the exact authoritative timestamp without re-querying the row — a
+    /// re-query would risk substituting a second, divergent `now()`.
     pub fn append_event(
         &self,
         kind: EventKind,
         issue_id: Option<&str>,
         worker_uuid: Option<&str>,
         payload: &serde_json::Value,
-    ) -> Result<i64, StateError> {
+    ) -> Result<(i64, i64), StateError> {
+        let ts = now_unix();
         let payload =
             serde_json::to_string(payload).map_err(query_err("serialize event payload"))?;
         self.conn
             .execute(
                 "INSERT INTO events (ts, kind, issue_id, worker_uuid, payload)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![now_unix(), kind, issue_id, worker_uuid, payload],
+                params![ts, kind, issue_id, worker_uuid, payload],
             )
             .map_err(query_err("append event"))?;
-        Ok(self.conn.last_insert_rowid())
+        Ok((self.conn.last_insert_rowid(), ts))
     }
 
     /// The most recent `limit` events, newest first.
@@ -681,6 +688,50 @@ impl StateDb {
                 ))
             })
             .map_err(query_err("query recent events"))?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (id, ts, kind, issue_id, worker_uuid, payload) =
+                row.map_err(query_err("read event row"))?;
+            let payload =
+                serde_json::from_str(&payload).map_err(query_err("deserialize event payload"))?;
+            events.push(EventRow {
+                id,
+                ts,
+                kind,
+                issue_id,
+                worker_uuid,
+                payload,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Every event in the table, **oldest first** (ascending `id`).
+    ///
+    /// This is the authoritative, fully-ordered event stream — the source the
+    /// [`crate::events::EventLog::rebuild_from`] reconciler rewrites the JSONL
+    /// mirror from. [`recent_events`](Self::recent_events) can't express it (it
+    /// caps at `limit` and orders newest-first), so a rebuild needs this instead.
+    pub fn all_events(&self) -> Result<Vec<EventRow>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, ts, kind, issue_id, worker_uuid, payload
+                 FROM events ORDER BY id ASC",
+            )
+            .map_err(query_err("prepare all events"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, EventKind>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(query_err("query all events"))?;
         let mut events = Vec::new();
         for row in rows {
             let (id, ts, kind, issue_id, worker_uuid, payload) =
@@ -890,7 +941,7 @@ mod tests {
     #[test]
     fn events_append_and_read_back() {
         let (_dir, db) = temp_db();
-        let id = db
+        let (id, ts) = db
             .append_event(
                 EventKind::Transition,
                 Some("#9"),
@@ -904,6 +955,31 @@ mod tests {
         assert_eq!(events[0].kind, EventKind::Transition);
         assert_eq!(events[0].issue_id.as_deref(), Some("#9"));
         assert_eq!(events[0].payload["to"], "implementing");
+        assert_eq!(
+            events[0].ts, ts,
+            "append_event returns the same ts it stamped on the row"
+        );
+    }
+
+    #[test]
+    fn all_events_returns_full_stream_oldest_first() {
+        let (_dir, db) = temp_db();
+        for i in 0..4 {
+            db.append_event(
+                EventKind::Spawn,
+                Some(&format!("#{i}")),
+                None,
+                &serde_json::json!({"n": i}),
+            )
+            .unwrap();
+        }
+        let all = db.all_events().unwrap();
+        assert_eq!(all.len(), 4);
+        // Oldest first: ids strictly ascending, payload counter in insert order.
+        for (i, ev) in all.iter().enumerate() {
+            assert_eq!(ev.payload["n"], i as i64);
+        }
+        assert!(all.windows(2).all(|w| w[0].id < w[1].id));
     }
 
     #[test]
