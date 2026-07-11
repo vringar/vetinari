@@ -14,6 +14,9 @@
 //!   sentinel gate, and idempotent translation planning (REQ-3, REQ-3b).
 //! - [`events`] — the append-only `events.jsonl` writer and the heartbeat
 //!   reader / staleness check (REQ-14, AC-9, AC-14).
+//! - [`spawn`] — hosting a worker in a zellij pane inside a prepared jj
+//!   workspace, behind the per-role mount matrix and the `claude-sandbox`
+//!   version-pin guard (REQ-1d, REQ-4, REQ-4a, REQ-5, REQ-13, AC-19, AC-27).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -21,5 +24,6 @@
 pub mod artifacts;
 pub mod events;
 pub mod recovery;
+pub mod spawn;
 pub mod state;
 pub mod workspace;
