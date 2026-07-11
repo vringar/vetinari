@@ -1,0 +1,623 @@
+{
+  "next_display_id": 29,
+  "next_comment_id": 8,
+  "display_id_map": {
+    "07ef2b19-8905-466f-b470-6b3d3a299614": 5,
+    "103f8bcb-a80d-47dd-a7c8-f2172e817e11": 12,
+    "1af92780-3f70-4619-bdfc-fc52699bb780": 8,
+    "21785547-9460-4340-a552-cd8b4132f89c": 28,
+    "2cce6b66-6936-43ac-a9d3-db966e743040": 6,
+    "359fd460-0f33-4abe-8606-f8d24852a354": 10,
+    "3937fa51-c125-41ac-a0a6-dd7380e4b652": 22,
+    "3ed07641-38f5-4e63-ad6d-323fac15a669": 2,
+    "594a945b-e842-45c8-8fe0-4672c2eece12": 11,
+    "5f786dd0-cd2d-494b-afde-7c409366cb5f": 15,
+    "5fd1c5d0-f1cd-4704-9732-1ae358da031a": 27,
+    "63a9761e-7c07-4b42-8fdf-cdbc0505348b": 21,
+    "6ddd8632-d87c-4592-b8d9-0031e0b8c947": 20,
+    "737e2a1d-2559-4c5a-9ec9-36660b288b83": 9,
+    "87777cbc-a5d5-47db-ae0e-dff17b78c0fb": 24,
+    "89dbce09-b093-4c19-b3b2-cdb281ef3819": 23,
+    "8acdbb66-ee4e-453a-82af-486dd683a1f3": 14,
+    "9799941b-04ce-4174-a6fa-36d10a16d375": 7,
+    "9aec5962-bca7-41ca-8991-2c0fa3d2bf64": 3,
+    "ac8126f8-d8d5-4d0d-b72b-7cfc6b0d47d7": 25,
+    "afae6546-3b57-4fe3-a175-5a2efcebcd4f": 1,
+    "b7e68a40-822f-4c16-b21f-30b147fcea44": 16,
+    "c0fa7697-c557-4c94-b7fe-266a9ef4f0cc": 17,
+    "c1bfd08b-be81-4c74-bf7e-86b01f93f50e": 13,
+    "cd6522ea-f8f6-4ba2-b775-e08ace0555ed": 26,
+    "e03078c1-e27b-4e6c-a4e2-19fc1880ad82": 4,
+    "e4e089df-597d-4734-9fb1-b24ea70c3f53": 19,
+    "faba5b16-2b39-4554-8648-88a57e0454bd": 18
+  },
+  "locks": {},
+  "issues": {
+    "07ef2b19-8905-466f-b470-6b3d3a299614": {
+      "uuid": "07ef2b19-8905-466f-b470-6b3d3a299614",
+      "display_id": 5,
+      "title": "F5: zellij_host crate — IPC client wrapper",
+      "description": "crates/zellij_host wraps zellij-server/zellij-utils. Surface: session_ensure(name) -> SessionHandle, pane_create(session, name, command, env, cwd) -> PaneHandle, pane_alive(pane), pane_close(pane). No Command::new('zellij'). Used by S1. REQ-1d.",
+      "status": "closed",
+      "priority": "critical",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:51.663577496Z",
+      "updated_at": "2026-05-17T13:05:58.095540963Z",
+      "closed_at": "2026-05-17T13:05:58.095540963Z",
+      "labels": [
+        "area:foundation",
+        "iteration:0"
+      ],
+      "blockers": [
+        "afae6546-3b57-4fe3-a175-5a2efcebcd4f"
+      ],
+      "comments": {
+        "b613d09f-d0c7-4e89-860a-573bccf8e069": {
+          "author": "desktop",
+          "content": "F5 complete: crates/zellij_host hosts each worker in a named pane of a\nlong-lived headless zellij session (REQ-1d).\n\nAdapter surface:\n- session_ensure(name) -> SessionHandle (idempotent; creates a detached\n  background session so a human can `zellij attach` later to inspect)\n- pane_create(session, name, command, env, cwd) -> PaneHandle\n- pane_alive(pane) -> bool\n- pane_close(pane)\n\nScope decision (recorded in REQ-1d): a feasibility spike of zellij 0.44.2's\nlibrary crates found a pure-library zellij_host is impractical -- zellij's\nserver must run as a daemonized process regardless of approach, zellij exposes\nno per-pane environment API anywhere, and zellij-server/zellij-utils carry no\nstability promise. zellij_host therefore drives the zellij CLI as a\nsubprocess: a deliberate, scoped exception to REQ-1a. The shell-out is\nconfined to one helper in this crate; the orchestrator core reaches zellij\nonly through this adapter. The xtask no-shell-out lint (AC-24) exempts\ncrates/zellij_host accordingly, and the design doc REQ-1d / REQ-1a were\namended to match.\n\nImplementation notes:\n- env has no zellij-native representation, so pane_create applies it by\n  prefixing the command with `env KEY=VALUE ...`.\n- panes are created with --close-on-exit, so pane_alive reports false once a\n  worker's command exits; liveness is read from `zellij action list-panes\n  --json`.\n- ZellijError is a self-contained miette::Diagnostic (REQ-1b).\n\nAC-27: tests/spawn.rs creates a real headless session, spawns a worker pane,\nasserts it is alive while running and closes on exit, and verifies env\napplication via a marker file. Passes.\n\nDelivered as 4 bisectable commits (design+lint amendment, skeleton+\nsession_ensure, pane operations, AC-27 test). Full workspace builds and\n`just lint` is clean.",
+          "created_at": "2026-05-17T13:05:56.297229960Z",
+          "kind": "result",
+          "signed_by": "SHA256:BLzQi2qsaSf9ZsCx7UTcFjKLtD3r57VLOgVDKwCWkZQ",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgpOunIvKS+6l8yUoZoc/zl3nq/iH3dCG1sxOc8aYJKwQAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAs5DpMgS5lN445nMceQN2vdxVVZTKO1h3IZsbifur3AW1E5yrtOZ2P8NZdRYnkuVXE19tZBIAAfUU2rSrs/L2Aw=="
+        }
+      }
+    },
+    "103f8bcb-a80d-47dd-a7c8-f2172e817e11": {
+      "uuid": "103f8bcb-a80d-47dd-a7c8-f2172e817e11",
+      "display_id": 12,
+      "title": "S5: Static QA gate runner (allowed shell-out exception)",
+      "description": "qa.rs: detect .orchestrator/static_qa.sh, run after every Implementer commit via tokio::process::Command. Capture tool/exit/last-50-lines. On non-zero, post --kind blocker via crosslink_api; transition back to phase:implementing. On zero, advance per config (MVP: phase:landing; it.2: phase:adversary-review). REQ-9, REQ-2a config-driven routing. AC-7.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:52.553745162Z",
+      "updated_at": "2026-05-14T15:59:25.112035346Z",
+      "labels": [
+        "area:substrate",
+        "iteration:1"
+      ],
+      "blockers": [
+        "359fd460-0f33-4abe-8606-f8d24852a354",
+        "9aec5962-bca7-41ca-8991-2c0fa3d2bf64"
+      ]
+    },
+    "1af92780-3f70-4619-bdfc-fc52699bb780": {
+      "uuid": "1af92780-3f70-4619-bdfc-fc52699bb780",
+      "display_id": 8,
+      "title": "S1: claude-sandbox spawn helper (zellij pane + version pin)",
+      "description": "spawn.rs uses zellij_host to create a pane named <role>-<id>-r<round> running claude-sandbox + claude. Assemble bwrap args per role (mount table from REQ-5/6/7 + Merger row). Assert claude-sandbox --version matches pinned value at startup; refuse to spawn on mismatch -> phase:orchestrator-error. REQ-4, REQ-4a, REQ-1d. AC-19, AC-27.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:52.044142869Z",
+      "updated_at": "2026-05-14T15:59:24.684218516Z",
+      "labels": [
+        "area:substrate",
+        "iteration:1"
+      ],
+      "blockers": [
+        "3ed07641-38f5-4e63-ad6d-323fac15a669",
+        "9799941b-04ce-4174-a6fa-36d10a16d375",
+        "9aec5962-bca7-41ca-8991-2c0fa3d2bf64",
+        "e03078c1-e27b-4e6c-a4e2-19fc1880ad82"
+      ]
+    },
+    "21785547-9460-4340-a552-cd8b4132f89c": {
+      "uuid": "21785547-9460-4340-a552-cd8b4132f89c",
+      "display_id": 28,
+      "title": "Pin crosslink via npins instead of a Cargo.toml git dependency",
+      "description": "## Context\n\ncrossbridge currently declares crosslink as a direct git dependency in its\nworkspace `Cargo.toml`:\n\n    crosslink = { git = \"https://github.com/forecast-bio/crosslink.git\", rev = \"12eb7b9...\" }\n\nvetinari (vringar/vetinari) pins crosslink differently. The approach makes nix\npackaging cleaner and is a prerequisite for the two projects to interoperate (see\n\"Why this matters\" below). Sharing the recipe.\n\n## vetinari's approach\n\n- **npins** pins crosslink in `npins/sources.json` (type Git, GitHub\n  forecast-bio/crosslink, a branch plus a locked revision and tarball hash). Bump\n  with `npins update crosslink`.\n- **shell.nix** (plain nixpkgs, no flakes) exposes the pinned source as an env\n  var: `CROSSLINK_SRC = \"${sources.crosslink}\"`.\n- crosslink is **not on crates.io**, so a `[patch.crates-io]` cannot redirect it.\n  Instead an insulation crate path-depends on a local copy of the source.\n- A `just bootstrap` recipe (also run by the shell `shellHook`) copies\n  `$CROSSLINK_SRC` into a **writable**, gitignored `.crosslink-src` tree. A\n  symlink into the read-only nix store does NOT work: crosslink's `build.rs`\n  writes a dashboard placeholder into the tree, and its server module embeds\n  `dashboard/dist` via `rust-embed`, so bootstrap also `mkdir -p dashboard/dist`\n  and writes a placeholder `index.html` so the derive compiles without a built\n  frontend.\n- The copy is guarded by a marker file holding the store path, so it only\n  re-copies when the pin actually moves — avoiding mtime churn and needless\n  rebuilds.\n\n## Why this matters for crossbridge specifically\n\nvetinari issue #25 integrates crossbridge by embedding `crossbridge-server` as a\nlibrary. That puts crossbridge's crosslink dependency and vetinari's own crosslink\ndependency in one cargo dependency graph. `libsqlite3-sys` carries\n`links = \"sqlite3\"`, which forces the *entire* graph to a single crosslink (and\nsingle rusqlite) instance — two different crosslink revisions is a hard cargo\nbuild failure, not a `[patch]`-able mismatch.\n\nSo crossbridge and vetinari must resolve crosslink to the **same commit**. Pinning\ncrosslink via npins (rather than a hard-coded `rev` in `Cargo.toml`) is what makes\nthat coordination tractable: the revision lives in one `npins/sources.json` entry,\nand the nix dev shell provides a single crosslink source path that both projects\nshare.\n\nHappy to share vetinari's exact `npins/sources.json` crosslink entry, `shell.nix`,\nand `just bootstrap` recipe.\n\nFiled from vetinari issue #25, architect finding B2.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "desktop",
+      "created_at": "2026-05-22T21:56:21.310407542Z",
+      "updated_at": "2026-05-22T21:56:21.310407542Z"
+    },
+    "2cce6b66-6936-43ac-a9d3-db966e743040": {
+      "uuid": "2cce6b66-6936-43ac-a9d3-db966e743040",
+      "display_id": 6,
+      "title": "F6: xtask — no-shell-out hard lint (AC-24) + workspace lint",
+      "description": "crates/xtask binary with a 'lint' subcommand: scans crates/{orchestrator,crosslink_api,jj_api,error,zellij_host}/src/**.rs for Command::new with disallowed targets (jj, git, gh, crosslink, zellij). Exit non-zero on any hit. just lint runs it. CI gate. Allowed exceptions: claude-sandbox, claude, .orchestrator/static_qa.sh. REQ-1a. AC-24.",
+      "status": "closed",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:51.794166659Z",
+      "updated_at": "2026-05-16T16:45:51.841933569Z",
+      "closed_at": "2026-05-16T16:45:51.841933569Z",
+      "labels": [
+        "area:foundation",
+        "iteration:0"
+      ],
+      "blockers": [
+        "afae6546-3b57-4fe3-a175-5a2efcebcd4f"
+      ],
+      "comments": {
+        "e2dc2b35-fdb5-4dfc-8d9f-12a6bac42e06": {
+          "author": "desktop",
+          "content": "F6 complete (commit fc659542).\n\nxtask gained a \"lint\" subcommand: the no-shell-out hard lint (AC-24). It\nparses every orchestrator-side crate's src/ tree with syn and fails the\nbuild on any Command::new() targeting jj, git, gh, crosslink, or zellij.\n\nDesign choices:\n- syn AST parse, not text grep: banned names in comments, doc strings, or\n  unrelated string literals never false-positive.\n- Test code exempt: cfg(test) modules, test / tokio::test functions, and\n  tests/ directories are pruned (the test harness legitimately drives the\n  real CLIs, per AC-27).\n- Scans all crates under crates/ automatically; escaping requires a\n  deliberate xtask-only entry in EXEMPT_CRATES, so new orchestrator crates\n  cannot silently bypass the audit.\n- claude / claude-sandbox are simply not in the banned set (no library\n  exists), so no separate exception list is needed.\n\nVerification:\n- 8 unit tests cover detection, every banned target, claude allowance,\n  comment/string false-positive immunity, and all test-exemption paths.\n- End-to-end: a planted Command::new(\"jj\") in orchestrator/src made\n  \"just lint\" exit 1 with a file:line:col report; removing it restored\n  a clean pass.\n- Full gate green: nix-shell just build / just test (12 tests) / just lint.\n\nKnown limitations (documented in lint.rs): a renamed import\n(use Command as C) or a non-literal target (Command::new(&var)) is not\ndetected. The lint is a regression guardrail, not a sandbox.",
+          "created_at": "2026-05-16T16:45:50.090553652Z",
+          "kind": "result",
+          "signed_by": "SHA256:BLzQi2qsaSf9ZsCx7UTcFjKLtD3r57VLOgVDKwCWkZQ",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgpOunIvKS+6l8yUoZoc/zl3nq/iH3dCG1sxOc8aYJKwQAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAN080fdSSUmJnUIkcDcdLzsoEnmU2bLW1WOGHbXIlnai3PQOLbE8EMsSyUiN03Y/Ag6JC7OPp7kofwjmCZs+rAQ=="
+        }
+      }
+    },
+    "359fd460-0f33-4abe-8606-f8d24852a354": {
+      "uuid": "359fd460-0f33-4abe-8606-f8d24852a354",
+      "display_id": 10,
+      "title": "S3: Artifact contract + DONE sentinel + parser",
+      "description": "artifacts.rs: schema-typed parsers for result.md, findings.jsonl, merge_result.md, progress.jsonl, DONE. Missing DONE = crash regardless of exit code. SHA256 artifact contents for posted_artifacts keying. miette diagnostics on schema violations. REQ-3, REQ-3b, REQ-1b. AC-23.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:52.294689359Z",
+      "updated_at": "2026-05-14T15:59:24.900316783Z",
+      "labels": [
+        "area:substrate",
+        "iteration:1"
+      ],
+      "blockers": [
+        "3ed07641-38f5-4e63-ad6d-323fac15a669",
+        "9aec5962-bca7-41ca-8991-2c0fa3d2bf64"
+      ]
+    },
+    "3937fa51-c125-41ac-a0a6-dd7380e4b652": {
+      "uuid": "3937fa51-c125-41ac-a0a6-dd7380e4b652",
+      "display_id": 22,
+      "title": "A2: Findings parser + idempotent blocker emission",
+      "description": "Extend artifacts.rs to parse findings.jsonl {severity, location, claim, evidence_files}. Each finding -> one --kind blocker via crosslink_api, keyed in posted_artifacts by finding_index. Crash mid-translation -> restart skips already-posted findings. REQ-3, REQ-3b.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:53.854253640Z",
+      "updated_at": "2026-05-14T15:59:26.583424297Z",
+      "labels": [
+        "area:adversary",
+        "iteration:2"
+      ],
+      "blockers": [
+        "359fd460-0f33-4abe-8606-f8d24852a354",
+        "3ed07641-38f5-4e63-ad6d-323fac15a669",
+        "63a9761e-7c07-4b42-8fdf-cdbc0505348b"
+      ]
+    },
+    "3ed07641-38f5-4e63-ad6d-323fac15a669": {
+      "uuid": "3ed07641-38f5-4e63-ad6d-323fac15a669",
+      "display_id": 2,
+      "title": "F2: state.db schema + posted_artifacts + recovery scaffolding",
+      "description": "SQLite migrations via rusqlite/sqlx. Tables: issues (with phase_substate, empty_round_streak reset rules in comments, landing_retry_count, last_diff_hash), active_workers, events, posted_artifacts (worker_uuid+artifact_path+content_sha+finding_index PK). recovery.rs scaffold returning NotImplemented for unknown substates; full logic in P2. REQ-2, REQ-2a, REQ-3b storage. AC-2.",
+      "status": "closed",
+      "priority": "critical",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:51.292709679Z",
+      "updated_at": "2026-05-21T21:45:28.548837026Z",
+      "closed_at": "2026-05-21T21:45:28.548837026Z",
+      "labels": [
+        "area:foundation",
+        "iteration:0"
+      ],
+      "blockers": [
+        "afae6546-3b57-4fe3-a175-5a2efcebcd4f"
+      ]
+    },
+    "594a945b-e842-45c8-8fe0-4672c2eece12": {
+      "uuid": "594a945b-e842-45c8-8fe0-4672c2eece12",
+      "display_id": 11,
+      "title": "S4: Heartbeat hook wiring + watchdog",
+      "description": ".claude/hooks/heartbeat.py and post-edit-check.py are symlinks/wrappers into the nix-vendored crosslink source. watchdog.rs iterates active_workers each tick via mtime on heartbeat-<uuid>.json; stale > heartbeat_threshold_s -> kill PG (via zellij_host::pane_close), jj_api::workspace_forget, transition phase back, re-spawn fresh. REQ-11. AC-8.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:52.426665682Z",
+      "updated_at": "2026-05-14T15:59:25.008935486Z",
+      "labels": [
+        "area:substrate",
+        "iteration:1"
+      ],
+      "blockers": [
+        "1af92780-3f70-4619-bdfc-fc52699bb780",
+        "737e2a1d-2559-4c5a-9ec9-36660b288b83"
+      ]
+    },
+    "5f786dd0-cd2d-494b-afde-7c409366cb5f": {
+      "uuid": "5f786dd0-cd2d-494b-afde-7c409366cb5f",
+      "display_id": 15,
+      "title": "P1: Build pump + concurrency budget + max_turns config",
+      "description": "pump.rs polls crosslink_api every poll_interval_ms for phase:graphed issues (strict pickup); respects [budget] caps; dispatches via spawn.rs. config.rs parses .orchestrator/config.toml: [budget] (max_concurrent_agents, max_per_role with defaults implementer=1/merger=1/adversary=2, poll_interval_ms=5000, heartbeat_threshold_s=120), [turns] (implementer=80, adversary=40, merger=30), [convergence] (mode='n-rounds', n_rounds=2). REQ-13, REQ-16. AC-10.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:52.949733543Z",
+      "updated_at": "2026-05-14T15:59:25.514801705Z",
+      "labels": [
+        "area:pump",
+        "iteration:1"
+      ],
+      "blockers": [
+        "103f8bcb-a80d-47dd-a7c8-f2172e817e11",
+        "1af92780-3f70-4619-bdfc-fc52699bb780",
+        "737e2a1d-2559-4c5a-9ec9-36660b288b83",
+        "8acdbb66-ee4e-453a-82af-486dd683a1f3",
+        "c1bfd08b-be81-4c74-bf7e-86b01f93f50e"
+      ]
+    },
+    "5fd1c5d0-f1cd-4704-9732-1ae358da031a": {
+      "uuid": "5fd1c5d0-f1cd-4704-9732-1ae358da031a",
+      "display_id": 27,
+      "title": "crossbridge-server: run() needs a programmatic shutdown path for library embedders",
+      "description": "## Context\n\nvetinari (an autonomous orchestrator — vringar/vetinari) wants to embed\n`crossbridge-server` as a library, calling `crossbridge_server::run::run(ServerConfig)`\non its own runtime to act as an inbound crossbridge peer, rather than spawning the\n`crossbridge-server` binary as a subprocess.\n\nTwo things in the current `run()` block clean library embedding.\n\n## Problem\n\n1. **No programmatic shutdown.** `run()`'s only non-error exit is `signal::ctrl_c()`.\n   There is no `CancellationToken`, shutdown channel, or any parameter by which an\n   embedder can ask the server loop to stop. An embedding host cannot cleanly bring\n   the server down as part of its own shutdown.\n\n2. **`process::exit(0)` inside `serve_one_session`.** On Ctrl-C the server calls\n   `std::process::exit(0)` directly. Embedded in a host process this (a) bypasses\n   every flush/checkpoint the host must perform before exiting, and (b) makes\n   crossbridge's own `ctrl_c` handler race the host's signal handling — whichever\n   fires first wins, and crossbridge's path terminates the whole process.\n\nTogether these force an embedder to reimplement `run()`'s loop (~50 lines, on top\nof the `supervisor`/`listeners`/`handler` modules) just to obtain a shutdown\nchannel — duplicating upstream logic that will then drift.\n\n## Request\n\n- Add an optional shutdown signal to `run()` / `ServerConfig` — e.g. `run()` accepts\n  a `tokio_util::sync::CancellationToken` (or a `tokio::sync::oneshot`/`watch`\n  receiver). When triggered, the loop returns `Ok(())`.\n- Remove the `process::exit(0)` in `serve_one_session`; return `Ok(())` from the\n  loop and let the caller own process exit.\n- Keep `ctrl_c` as the *binary's* behavior — `crossbridge-server/src/main.rs` can\n  create a token and wire it to `signal::ctrl_c()` — but `run()` itself should not\n  own signal handling or call `process::exit`.\n\nThis gives library embedders clean shutdown semantics and removes the need to fork\nthe run loop.\n\nFiled from vetinari issue #25 (crossbridge integration), architect finding B1/B1a.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "desktop",
+      "created_at": "2026-05-22T21:56:19.545819962Z",
+      "updated_at": "2026-05-22T21:56:19.545819962Z"
+    },
+    "63a9761e-7c07-4b42-8fdf-cdbc0505348b": {
+      "uuid": "63a9761e-7c07-4b42-8fdf-cdbc0505348b",
+      "display_id": 21,
+      "title": "A1: Adversary role + pre-rendered inputs",
+      "description": "roles/adversary.rs: allowlist excludes all jj write ops (no .jj/ mount anyway, per REQ-5/6 + Merger row). Before spawn, orchestrator pre-renders _orchestrator/diff.patch (jj_api::diff prior_round..current), log.txt (jj_api::log of chain), prior_findings.json (every prior round's findings). system_prompt from prompts/adversary.md. REQ-8.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:53.717079442Z",
+      "updated_at": "2026-05-14T15:59:26.423178648Z",
+      "labels": [
+        "area:adversary",
+        "iteration:2"
+      ],
+      "blockers": [
+        "1af92780-3f70-4619-bdfc-fc52699bb780",
+        "e03078c1-e27b-4e6c-a4e2-19fc1880ad82",
+        "e4e089df-597d-4734-9fb1-b24ea70c3f53"
+      ]
+    },
+    "6ddd8632-d87c-4592-b8d9-0031e0b8c947": {
+      "uuid": "6ddd8632-d87c-4592-b8d9-0031e0b8c947",
+      "display_id": 20,
+      "title": "L3: Landing dispatch — remote mode (jj_api push + octocrab PR create)",
+      "description": "landing.rs remote mode (tracker_remote set): jj_api::git_push --bookmark vdd/<id>-<slug>; then octocrab to create PR (--base main --head vdd/<id>-<slug> --title from jj description --body from _orchestrator/result.md). phase_substate: push_started -> push_done_pr_pending -> pr_created -> phase:pr-open. tests/fixtures/hello/REMOTE_SETUP.md documents GH_TOKEN env requirements. REQ-17 remote. AC-12.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:53.588483728Z",
+      "updated_at": "2026-05-14T15:59:26.262880729Z",
+      "labels": [
+        "area:landing",
+        "iteration:1.5"
+      ],
+      "blockers": [
+        "e4e089df-597d-4734-9fb1-b24ea70c3f53"
+      ]
+    },
+    "737e2a1d-2559-4c5a-9ec9-36660b288b83": {
+      "uuid": "737e2a1d-2559-4c5a-9ec9-36660b288b83",
+      "display_id": 9,
+      "title": "S2: jj workspace lifecycle + mutex serialization (via jj_api)",
+      "description": "workspace.rs uses jj_api exclusively. cleanup-before-spawn: jj_api::workspace_forget + rm -rf. workspace_add at .workspace/<phase>-<id>-r<round>-<uuid>/. Orchestrator-held mutex around every .jj/-mutating jj_api call. REQ-5a, REQ-12, REQ-1a. AC-5, AC-6, AC-20, AC-25.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:52.167069495Z",
+      "updated_at": "2026-05-14T15:59:24.790683757Z",
+      "labels": [
+        "area:substrate",
+        "iteration:1"
+      ],
+      "blockers": [
+        "3ed07641-38f5-4e63-ad6d-323fac15a669",
+        "e03078c1-e27b-4e6c-a4e2-19fc1880ad82"
+      ]
+    },
+    "87777cbc-a5d5-47db-ae0e-dff17b78c0fb": {
+      "uuid": "87777cbc-a5d5-47db-ae0e-dff17b78c0fb",
+      "display_id": 24,
+      "title": "A4: Iteration 2 E2E test — full adversary cycle",
+      "description": "AC-15: Implementer commit produces a Rust file with deliberate unsafe {} masked behind a safe-looking API; Adversary findings.jsonl flags it; Implementer round 2 receives + removes; round 3 Adversary empty + stable diff hash; convergence -> phase:converged -> phase:landing -> phase:merged.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:54.129934010Z",
+      "updated_at": "2026-05-14T15:59:26.738613270Z",
+      "labels": [
+        "area:test",
+        "iteration:2"
+      ],
+      "blockers": [
+        "89dbce09-b093-4c19-b3b2-cdb281ef3819"
+      ]
+    },
+    "89dbce09-b093-4c19-b3b2-cdb281ef3819": {
+      "uuid": "89dbce09-b093-4c19-b3b2-cdb281ef3819",
+      "display_id": 23,
+      "title": "A3: Convergence detector — n-rounds + diff-hash stability",
+      "description": "Rule: empty findings.jsonl AND QA-pass AND sha256(jj_api::diff) matches last_diff_hash. empty_round_streak increments only when all three hold; resets per state.db comment rules. Streak >= n_rounds -> phase:converged -> phase:landing. REQ-10.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:53.994843773Z",
+      "updated_at": "2026-05-14T15:59:26.686742141Z",
+      "labels": [
+        "area:adversary",
+        "iteration:2"
+      ],
+      "blockers": [
+        "3937fa51-c125-41ac-a0a6-dd7380e4b652",
+        "3ed07641-38f5-4e63-ad6d-323fac15a669"
+      ]
+    },
+    "8acdbb66-ee4e-453a-82af-486dd683a1f3": {
+      "uuid": "8acdbb66-ee4e-453a-82af-486dd683a1f3",
+      "display_id": 14,
+      "title": "S7: Implementer role (allowlist + prompt + task-md)",
+      "description": "roles/implementer.rs: allowlist excludes jj abandon|op|workspace forget|workspace add|workspace list|edit|git push|git fetch|rebase|squash|split; includes describe|commit|new|diff|show|log|status|files (no squash/split — see REQ-5 rationale). system_prompt from .orchestrator/prompts/implementer.md. task.md assembled from issue body + prior blockers/findings. REQ-5, REQ-8.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:52.817455959Z",
+      "updated_at": "2026-05-14T15:59:25.225695107Z",
+      "labels": [
+        "area:substrate",
+        "iteration:1"
+      ],
+      "blockers": [
+        "1af92780-3f70-4619-bdfc-fc52699bb780"
+      ]
+    },
+    "9799941b-04ce-4174-a6fa-36d10a16d375": {
+      "uuid": "9799941b-04ce-4174-a6fa-36d10a16d375",
+      "display_id": 7,
+      "title": "Z1: zellij session bootstrap + headless attach",
+      "description": "On orchestrator startup, ensure a long-lived headless zellij session named 'vdd-orchestrator' exists (create if missing). just orchestrate brings up the session if absent. Document zellij attach vdd-orchestrator for live inspection. Uses zellij_host (F5). REQ-1d.",
+      "status": "closed",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:51.919430156Z",
+      "updated_at": "2026-05-21T21:45:30.490580670Z",
+      "closed_at": "2026-05-21T21:45:30.490580670Z",
+      "labels": [
+        "area:zellij",
+        "iteration:1"
+      ],
+      "blockers": [
+        "07ef2b19-8905-466f-b470-6b3d3a299614",
+        "afae6546-3b57-4fe3-a175-5a2efcebcd4f"
+      ]
+    },
+    "9aec5962-bca7-41ca-8991-2c0fa3d2bf64": {
+      "uuid": "9aec5962-bca7-41ca-8991-2c0fa3d2bf64",
+      "display_id": 3,
+      "title": "F3: crosslink_api insulation crate",
+      "description": "crates/crosslink_api wraps crosslink's internal crates. Stable adapter surface: read_issue(id), comment_write(id, kind, body, role_metadata) -> comment_id, label_add(id, name), label_remove(id, name), sign(payload), key_ensure_loaded(). Path-dep on crosslink (path injected via .cargo/config.toml). All errors miette::Diagnostic. REQ-3a, REQ-1b.",
+      "status": "closed",
+      "priority": "critical",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:51.419462990Z",
+      "updated_at": "2026-05-17T13:27:59.797746555Z",
+      "closed_at": "2026-05-17T13:27:59.797746555Z",
+      "labels": [
+        "area:foundation",
+        "iteration:0"
+      ],
+      "blockers": [
+        "afae6546-3b57-4fe3-a175-5a2efcebcd4f"
+      ],
+      "comments": {
+        "f8a8f1b4-93c2-4554-bd72-e0551e104a9d": {
+          "author": "desktop",
+          "content": "F3 complete: crates/crosslink_api wraps the crosslink library crate behind a\nstable adapter surface (REQ-3a).\n\nCrosslinkRepo handle:\n- discover() / open(repo_root) -- locate a .crosslink/ repository\n- read_issue(id) -> IssueInfo (issue fields + labels)\n- comment_write(id, kind, body, role_metadata) -> comment id\n- label_add / label_remove(id, name) -> bool\n- sign(payload, namespace) -> base64 signature\n- key_ensure_loaded() -> fingerprint\n\nSourcing: crosslink is pinned via npins (forecast-bio/crosslink, develop\nbranch). It is not on crates.io and its build.rs writes a dashboard\nplaceholder into its own tree, so `just bootstrap` copies the npins-pinned\nsource to a writable .crosslink-src tree and crosslink_api path-depends on it.\n.crosslink-src is excluded from the workspace so crosslink stays a plain\ndependency. shell.nix exports CROSSLINK_SRC; bump via `npins update crosslink`.\n\nDesign notes:\n- CrosslinkError is a self-contained miette::Diagnostic (REQ-1b). crosslink's\n  library API is uniformly anyhow-based with no typed errors; the underlying\n  cause is boxed so neither crosslink nor anyhow types leak into this crate's\n  public signatures -- anyhow is not a dependency of this library crate.\n- comment_write and the label operations branch on crosslink's SharedWriter:\n  hub repositories route through it, single-agent repositories write the\n  database directly -- mirroring crosslink's own CLI, since a direct write in\n  hub mode is lost to the next hydration.\n- key_ensure_loaded is verify-only: it never generates an identity, since\n  provisioning a signing key is a deliberate crosslink setup step.\n- crosslink's API is synchronous, so the adapter is too.\n\nTested: 6 integration tests build a throwaway crosslink repository and\nround-trip issue reads, labels, comments, and the IssueNotFound /\nNotARepository / IdentityUnavailable / InvalidCommentKind error paths. The\nfull workspace builds, `just lint` is clean (17 files scanned), and the whole\ntest suite passes.\n\nDelivered as 3 commits: build wiring, adapter surface, integration test.",
+          "created_at": "2026-05-17T13:27:58.095750897Z",
+          "kind": "result",
+          "signed_by": "SHA256:BLzQi2qsaSf9ZsCx7UTcFjKLtD3r57VLOgVDKwCWkZQ",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgpOunIvKS+6l8yUoZoc/zl3nq/iH3dCG1sxOc8aYJKwQAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAR6YB2YCO7Tae8XQRTaB3qQbDm7TXT7f60QBmxXWfufxm1v/gOZ0JV/lyy3QAEavg8FCJ/HrsSvb0vfzsFkneAg=="
+        }
+      }
+    },
+    "ac8126f8-d8d5-4d0d-b72b-7cfc6b0d47d7": {
+      "uuid": "ac8126f8-d8d5-4d0d-b72b-7cfc6b0d47d7",
+      "display_id": 25,
+      "title": "vringar/crossbridge integration — research & decide scope",
+      "description": "Question: \n\nContext: \n\nFindings: \n\nResearch/decision issue — not yet designed. The integration scope is an open\nquestion and is filed at critical priority so it gets resolved before any\nimplementation issues are broken out.\n\n## What crossbridge is\nvringar/crossbridge is a cross-repo IPC tool. Topology:\n- `crossbridge-supervisor` runs on the host and owns `<root>/register.socket`.\n- A per-repo `crossbridge-server --group <name> --slug <repo>` registers with it.\n- `crossbridge-client {peers, submit, answer}` talks over the same `<root>`.\n\n## Why this matters to vetinari (the open question)\nCandidate roles — one must be chosen during the design pass:\n1. Cross-instance coordination: multiple vetinari instances (one per project)\n   share host-wide state through crossbridge.\n2. Worker cross-repo Q&A: vetinari workers use peers/submit/answer to ask\n   agents running in other repos mid-task.\n3. Inbound submissions: the vetinari orchestrator registers a crossbridge\n   server and answers submissions routed to it from other repos/agents.\n\n## Hard constraint already known\ncrossbridge's socket root (`/run/crossbridge` or `$XDG_RUNTIME_DIR/crossbridge`)\nis NOT bind-mounted into `claude-sandbox`. Any worker-side crossbridge use\n(roles 2 and 3) requires the spawn helper (#8 / REQ-4) to bind the socket\ndirectory or point `CROSSBRIDGE_SOCKET_ROOT` at an already-bound path.\nOrchestrator-side use (role 1) runs outside the sandbox and is unaffected.\n\n## Next steps\n- [ ] Decide the integration role(s) above.\n- [ ] If worker-side: design the sandbox socket-mount change against REQ-4 / #8.\n- [ ] Run the-architect on the resulting design before breaking out impl issues.\n- [ ] Integrate the decision into `.design/vdd-orchestrator.md` (or a new design doc).\n\n## Known upstream papercuts (prior session)\nFrom `.crosslink-bug-report.md` / knowledge page F0b: `crossbridge-client` should\nsuggest running the supervisor when no socket root exists; `--issue` should accept\nthe L-prefixed local form.",
+      "status": "open",
+      "priority": "critical",
+      "created_by": "desktop",
+      "created_at": "2026-05-15T22:23:03.287999127Z",
+      "updated_at": "2026-05-15T22:23:03.395702244Z",
+      "labels": [
+        "area:integration",
+        "research"
+      ]
+    },
+    "afae6546-3b57-4fe3-a175-5a2efcebcd4f": {
+      "uuid": "afae6546-3b57-4fe3-a175-5a2efcebcd4f",
+      "display_id": 1,
+      "title": "F1: Project skeleton (shell.nix/npins + cargo workspace + just + error crate)",
+      "description": "Create flake.nix with dev-shell (rustc, jj source path, claude-sandbox PINNED commit, claude CLI, sqlite, python, zellij). Cargo workspace root with crates: orchestrator, crosslink_api, jj_api, error, xtask. justfile with bootstrap/build/test/orchestrate/dogfood/lint recipes. just bootstrap generates .cargo/config.toml with crosslink + jj-lib source paths. error crate provides common miette::Diagnostic + thiserror enums for spawn/qa/landing/recovery/artifact errors. AC-1.",
+      "status": "closed",
+      "priority": "critical",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:51.160753564Z",
+      "updated_at": "2026-05-15T21:58:46.695570966Z",
+      "closed_at": "2026-05-15T20:30:58.635670723Z",
+      "labels": [
+        "area:foundation",
+        "iteration:0"
+      ],
+      "comments": {
+        "bcae22c7-943d-4c06-8485-a62680db73e5": {
+          "author": "desktop",
+          "content": "F1 complete. AC-1 satisfied: `nix develop` provides rustc 1.95.0, jj 0.41.0, claude-sandbox (pinned via VDD_CLAUDE_SANDBOX_PIN env var set in shellHook), zellij 0.44.2, sqlite, python3, just, cargo-nextest. `just bootstrap` writes a placeholder .cargo/config.toml. `just build` produces target/debug/orchestrator. `just build-release` produces target/release/orchestrator (verified, runs cleanly). `just test` runs 4 vetinari-error tests, all pass. `just lint` runs rustfmt --check + clippy -D warnings + xtask lint placeholder (exits 2, recipe treats as skip until #6). `just fmt`, `just clean`, `just graph` recipes also wired.\n\nNote: error crate is a fully implemented adapter surface per F1 description (REQ-1b) — Spawn/Qa/Landing/Recovery/Artifact thiserror enums all impl miette::Diagnostic with codes/help/url annotations; one variant uses NamedSource+SourceSpan for labeled-span rendering. 4 unit tests cover unique-code invariant, ?-propagation, span rendering, and severity escalation. crosslink_api, jj_api, xtask are intentional skeletons whose content lands in #3/#4/#6.\n\nBuck2 fallback (REQ-1) not invoked; nix+cargo+just sufficed cleanly.",
+          "created_at": "2026-05-15T20:29:29.304050609Z",
+          "kind": "result",
+          "signed_by": "SHA256:BLzQi2qsaSf9ZsCx7UTcFjKLtD3r57VLOgVDKwCWkZQ",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgpOunIvKS+6l8yUoZoc/zl3nq/iH3dCG1sxOc8aYJKwQAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwSwncZFvRVTFaldmRL1qeVeKiMCsGphvwiP7zNqBDe8b7dNlHGwWaU1hj+M8lCp2pTQHPymqJZnanpoR+gN8Cg=="
+        },
+        "d5cb5c95-1ac1-48ad-8abf-8df8fdc8dfce": {
+          "author": "desktop",
+          "content": "Build system migrated from Nix flakes to npins + classic-nixpkgs shell.nix. Flakes are deliberately avoided so the project composes with a non-flake nixos-setup (vringar/nixos-setup). Changes: flake.nix/flake.lock removed; npins/sources.json pins nixpkgs (nixos-unstable) + rust-overlay (master); new shell.nix replicates the old devShell (same toolchain, RUST_BACKTRACE, claude-sandbox shellHook pin). Enter the dev shell with 'nix-shell' (not 'nix develop'). This also fixed a launch failure: claude-sandbox resolves shell.nix before flake.nix, and 'nix-shell flake.nix' errors with 'requires a single derivation'. The F1 description and the prior [result] comment still reference flake.nix/'nix develop' — this comment supersedes them. Design spec REQ-1/REQ-4a/REQ-11/AC-1/Q3 in .design/vdd-orchestrator.md updated to match.",
+          "created_at": "2026-05-15T21:58:46.762607243Z",
+          "kind": "decision",
+          "signed_by": "SHA256:BLzQi2qsaSf9ZsCx7UTcFjKLtD3r57VLOgVDKwCWkZQ",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgpOunIvKS+6l8yUoZoc/zl3nq/iH3dCG1sxOc8aYJKwQAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/sXJpigalN3SD9FzhF2ejmT8f2l2ZtrTbRA5Rto41jBsnZvkakcfL2sK++/7QZqKOQSDyLBfEDfpTsN9d+7HBQ=="
+        },
+        "e2264a9d-c4cc-46f7-a9b4-67806559b35c": {
+          "author": "desktop",
+          "content": "Plan: (1) flake.nix dev shell with rust-overlay (stable), cargo, jj (current 0.41.0), claude-sandbox pinned via nix store path, claude CLI, sqlite, python3, zellij. (2) Root Cargo.toml workspace; skeleton crates orchestrator/crosslink_api/jj_api/error/xtask. (3) error crate fully implemented per design REQ-1b: thiserror enums for Spawn/Qa/Landing/Recovery/Artifact errors, all impl miette::Diagnostic. crosslink_api, jj_api, xtask: empty compilable libs/bins (their content lands in #3, #4, #6). (4) justfile with bootstrap/build/test/lint/orchestrate/dogfood. (5) Verify nix develop -c just build green.",
+          "created_at": "2026-05-15T20:19:37.175979963Z",
+          "kind": "plan",
+          "signed_by": "SHA256:BLzQi2qsaSf9ZsCx7UTcFjKLtD3r57VLOgVDKwCWkZQ",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgpOunIvKS+6l8yUoZoc/zl3nq/iH3dCG1sxOc8aYJKwQAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAsD/gJPoVNtVBK4hSY9nWsReO2S7xT5bvnXwCwEoxICtQAXcYoCpqVD6BCyLSZXWsjrcu7nHWoJu0A+fRfXGtAA=="
+        }
+      }
+    },
+    "b7e68a40-822f-4c16-b21f-30b147fcea44": {
+      "uuid": "b7e68a40-822f-4c16-b21f-30b147fcea44",
+      "display_id": 16,
+      "title": "P2: Crash-safe resumption (recovery.rs deterministic table)",
+      "description": "Implement recovery.rs body: on startup, for each non-terminal issue inspect phase_substate, check filesystem ground truth (DONE sentinel for worker phases; jj_api log/bookmark/diff + octocrab for landing). Deterministic decision table per substate. Idempotent. REQ-15. AC-17, AC-18.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:53.074017473Z",
+      "updated_at": "2026-05-14T15:59:25.619950340Z",
+      "labels": [
+        "area:pump",
+        "iteration:1"
+      ],
+      "blockers": [
+        "3ed07641-38f5-4e63-ad6d-323fac15a669",
+        "5f786dd0-cd2d-494b-afde-7c409366cb5f"
+      ]
+    },
+    "c0fa7697-c557-4c94-b7fe-266a9ef4f0cc": {
+      "uuid": "c0fa7697-c557-4c94-b7fe-266a9ef4f0cc",
+      "display_id": 17,
+      "title": "L2: Landing dispatch — local mode (jj_api rebase + bookmark FF) + branch naming",
+      "description": "landing.rs: branch.rs slug helper (vdd/<id>-<short-slug>; title -> lowercase, non-alnum -> '-', collapse, trim ~40 chars at word boundary). Local mode (tracker_remote empty) via jj_api: rebase onto main, bookmark fast-forward. phase_substate progression: rebase_started -> rebase_done_bookmark_pending -> bookmark_moved_complete -> phase:merged. On conflict -> Merger (L4). REQ-17 local, Q2 resolved.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:53.197498100Z",
+      "updated_at": "2026-05-14T15:59:25.784229205Z",
+      "labels": [
+        "area:landing",
+        "iteration:1"
+      ],
+      "blockers": [
+        "5f786dd0-cd2d-494b-afde-7c409366cb5f",
+        "9aec5962-bca7-41ca-8991-2c0fa3d2bf64",
+        "e03078c1-e27b-4e6c-a4e2-19fc1880ad82"
+      ]
+    },
+    "c1bfd08b-be81-4c74-bf7e-86b01f93f50e": {
+      "uuid": "c1bfd08b-be81-4c74-bf7e-86b01f93f50e",
+      "display_id": 13,
+      "title": "S6: Events log + observability triplet",
+      "description": "events.rs: append-only events.jsonl writer with mirrored SQLite events table. Schema {ts, kind, issue_id, worker_uuid, payload, from_phase, to_phase, reason}. heartbeat-<uuid>.json path conventions documented. REQ-14. AC-9.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:52.687020768Z",
+      "updated_at": "2026-05-14T15:59:25.171744926Z",
+      "labels": [
+        "area:substrate",
+        "iteration:1"
+      ],
+      "blockers": [
+        "3ed07641-38f5-4e63-ad6d-323fac15a669"
+      ]
+    },
+    "cd6522ea-f8f6-4ba2-b775-e08ace0555ed": {
+      "uuid": "cd6522ea-f8f6-4ba2-b775-e08ace0555ed",
+      "display_id": 26,
+      "title": "Docs: write a real top-level README.md",
+      "description": "README.md is currently empty. Write a real top-level README.\n\nIt should cover: what vetinari is (a headless Rust orchestrator that drives\ncrosslink issues through an implement / static-QA / adversary / converge /\nland pipeline using sandboxed Claude workers); how to enter the dev shell\n(nix-shell, or direnv); the top-level just recipes (build, test, lint,\norchestrate, dogfood, graph); the workspace layout (crates/orchestrator,\ncrosslink_api, jj_api, error, xtask); and a pointer to\n.design/vdd-orchestrator.md as the design source of truth.\n\nKeep it accurate to what actually exists -- the orchestrator is still a\nskeleton as of iteration 0 -- and grow it as iteration-0 and iteration-1\nissues land. State plainly which pipeline stages are implemented vs planned.\n\nContext: a GitHub repo was created (origin remote) because crosslink hooks\nrequire a git origin; the canonical remote is github.com/vringar/vetinari.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "desktop",
+      "created_at": "2026-05-16T16:48:02.819795084Z",
+      "updated_at": "2026-05-16T16:48:06.278858091Z",
+      "labels": [
+        "area:foundation",
+        "iteration:0"
+      ]
+    },
+    "e03078c1-e27b-4e6c-a4e2-19fc1880ad82": {
+      "uuid": "e03078c1-e27b-4e6c-a4e2-19fc1880ad82",
+      "display_id": 4,
+      "title": "F4: jj_api insulation crate",
+      "description": "crates/jj_api wraps jj-lib. Stable adapter surface: workspace_add/forget/list, status, diff(rev_range) -> patch, log(revset), describe(rev, msg), bookmark_create/move/list, rebase(src_rev, dest_rev), git_push(remote, bookmark). No std::process::Command::new('jj') anywhere in this crate. Path-dep on jj-lib via .cargo/config.toml from nix. All errors miette::Diagnostic. REQ-1a, REQ-1c, REQ-1b.",
+      "status": "closed",
+      "priority": "critical",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:51.542374227Z",
+      "updated_at": "2026-05-16T22:38:21.835098277Z",
+      "closed_at": "2026-05-16T22:38:21.835098277Z",
+      "labels": [
+        "area:foundation",
+        "iteration:0"
+      ],
+      "blockers": [
+        "afae6546-3b57-4fe3-a175-5a2efcebcd4f"
+      ],
+      "comments": {
+        "ca5e58aa-4098-4bea-bc5b-475b0d0ec2b5": {
+          "author": "desktop",
+          "content": "F4 complete: crates/jj_api now wraps jj-lib behind a stable adapter surface (REQ-1c).\n\nJjWorkspace exposes the full operation set the issue calls for:\n- workspace_add / workspace_forget / workspace_list\n- status (read-only working-copy-vs-parent change list)\n- diff(from, to) rendering a git-format patch\n- log(revset)\n- describe(revset, message)\n- bookmark_create / bookmark_move / bookmark_list\n- rebase(source, destination)\n- git_push(remote, bookmark)\n\nDesign notes:\n- JjError is a self-contained miette::Diagnostic enum; every variant boxes the\n  underlying jj-lib cause, so jj-lib error types never leak into this crate's\n  public signatures (REQ-1b). All jj-lib API churn is contained here.\n- jj-lib is async-heavy; the adapter drives its futures on the current thread\n  via pollster, keeping the public surface synchronous and pulling no tokio\n  runtime into the orchestrator (REQ-1a).\n- jj-lib is resolved from the nix-pinned jujutsu source via a generated\n  .cargo/config.toml patch (REQ-1, REQ-1c).\n- No std::process::Command anywhere in the crate; git_push relies on jj-lib\n  running the git binary itself. The AC-24 no-shell-out lint passes (15 files\n  scanned, clean).\n\nAC-25: tests/lifecycle.rs drives add -> status -> diff -> describe -> list\n(plus log, bookmarks, rebase) entirely through library calls and passes.\n\nDelivered as 10 bisectable commits, one per operation group; the full\nworkspace builds and `just lint` is clean.\n\nstatus is intentionally read-only (no working-copy snapshot): workers drive\nthe jj CLI which snapshots on every invocation, so the recorded working-copy\ncommit is current when the orchestrator inspects a workspace, and a read-only\nstatus cannot corrupt a live worker workspace.",
+          "created_at": "2026-05-16T22:38:17.181946540Z",
+          "kind": "result",
+          "signed_by": "SHA256:BLzQi2qsaSf9ZsCx7UTcFjKLtD3r57VLOgVDKwCWkZQ",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgpOunIvKS+6l8yUoZoc/zl3nq/iH3dCG1sxOc8aYJKwQAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABABtX5E+cjkej72oD4nZ1dYI2u6g8BMWa2nKCOdqcPTUX+OJ9j5sONjj147H1v4RFYOqZPUHIDrJOYgJIN/55IBw=="
+        }
+      }
+    },
+    "e4e089df-597d-4734-9fb1-b24ea70c3f53": {
+      "uuid": "e4e089df-597d-4734-9fb1-b24ea70c3f53",
+      "display_id": 19,
+      "title": "G1: Iteration-1 close-out: fixture + self dogfood",
+      "description": "tests/fixtures/hello/: a tiny separate jj+crosslink repo. AC-11a: file issue, run orchestrator against fixture, observe end-to-end -> phase:merged. AC-11b (deferred until 11a passes): self-dogfood on this repo with a similarly trivial change. AC-26 (miette error rendering) verified in the negative-path subtests. MVP DoD.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:53.459364341Z",
+      "updated_at": "2026-05-14T15:59:26.210333478Z",
+      "labels": [
+        "area:test",
+        "iteration:1"
+      ],
+      "blockers": [
+        "2cce6b66-6936-43ac-a9d3-db966e743040",
+        "5f786dd0-cd2d-494b-afde-7c409366cb5f",
+        "b7e68a40-822f-4c16-b21f-30b147fcea44",
+        "c0fa7697-c557-4c94-b7fe-266a9ef4f0cc",
+        "faba5b16-2b39-4554-8648-88a57e0454bd"
+      ]
+    },
+    "faba5b16-2b39-4554-8648-88a57e0454bd": {
+      "uuid": "faba5b16-2b39-4554-8648-88a57e0454bd",
+      "display_id": 18,
+      "title": "L4: Merger role + post-merge QA + human-merge resumption",
+      "description": "roles/merger.rs: allowlist adds jj resolve|restore + Read/Edit/Write; commits via jj describe (NOT squash). _orchestrator/conflict.md as input. After Merger DONE: orchestrator re-runs static_qa.sh; on QA-pass retry landing; on any failure -> phase:awaiting-human-merge. human-resolved:retry label triggers retry without Merger. REQ-19, REQ-15a. AC-13, AC-14, AC-21, AC-22.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "0wAy",
+      "created_at": "2026-05-14T15:58:53.324316565Z",
+      "updated_at": "2026-05-14T15:59:25.944437483Z",
+      "labels": [
+        "area:landing",
+        "iteration:1"
+      ],
+      "blockers": [
+        "103f8bcb-a80d-47dd-a7c8-f2172e817e11",
+        "1af92780-3f70-4619-bdfc-fc52699bb780",
+        "c0fa7697-c557-4c94-b7fe-266a9ef4f0cc"
+      ]
+    }
+  },
+  "next_milestone_id": 1,
+  "watermark": {
+    "timestamp": "2026-05-15T20:30:58.676280462Z",
+    "agent_id": "desktop",
+    "agent_seq": 2
+  }
+}
