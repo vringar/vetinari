@@ -109,6 +109,82 @@ impl CrosslinkRepo {
         })
     }
 
+    /// List every issue carrying label `label`, filtered to `status` (e.g.
+    /// `"open"`), each with its full label set attached.
+    ///
+    /// This is the poll the build pump runs each tick to find the issues it may
+    /// pick up: `list_by_label("open", "phase:graphed")` returns exactly the
+    /// graphed, open issues (Q1: the pump ignores unphased issues). crosslink's
+    /// `Database::list_issues` filters by a single label at the SQL level; the
+    /// per-issue label sets are then fetched in one batched query so a caller
+    /// that needs the whole label set (to read `round:N`, say) does not
+    /// re-query per issue. Results are returned in ascending id order (stable
+    /// pickup order), regardless of crosslink's internal ordering.
+    pub fn list_by_label(&self, status: &str, label: &str) -> Result<Vec<IssueInfo>> {
+        let db = self.db()?;
+        let issues = db
+            .list_issues(Some(status), Some(label), None)
+            .map_err(|source| CrosslinkError::Read {
+                operation: format!("list `{status}` issues labeled `{label}`"),
+                source: source.into(),
+            })?;
+        let ids: Vec<i64> = issues.iter().map(|i| i.id).collect();
+        let mut labels = db
+            .get_labels_batch(&ids)
+            .map_err(|source| CrosslinkError::Read {
+                operation: "batch-read labels for listed issues".to_owned(),
+                source: source.into(),
+            })?;
+        let mut out: Vec<IssueInfo> = issues
+            .into_iter()
+            .map(|issue| IssueInfo {
+                id: issue.id,
+                title: issue.title,
+                description: issue.description,
+                status: issue.status.as_str().to_owned(),
+                priority: issue.priority.as_str().to_owned(),
+                parent_id: issue.parent_id,
+                labels: labels.remove(&issue.id).unwrap_or_default(),
+            })
+            .collect();
+        out.sort_by_key(|i| i.id);
+        Ok(out)
+    }
+
+    /// The ids of issue `id`'s blockers that are still **open** — the ones that
+    /// actually gate it.
+    ///
+    /// The build pump treats an issue as ready only when this is empty: a
+    /// graphed issue with an open blocker must wait for that blocker to land
+    /// first. A blocker that is already closed no longer gates, so it is
+    /// excluded. crosslink records dependencies as raw id pairs
+    /// (`Database::get_blockers`); this resolves each and keeps only those whose
+    /// status is `open`, in ascending id order.
+    pub fn open_blockers(&self, id: i64) -> Result<Vec<i64>> {
+        let db = self.db()?;
+        self.require_issue(&db, id)?;
+        let blockers = db.get_blockers(id).map_err(|source| CrosslinkError::Read {
+            operation: format!("read blockers of issue #{id}"),
+            source: source.into(),
+        })?;
+        let mut open = Vec::new();
+        for blocker_id in blockers {
+            let issue = db
+                .get_issue(blocker_id)
+                .map_err(|source| CrosslinkError::Read {
+                    operation: format!("read blocker issue #{blocker_id}"),
+                    source: source.into(),
+                })?;
+            if let Some(issue) = issue {
+                if issue.status.as_str() == "open" {
+                    open.push(blocker_id);
+                }
+            }
+        }
+        open.sort_unstable();
+        Ok(open)
+    }
+
     /// Add a comment to issue `issue_id` and return the new comment's id.
     ///
     /// `kind` must be a crosslink comment kind (note, plan, decision,

@@ -678,6 +678,54 @@ impl WorkerHandle {
     pub fn close(&self) {
         let _ = pane_close(&self.pane);
     }
+
+    /// Close the pane **and verify the hosted command is actually gone** before
+    /// returning — the workspace-cleanup safety step (#3).
+    ///
+    /// A failure/timeout path in the pump follows this with `jj workspace
+    /// forget` + `rm -rf`. Doing that while a surviving worker still writes into
+    /// the workspace races the removal (partial trees, resurrected files) and
+    /// leaks the process. So on any such path the pump calls this first: it
+    /// closes the pane (which terminates the pane's foreground command via
+    /// zellij's `close-pane`) and then polls [`pane_alive`] until the pane is
+    /// reported dead or `deadline` elapses. Returns `true` if the pane was
+    /// confirmed gone, `false` if the deadline passed with the pane still (or
+    /// still-appearing-to-be) alive — the caller logs the residual risk but
+    /// proceeds, since leaving the workspace forever is worse.
+    ///
+    /// RESIDUAL LIMITATION (documented follow-up, mirrors the QA-grandchild
+    /// note): workers are hosted through the `zellij` CLI, so the orchestrator
+    /// never learns the worker's OS pid (there is no per-pane pid in zellij's
+    /// IPC surface — see REQ-1d). `close-pane` terminates the pane's foreground
+    /// command, but a *grandchild* the worker spawned into its own process group
+    /// (e.g. a detached background job) can outlive the pane. A full
+    /// process-group kill needs a signal crate / `unsafe`, which this crate's
+    /// `#![forbid(unsafe_code)]` disallows; portably we do pane-close + verified
+    /// death of the pane. Persisting a real pid and group-killing it is tracked
+    /// as follow-up (#16 P2 crash-recovery).
+    pub fn close_and_wait(&self, deadline: Duration, poll_interval: Duration) -> bool {
+        self.close();
+        let stop = Instant::now() + deadline;
+        loop {
+            match pane_alive(&self.pane) {
+                // Confirmed gone: the pane closed on command exit / close-pane.
+                Ok(false) => return true,
+                Ok(true) => {
+                    if Instant::now() >= stop {
+                        return false;
+                    }
+                }
+                // A transient liveness-query hiccup: keep polling until the
+                // deadline. If it never clears, report unconfirmed.
+                Err(_) => {
+                    if Instant::now() >= stop {
+                        return false;
+                    }
+                }
+            }
+            std::thread::sleep(poll_interval);
+        }
+    }
 }
 
 /// Hosts workers in panes of a headless zellij session (REQ-1d).

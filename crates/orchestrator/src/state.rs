@@ -119,6 +119,28 @@ str_enum! {
     }
 }
 
+impl Phase {
+    /// Whether the build pump's drive step (REQ-2) may pick this phase up and
+    /// drive it. Drivable = non-terminal and non-parked: an issue whose
+    /// authoritative `state.db` phase is one of these is queued work.
+    ///
+    /// - `Graphed` — freshly ingested, never driven.
+    /// - `Implementing` / `QaGate` — a requeued or crash-interrupted in-flight
+    ///   worker phase; re-driven from `state.db` (fresh workspace, round++).
+    ///
+    /// Everything else is *not* driven by the pump:
+    /// - `Merged` / `PrOpen` — terminal success.
+    /// - `AwaitingHumanMerge` — parked for a human (REQ-15a resumes it via a
+    ///   label, not the pump's poll).
+    /// - `OrchestratorError` — poisoned; a human must inspect.
+    /// - `AdversaryReview` / `Converged` / `Landing` — iteration-2+ / in-flight
+    ///   landing substates not entered by the MVP drive loop; excluded so the
+    ///   pump never re-enters a landing mid-flight (P2 recovery, #16, owns that).
+    pub fn is_drivable(self) -> bool {
+        matches!(self, Phase::Graphed | Phase::Implementing | Phase::QaGate)
+    }
+}
+
 str_enum! {
     /// In-flight substate of a multi-step phase (REQ-2a). Tracks progress
     /// through `qa-gate` and `landing` so a crash mid-phase is recoverable.

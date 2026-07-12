@@ -106,10 +106,11 @@ fmt:
 orchestrate:
     cargo run --release -p orchestrator
 
-# Dogfood loop. Will be wired to the fixture-based test in #19 (G1).
+# Dogfood loop (AC-11a): drive one crosslink issue graphed → merged headless,
+# through the build pump against the `hello` fixture, with the Direct fake
+# worker (no live claude). This IS the MVP definition-of-done.
 dogfood:
-    @echo "dogfood loop ships with #19 (G1) — see .design/vdd-orchestrator.md AC-11a/11b"
-    @exit 0
+    cargo test -p orchestrator --test dogfood -- --nocapture
 
 # Clean every build artifact. Keeps the dev shell otherwise untouched.
 clean:

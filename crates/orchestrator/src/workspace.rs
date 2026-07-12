@@ -358,25 +358,6 @@ impl WorkspaceManager {
             })
     }
 
-    /// Repoint the existing local bookmark `name` at the commit `revset`
-    /// resolves to, under the `.jj/` gate — the fast-forward step of local-mode
-    /// landing (REQ-17, REQ-5a).
-    ///
-    /// A failure (missing bookmark, unresolvable revset, transaction error)
-    /// surfaces as [`LandingError::BookmarkMoveFailed`] carrying the bookmark
-    /// name. Moving a bookmark that already points at `revset` is a jj no-op
-    /// that still returns `Ok(())`, which is what makes the bookmark-move step
-    /// idempotent on resume (AC-18).
-    pub fn move_bookmark(&self, name: &str, revset: &str) -> Result<(), LandingError> {
-        self.gate()
-            .handle
-            .bookmark_move(name, revset)
-            .map_err(|source| LandingError::BookmarkMoveFailed {
-                bookmark: name.to_owned(),
-                source: Box::new(source),
-            })
-    }
-
     /// The full commit id the local bookmark `name` currently points at, or
     /// `None` if there is no such bookmark (or it is conflicted).
     ///
@@ -433,6 +414,35 @@ impl WorkspaceManager {
             .map_err(|source| LandingError::RebaseFailed {
                 change_revset: ancestor_revset.to_owned(),
                 dest_revset: descendant_revset.to_owned(),
+                source: Box::new(source),
+            })
+    }
+
+    /// Whether the tree of the commit `change_revset` resolves to differs from
+    /// the tree of `base_revset` — i.e. the worker's change actually carries
+    /// content, rather than being an empty commit identical to its base. Read
+    /// under the `.jj/` gate (REQ-5a).
+    ///
+    /// The empty-commit landing guard (#4): a worker that writes a valid `DONE`
+    /// but never edits the tree (or never `jj describe`s a change) leaves an
+    /// empty working-copy commit equal to `main`. Landing that as a
+    /// fast-forward would advance `main` to a no-op commit and falsely report
+    /// `phase:merged`. The pump checks this before landing and treats an empty
+    /// change as a worker failure. Implemented as a rendered `diff(base ->
+    /// change)` being non-empty; a genuine jj-op failure surfaces as
+    /// [`LandingError::RebaseFailed`] (reusing its revset-context shape).
+    pub fn change_differs_from(
+        &self,
+        base_revset: &str,
+        change_revset: &str,
+    ) -> Result<bool, LandingError> {
+        self.gate()
+            .handle
+            .diff(base_revset, change_revset)
+            .map(|patch| !patch.trim().is_empty())
+            .map_err(|source| LandingError::RebaseFailed {
+                change_revset: change_revset.to_owned(),
+                dest_revset: base_revset.to_owned(),
                 source: Box::new(source),
             })
     }

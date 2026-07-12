@@ -92,6 +92,71 @@ fn opening_a_non_crosslink_directory_fails() {
 }
 
 #[test]
+fn list_by_label_returns_matching_open_issues_with_labels() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crosslink_dir = tmp.path().join(".crosslink");
+    std::fs::create_dir_all(&crosslink_dir).expect("mkdir .crosslink");
+    let db = Database::open(&crosslink_dir.join("issues.db")).expect("open db");
+
+    // Two graphed issues, one unlabeled, one graphed-but-closed.
+    let a = db.create_issue("Graphed A", None, "high").expect("a");
+    let b = db.create_issue("Graphed B", None, "low").expect("b");
+    let c = db.create_issue("Unlabeled C", None, "low").expect("c");
+    let d = db.create_issue("Closed graphed D", None, "low").expect("d");
+    for id in [a, b, d] {
+        db.add_label(id, "phase:graphed").expect("label");
+    }
+    db.add_label(a, "round:0").expect("extra label");
+    db.add_label(c, "phase:merged").expect("label c");
+    db.close_issue(d).expect("close d");
+
+    let repo = CrosslinkRepo::open(tmp.path()).expect("open repo");
+    let graphed = repo
+        .list_by_label("open", "phase:graphed")
+        .expect("list graphed");
+
+    // Only the two OPEN graphed issues, in ascending id order.
+    let ids: Vec<i64> = graphed.iter().map(|i| i.id).collect();
+    assert_eq!(ids, vec![a, b], "closed and unlabeled issues excluded");
+    // Each carries its full label set.
+    let issue_a = graphed.iter().find(|i| i.id == a).unwrap();
+    assert!(issue_a.labels.iter().any(|l| l == "phase:graphed"));
+    assert!(issue_a.labels.iter().any(|l| l == "round:0"));
+}
+
+#[test]
+fn open_blockers_reports_only_open_blocking_issues() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crosslink_dir = tmp.path().join(".crosslink");
+    std::fs::create_dir_all(&crosslink_dir).expect("mkdir .crosslink");
+    let db = Database::open(&crosslink_dir.join("issues.db")).expect("open db");
+
+    let target = db.create_issue("Blocked target", None, "high").expect("t");
+    let open_blocker = db.create_issue("Open blocker", None, "low").expect("ob");
+    let closed_blocker = db.create_issue("Closed blocker", None, "low").expect("cb");
+    // add_dependency(target, blocker): both block `target`.
+    db.add_dependency(target, open_blocker).expect("dep open");
+    db.add_dependency(target, closed_blocker)
+        .expect("dep closed");
+    db.close_issue(closed_blocker).expect("close blocker");
+
+    let repo = CrosslinkRepo::open(tmp.path()).expect("open repo");
+    let open = repo.open_blockers(target).expect("open blockers");
+    assert_eq!(
+        open,
+        vec![open_blocker],
+        "only the still-open blocker gates the target"
+    );
+
+    // Once the last open blocker closes, the target is unblocked.
+    db.close_issue(open_blocker).expect("close last blocker");
+    assert!(
+        repo.open_blockers(target).expect("recheck").is_empty(),
+        "a fully-closed blocker set leaves no open blockers"
+    );
+}
+
+#[test]
 fn signing_without_an_identity_reports_identity_unavailable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fixture_repo(tmp.path());

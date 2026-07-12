@@ -55,9 +55,19 @@ fn fixtures_path(rel: &str) -> PathBuf {
         .unwrap_or_else(|e| panic!("tests/fixtures/{rel} must exist: {e}"))
 }
 
-/// Path to the committed fake-implementer worker script.
+/// Path to the committed fake-implementer worker script (happy path).
 pub fn fake_implementer() -> PathBuf {
     fixtures_path("fake-implementer.sh")
+}
+
+/// Path to the fake implementer that always produces a QA-failing change.
+pub fn fake_implementer_qa_fail() -> PathBuf {
+    fixtures_path("fake-implementer-qa-fail.sh")
+}
+
+/// Path to the fake implementer that writes a valid DONE but makes no change.
+pub fn fake_implementer_empty() -> PathBuf {
+    fixtures_path("fake-implementer-empty.sh")
 }
 
 /// Run `program args...` in `cwd`, panicking with captured output on failure.

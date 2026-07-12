@@ -36,6 +36,10 @@ uuid = { workspace = true }
 # (transitively via the pinned crosslink/jj-lib trees) so `digest` resolves to
 # one copy.
 sha2 = "0.10"
+# `.orchestrator/config.toml` parsing (REQ-13, config.rs). Pure-Rust TOML; the
+# 0.8 requirement unifies with the `toml 0.8.x` already in the dependency graph
+# (transitively via the pinned crosslink tree) so it resolves to one copy.
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }

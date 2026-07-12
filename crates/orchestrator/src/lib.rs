@@ -23,13 +23,20 @@
 //! - [`landing`] — local-mode landing: rebases a converged issue's change onto
 //!   `main` and fast-forwards the `main` bookmark, driving a resumable substate
 //!   machine through the `.jj/` gate (REQ-17 local path, REQ-2a, AC-11a, AC-18).
+//! - [`config`] — the `.orchestrator/config.toml` parser: the concurrency
+//!   budget, poll cadence, timeouts, and dogfood worker command (REQ-13).
+//! - [`pump`] — the build pump: the integration keystone that drives one
+//!   `phase:graphed` issue through implement → QA → land → `phase:merged`,
+//!   headless (REQ-16, REQ-13, AC-11a).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod artifacts;
+pub mod config;
 pub mod events;
 pub mod landing;
+pub mod pump;
 pub mod qa;
 pub mod recovery;
 pub mod spawn;
