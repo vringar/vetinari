@@ -20,12 +20,16 @@
 //! - [`qa`] — the static QA gate: runs `.orchestrator/static_qa.sh` against a
 //!   worker's workspace and derives a deterministic, exit-code-owned pass/fail
 //!   verdict (REQ-9, REQ-9a, AC-7).
+//! - [`landing`] — local-mode landing: rebases a converged issue's change onto
+//!   `main` and fast-forwards the `main` bookmark, driving a resumable substate
+//!   machine through the `.jj/` gate (REQ-17 local path, REQ-2a, AC-11a, AC-18).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod artifacts;
 pub mod events;
+pub mod landing;
 pub mod qa;
 pub mod recovery;
 pub mod spawn;

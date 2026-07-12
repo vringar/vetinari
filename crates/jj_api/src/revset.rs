@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use futures::TryStreamExt;
 use jj_lib::commit::Commit;
 use jj_lib::fileset::FilesetAliasesMap;
+use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo;
 use jj_lib::repo_path::RepoPathUiConverter;
 use jj_lib::revset::{
@@ -99,6 +100,38 @@ impl JjWorkspace {
                 count,
             }),
         }
+    }
+
+    /// Whether the commit `ancestor` resolves to is an ancestor of (or equal to)
+    /// the commit `descendant` resolves to — i.e. moving a bookmark from
+    /// `ancestor` to `descendant` would be a true fast-forward.
+    ///
+    /// Both revsets must resolve to exactly one commit (via the same
+    /// [`resolve_single`](Self::resolve_single) semantics the write ops use), so
+    /// an ambiguous/divergent revset is an error rather than a silent pick. The
+    /// test is the revset `ancestor & ::descendant` being non-empty: `::x` is the
+    /// ancestor set of `x` (inclusive of `x`), so the intersection is non-empty
+    /// exactly when `ancestor` lies on-or-below `descendant`.
+    ///
+    /// The load-bearing safety guard for local-mode landing: before moving the
+    /// `main` bookmark, the orchestrator asserts the current `main` commit is an
+    /// ancestor of the landing target, so `main` can only ever fast-forward and
+    /// never rewind or move sideways (REQ-17).
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let repo = self.repo_at_head()?;
+        // resolve_single pins each side to exactly one commit (erroring on an
+        // ambiguous/divergent id) before we build the ancestry query, so the
+        // guard can never be fooled by a revset that fans out to many commits.
+        let ancestor_commit = self.resolve_single(repo.as_ref(), ancestor)?;
+        let descendant_commit = self.resolve_single(repo.as_ref(), descendant)?;
+        // Query by full commit id so the intersection can't be confused by a
+        // revset symbol that resolves differently in this second evaluation.
+        let query = format!(
+            "{} & ::{}",
+            ancestor_commit.id().hex(),
+            descendant_commit.id().hex()
+        );
+        Ok(!self.evaluate_revset(repo.as_ref(), &query)?.is_empty())
     }
 }
 

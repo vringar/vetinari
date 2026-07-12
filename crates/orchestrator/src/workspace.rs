@@ -25,8 +25,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use vetinari_error::SpawnError;
-use vetinari_jj_api::{JjWorkspace, WorkspaceEntry};
+use vetinari_error::{LandingError, SpawnError};
+use vetinari_jj_api::{CommitInfo, JjWorkspace, WorkspaceEntry};
 
 use crate::state::Phase;
 
@@ -322,6 +322,186 @@ impl WorkspaceManager {
     /// Absolute path of the directory `name` lives in: `<root>/.workspace/<name>`.
     pub fn workspace_dir(&self, name: &WorkspaceName) -> PathBuf {
         self.root.join(WORKSPACE_DIR).join(name.as_str())
+    }
+
+    // --- landing primitives (REQ-17 local path, REQ-5a) --------------------
+    //
+    // These mutate `.jj/` (rebase, bookmark move) or read the commit graph and
+    // MUST share the same serializing gate as the workspace lifecycle above, so
+    // a rebase in the landing step cannot race a `workspace add` in the build
+    // pump (REQ-5a). They live on the manager — behind [`gate`](Self::gate) —
+    // rather than as free functions taking a raw handle, so the "the mutex owns
+    // the only handle" invariant is preserved: no raw [`JjWorkspace`] ever
+    // escapes.
+
+    /// Rebase the change `source_revset` resolves to so its parent becomes the
+    /// commit `dest_revset` resolves to, under the `.jj/` gate (REQ-17, REQ-5a).
+    ///
+    /// A rebase that cannot apply cleanly is **not** an error — jj records the
+    /// conflict in the rebased commit's tree and the operation succeeds. The
+    /// returned [`CommitInfo`] carries [`CommitInfo::has_conflict`]; the caller
+    /// (`land_local`) checks that flag to decide between fast-forwarding and
+    /// parking for a human. Only a genuine jj-op failure (unresolvable revset,
+    /// backend/transaction error) surfaces as [`LandingError::RebaseFailed`].
+    pub fn rebase(
+        &self,
+        source_revset: &str,
+        dest_revset: &str,
+    ) -> Result<CommitInfo, LandingError> {
+        self.gate()
+            .handle
+            .rebase(source_revset, dest_revset)
+            .map_err(|source| LandingError::RebaseFailed {
+                change_revset: source_revset.to_owned(),
+                dest_revset: dest_revset.to_owned(),
+                source: Box::new(source),
+            })
+    }
+
+    /// Repoint the existing local bookmark `name` at the commit `revset`
+    /// resolves to, under the `.jj/` gate — the fast-forward step of local-mode
+    /// landing (REQ-17, REQ-5a).
+    ///
+    /// A failure (missing bookmark, unresolvable revset, transaction error)
+    /// surfaces as [`LandingError::BookmarkMoveFailed`] carrying the bookmark
+    /// name. Moving a bookmark that already points at `revset` is a jj no-op
+    /// that still returns `Ok(())`, which is what makes the bookmark-move step
+    /// idempotent on resume (AC-18).
+    pub fn move_bookmark(&self, name: &str, revset: &str) -> Result<(), LandingError> {
+        self.gate()
+            .handle
+            .bookmark_move(name, revset)
+            .map_err(|source| LandingError::BookmarkMoveFailed {
+                bookmark: name.to_owned(),
+                source: Box::new(source),
+            })
+    }
+
+    /// The full commit id the local bookmark `name` currently points at, or
+    /// `None` if there is no such bookmark (or it is conflicted).
+    ///
+    /// Used by the resumable landing machine to read filesystem/graph ground
+    /// truth (REQ-15): after a crash in `rebase_done_bookmark_pending`, the
+    /// resume path compares this against the landed change's commit id to decide
+    /// whether the move already happened (advance) or still needs doing (retry).
+    pub fn bookmark_target(&self, name: &str) -> Result<Option<String>, LandingError> {
+        let list = self.gate().handle.bookmark_list().map_err(|source| {
+            LandingError::BookmarkMoveFailed {
+                bookmark: name.to_owned(),
+                source: Box::new(source),
+            }
+        })?;
+        Ok(list
+            .into_iter()
+            .find(|b| b.name == name)
+            .and_then(|b| b.target))
+    }
+
+    /// Metadata for the single commit `revset` resolves to, under the `.jj/`
+    /// gate. A convenience read used by the landing machine to fetch the landed
+    /// change's commit id (for the bookmark-move idempotency check) without the
+    /// caller reaching a raw handle.
+    ///
+    /// Uses the length-checked `resolve_single` semantics: an *ambiguous* revset
+    /// (e.g. a divergent change id resolving to several commits) is an error, not
+    /// a silent pick of one. Errors as [`LandingError::RebaseFailed`] (reusing
+    /// its revset-context shape) if the revset does not resolve to exactly one
+    /// commit.
+    pub fn resolve_change(&self, revset: &str) -> Result<CommitInfo, LandingError> {
+        self.gate()
+            .handle
+            .resolve_single_info(revset)
+            .map_err(|source| LandingError::RebaseFailed {
+                change_revset: revset.to_owned(),
+                dest_revset: revset.to_owned(),
+                source: Box::new(source),
+            })
+    }
+
+    /// Whether the commit `ancestor_revset` resolves to is an ancestor of (or
+    /// equal to) the commit `descendant_revset` resolves to — i.e. moving a
+    /// bookmark from the former to the latter would be a true fast-forward.
+    /// Read under the `.jj/` gate (REQ-5a).
+    pub fn is_ancestor(
+        &self,
+        ancestor_revset: &str,
+        descendant_revset: &str,
+    ) -> Result<bool, LandingError> {
+        self.gate()
+            .handle
+            .is_ancestor(ancestor_revset, descendant_revset)
+            .map_err(|source| LandingError::RebaseFailed {
+                change_revset: ancestor_revset.to_owned(),
+                dest_revset: descendant_revset.to_owned(),
+                source: Box::new(source),
+            })
+    }
+
+    /// Fast-forward the local bookmark `name` to the commit `target_revset`
+    /// resolves to, **refusing any move that is not a true fast-forward**
+    /// (REQ-17). The load-bearing safety guard for local-mode landing.
+    ///
+    /// The whole check-then-move runs under a single hold of the `.jj/` gate, so
+    /// no concurrent lander (REQ-5a) can advance `main` between the ancestry
+    /// check and the bookmark write: the guard sees a consistent view and the
+    /// move is atomic with it. If the bookmark's current commit is **not** an
+    /// ancestor of `target_revset`, the move is refused with
+    /// [`LandingError::NotFastForward`] and the bookmark is left untouched —
+    /// `main` can only ever advance, never rewind or move sideways.
+    ///
+    /// A bookmark already at `target_revset` is a fast-forward (equal is an
+    /// ancestor), so the move is a jj no-op and this stays idempotent on resume.
+    /// A missing bookmark surfaces as [`LandingError::BookmarkMoveFailed`].
+    pub fn fast_forward_bookmark(
+        &self,
+        name: &str,
+        target_revset: &str,
+    ) -> Result<(), LandingError> {
+        // One gate hold spans read-current → ancestry-check → move, so a
+        // concurrent `.jj/` mutator cannot slip between the guard and the write.
+        let gate = self.gate();
+        let current = gate
+            .handle
+            .bookmark_list()
+            .map_err(|source| LandingError::BookmarkMoveFailed {
+                bookmark: name.to_owned(),
+                source: Box::new(source),
+            })?
+            .into_iter()
+            .find(|b| b.name == name)
+            .and_then(|b| b.target)
+            .ok_or_else(|| LandingError::BookmarkMoveFailed {
+                bookmark: name.to_owned(),
+                source: format!("bookmark `{name}` is absent or conflicted").into(),
+            })?;
+        // Fast-forward iff the current commit is an ancestor of (or equal to)
+        // the target. Query by full commit id on both sides so the check can't
+        // be fooled by a symbol resolving differently between reads.
+        let is_ff = gate
+            .handle
+            .is_ancestor(&current, target_revset)
+            .map_err(|source| LandingError::BookmarkMoveFailed {
+                bookmark: name.to_owned(),
+                source: Box::new(source),
+            })?;
+        if !is_ff {
+            let target = gate
+                .handle
+                .resolve_single_info(target_revset)
+                .map(|c| c.commit_id)
+                .unwrap_or_else(|_| target_revset.to_owned());
+            return Err(LandingError::NotFastForward {
+                bookmark: name.to_owned(),
+                current,
+                target,
+            });
+        }
+        gate.handle
+            .bookmark_move(name, target_revset)
+            .map_err(|source| LandingError::BookmarkMoveFailed {
+                bookmark: name.to_owned(),
+                source: Box::new(source),
+            })
     }
 
     /// Take the serializing lock, yielding a [`JjGate`] through which — and only

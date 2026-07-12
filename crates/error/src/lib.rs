@@ -403,6 +403,51 @@ pub enum LandingError {
         QaError,
     ),
 
+    /// A jj operation the landing step drove — the rebase itself, or a revset
+    /// resolution needed to run it — failed outright (a backend/transaction
+    /// error, an unresolvable revset). Distinct from [`RebaseConflict`]: a
+    /// conflict is a *successful* jj rebase whose result tree carries markers
+    /// (checked via [`CommitInfo::has_conflict`]), whereas this is the rebase
+    /// operation failing to complete at all. Routes to
+    /// `phase:orchestrator-error`, not a Merger.
+    ///
+    /// [`RebaseConflict`]: LandingError::RebaseConflict
+    /// [`CommitInfo::has_conflict`]: https://github.com/vringar/vetinari/blob/main/crates/jj_api/src/log.rs
+    #[error("jj rebase operation failed for `{change_revset}` onto `{dest_revset}`")]
+    #[diagnostic(
+        code(vetinari::landing::rebase_failed),
+        help("Not a conflict (that is handled separately) — the jj operation itself failed. Inspect `jj op log`.")
+    )]
+    RebaseFailed {
+        /// Revset naming the change being landed.
+        change_revset: String,
+        /// Revset naming the rebase destination (typically the `main` bookmark).
+        dest_revset: String,
+        /// Underlying `jj_api` cause.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// The landing target is **not** a fast-forward of the current `main`
+    /// bookmark: `main`'s commit is not an ancestor of the target, so moving the
+    /// bookmark would rewind trunk or move it sideways, orphaning committed work.
+    /// The move is refused and the issue parks at `phase:awaiting-human-merge`
+    /// (REQ-17). This is how a concurrent lander (REQ-5a) or a stale/advanced
+    /// revset fails *safe* — the bookmark is never rewound.
+    #[error("refusing to move bookmark `{bookmark}`: target `{target}` is not a fast-forward of the current `{bookmark}` (`{current}`)")]
+    #[diagnostic(
+        code(vetinari::landing::not_fast_forward),
+        help("`main` moved (a concurrent land, or a stale change-id target) so this land is no longer a fast-forward. The issue parks at phase:awaiting-human-merge; a human (or a Merger) must reconcile.")
+    )]
+    NotFastForward {
+        /// Bookmark that would have been rewound (typically `main`).
+        bookmark: String,
+        /// Commit the bookmark currently points at.
+        current: String,
+        /// Commit the landing tried to fast-forward the bookmark to.
+        target: String,
+    },
+
     /// Recovery found a landing substate that doesn't match filesystem ground
     /// truth (REQ-2a).
     #[error("landing substate `{substate}` disagrees with filesystem truth: {fs_truth}")]
@@ -732,6 +777,8 @@ mod tests {
             "vetinari::landing::rebase_conflict",
             "vetinari::landing::push_conflict",
             "vetinari::landing::bookmark_move_failed",
+            "vetinari::landing::not_fast_forward",
+            "vetinari::landing::rebase_failed",
             "vetinari::landing::gh_auth_missing",
             "vetinari::landing::pr_create_failed",
             "vetinari::landing::merger_invalid_result",

@@ -57,4 +57,18 @@ impl JjWorkspace {
         let commits = self.evaluate_revset(repo.as_ref(), revset)?;
         Ok(commits.iter().map(CommitInfo::from_commit).collect())
     }
+
+    /// Resolve `revset` to metadata for **exactly one** commit, erroring if it
+    /// matches zero ([`JjError::NoSuchRevision`]) or more than one
+    /// ([`JjError::AmbiguousRevision`]).
+    ///
+    /// Unlike [`log`](Self::log), which returns every match and lets the caller
+    /// pick, this enforces an unambiguous target — the semantics the landing
+    /// machine needs so a divergent change id resolving to several commits is a
+    /// hard error rather than a silent pick of one.
+    pub fn resolve_single_info(&self, revset: &str) -> Result<CommitInfo> {
+        let repo = self.repo_at_head()?;
+        let commit = self.resolve_single(repo.as_ref(), revset)?;
+        Ok(CommitInfo::from_commit(&commit))
+    }
 }
