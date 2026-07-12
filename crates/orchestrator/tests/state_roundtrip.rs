@@ -41,10 +41,11 @@ fn state_db_survives_a_restart() {
         last_heartbeat: 1_700_000_050,
     };
     let posted = PostedArtifact {
-        worker_uuid: "worker-uuid-7".into(),
+        issue_id: "#42".into(),
         artifact_path: "_orchestrator/findings.jsonl".into(),
         content_sha: "sha-1".into(),
         finding_index: 0,
+        worker_uuid: "worker-uuid-7".into(),
         comment_id: "comment-99".into(),
         posted_at: 1_700_000_060,
     };

@@ -10,7 +10,11 @@
 //!   bookkeeping.
 //! - `active_workers` — one row per live worker, for the watchdog and recovery.
 //! - `posted_artifacts` — the idempotency ledger for comment translation
-//!   (REQ-3b): each `(worker, artifact-sha, finding-index)` tuple posts once.
+//!   (REQ-3b, AC-17): each `(issue, artifact-path, content-sha, finding-index)`
+//!   tuple posts once. The dedup key is **content-addressed and issue-scoped**,
+//!   NOT keyed on the worker uuid: recovery re-drives an issue under a fresh
+//!   uuid, so keying on the uuid would let identical content post twice. The
+//!   producing `worker_uuid` is retained as a non-key audit column.
 //! - `events` — the SQLite mirror of `events.jsonl` for queryable observability.
 //!
 //! # Forward-only schema
@@ -236,13 +240,18 @@ CREATE TABLE issues (
 );
 
 CREATE TABLE posted_artifacts (
-  worker_uuid   TEXT NOT NULL,
+  issue_id      TEXT NOT NULL,
   artifact_path TEXT NOT NULL,
   content_sha   TEXT NOT NULL,
   finding_index INTEGER NOT NULL DEFAULT -1,
+  -- worker_uuid is a NON-KEY audit column: it records which attempt/worker
+  -- produced the posted comment, but the dedup key below is content-addressed
+  -- and issue-scoped so a re-translation of identical content under a fresh
+  -- uuid (crash recovery re-drive) still posts at most once (AC-17).
+  worker_uuid   TEXT NOT NULL,
   comment_id    TEXT NOT NULL,
   posted_at     INTEGER NOT NULL,
-  PRIMARY KEY (worker_uuid, artifact_path, content_sha, finding_index)
+  PRIMARY KEY (issue_id, artifact_path, content_sha, finding_index)
 );
 
 CREATE TABLE active_workers (
@@ -340,11 +349,18 @@ pub struct ActiveWorkerRow {
     pub last_heartbeat: i64,
 }
 
-/// A row of the `posted_artifacts` table — the REQ-3b idempotency ledger.
+/// A row of the `posted_artifacts` table — the REQ-3b / AC-17 idempotency
+/// ledger.
+///
+/// The dedup key is `(issue_id, artifact_path, content_sha, finding_index)` —
+/// content-addressed and issue-scoped. `worker_uuid` is a non-key audit column:
+/// it records the producing attempt but does NOT participate in deduplication,
+/// so a re-translation of identical content for the same issue under a fresh
+/// uuid (a recovery re-drive) still posts at most once.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PostedArtifact {
-    /// Worker that produced the artifact.
-    pub worker_uuid: String,
+    /// Issue the comment was posted to — part of the content-addressed dedup key.
+    pub issue_id: String,
     /// Artifact path within the worker's `_orchestrator/` directory.
     pub artifact_path: String,
     /// SHA-256 of the artifact's content at posting time.
@@ -352,6 +368,8 @@ pub struct PostedArtifact {
     /// Index of the finding within a multi-finding artifact; `-1` for a
     /// whole-file artifact such as `result.md`.
     pub finding_index: i64,
+    /// Worker that produced the artifact — a non-key AUDIT column.
+    pub worker_uuid: String,
     /// Crosslink comment id returned when the comment was posted.
     pub comment_id: String,
     /// Unix seconds the comment was posted.
@@ -616,21 +634,27 @@ impl StateDb {
 
     /// Record that a comment was posted for an artifact tuple. Returns `true`
     /// if this is the first time the tuple was seen, `false` if it was already
-    /// recorded — the REQ-3b idempotency guard that makes comment translation
-    /// safe to re-run after a crash.
+    /// recorded — the REQ-3b / AC-17 idempotency guard that makes comment
+    /// translation safe to re-run after a crash.
+    ///
+    /// Dedup is on the content-addressed key `(issue_id, artifact_path,
+    /// content_sha, finding_index)`; `worker_uuid` is written as an audit column
+    /// only, so a re-translation of identical content under a fresh uuid (a
+    /// recovery re-drive) is correctly suppressed.
     pub fn record_posted(&self, posted: &PostedArtifact) -> Result<bool, StateError> {
         let changed = self
             .conn
             .execute(
                 "INSERT OR IGNORE INTO posted_artifacts
-                   (worker_uuid, artifact_path, content_sha, finding_index,
-                    comment_id, posted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                   (issue_id, artifact_path, content_sha, finding_index,
+                    worker_uuid, comment_id, posted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    posted.worker_uuid,
+                    posted.issue_id,
                     posted.artifact_path,
                     posted.content_sha,
                     posted.finding_index,
+                    posted.worker_uuid,
                     posted.comment_id,
                     posted.posted_at,
                 ],
@@ -639,10 +663,12 @@ impl StateDb {
         Ok(changed == 1)
     }
 
-    /// Whether a comment has already been posted for this artifact tuple.
+    /// Whether a comment has already been posted for this artifact tuple. Keyed
+    /// on the content-addressed `(issue_id, artifact_path, content_sha,
+    /// finding_index)` tuple, NOT the producing worker uuid.
     pub fn is_posted(
         &self,
-        worker_uuid: &str,
+        issue_id: &str,
         artifact_path: &str,
         content_sha: &str,
         finding_index: i64,
@@ -651,9 +677,9 @@ impl StateDb {
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM posted_artifacts
-                 WHERE worker_uuid = ?1 AND artifact_path = ?2
+                 WHERE issue_id = ?1 AND artifact_path = ?2
                    AND content_sha = ?3 AND finding_index = ?4",
-                params![worker_uuid, artifact_path, content_sha, finding_index],
+                params![issue_id, artifact_path, content_sha, finding_index],
                 |r| r.get(0),
             )
             .map_err(query_err("check posted artifact"))?;
@@ -916,10 +942,11 @@ mod tests {
     fn posted_artifacts_are_idempotent() {
         let (_dir, db) = temp_db();
         let posted = PostedArtifact {
-            worker_uuid: "w1".into(),
+            issue_id: "42".into(),
             artifact_path: "_orchestrator/findings.jsonl".into(),
             content_sha: "sha".into(),
             finding_index: 0,
+            worker_uuid: "w1".into(),
             comment_id: "c1".into(),
             posted_at: 100,
         };
@@ -929,10 +956,41 @@ mod tests {
             "second insert of the same tuple is a no-op"
         );
         assert!(db
-            .is_posted("w1", "_orchestrator/findings.jsonl", "sha", 0)
+            .is_posted("42", "_orchestrator/findings.jsonl", "sha", 0)
             .unwrap());
         assert!(!db
-            .is_posted("w1", "_orchestrator/findings.jsonl", "sha", 1)
+            .is_posted("42", "_orchestrator/findings.jsonl", "sha", 1)
+            .unwrap());
+    }
+
+    #[test]
+    fn posted_artifacts_dedup_is_content_addressed_not_uuid_keyed() {
+        // The AC-17 property: identical content for the SAME issue posted under
+        // a DIFFERENT worker uuid (a recovery re-drive) is a dedup no-op — the
+        // uuid is an audit column, not part of the key.
+        let (_dir, db) = temp_db();
+        let first = PostedArtifact {
+            issue_id: "42".into(),
+            artifact_path: "_orchestrator/result.md".into(),
+            content_sha: "sha".into(),
+            finding_index: -1,
+            worker_uuid: "crashed-uuid".into(),
+            comment_id: "c1".into(),
+            posted_at: 100,
+        };
+        assert!(db.record_posted(&first).unwrap(), "first insert is new");
+        // Same issue + content, fresh uuid (the redrive) → suppressed.
+        let redrive = PostedArtifact {
+            worker_uuid: "fresh-uuid".into(),
+            comment_id: "c2".into(),
+            ..first.clone()
+        };
+        assert!(
+            !db.record_posted(&redrive).unwrap(),
+            "identical content under a fresh uuid must be a dedup no-op (AC-17)"
+        );
+        assert!(db
+            .is_posted("42", "_orchestrator/result.md", "sha", -1)
             .unwrap());
     }
 

@@ -764,22 +764,27 @@ impl BuildPump {
     }
 
     /// Translate a worker's verified artifacts into crosslink comments,
-    /// idempotently against the `posted_artifacts` ledger (REQ-3, REQ-3b).
+    /// idempotently against the `posted_artifacts` ledger (REQ-3, REQ-3b,
+    /// AC-17).
     ///
-    /// Each planned comment is posted at most once: the `(worker_uuid,
-    /// artifact_path, content_sha, finding_index)` tuple is checked against the
-    /// ledger first; a tuple already recorded is skipped (crash-replay safe).
+    /// Each planned comment is posted at most once: the content-addressed
+    /// `(issue_id, artifact_path, content_sha, finding_index)` tuple is checked
+    /// against the ledger first; a tuple already recorded is skipped. Keying on
+    /// the issue + content (not the worker uuid) means a re-translation of
+    /// identical content under a fresh uuid — a crash-recovery re-drive — is also
+    /// suppressed, so a comment posts at most once across attempts.
     fn translate_artifacts(
         &self,
         issue_id: i64,
         worker_uuid: &str,
         done: &DoneSentinel,
     ) -> Result<(), PumpError> {
+        let issue_key = issue_id.to_string();
         let set = ArtifactSet { done: done.clone() };
         let plan = crate::artifacts::translation_plan(worker_uuid, &set)?;
         for item in plan {
             if self.state.is_posted(
-                worker_uuid,
+                &issue_key,
                 &item.artifact_path,
                 &item.content_sha,
                 item.finding_index,
@@ -793,10 +798,11 @@ impl BuildPump {
                 Some(WORKER_ROLE_TAG),
             )?;
             self.state.record_posted(&crate::state::PostedArtifact {
-                worker_uuid: worker_uuid.to_owned(),
+                issue_id: issue_key.clone(),
                 artifact_path: item.artifact_path,
                 content_sha: item.content_sha,
                 finding_index: item.finding_index,
+                worker_uuid: worker_uuid.to_owned(),
                 comment_id: comment_id.to_string(),
                 posted_at: now_unix(),
             })?;

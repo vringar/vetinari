@@ -98,6 +98,22 @@ fn main() -> miette::Result<()> {
     // dogfood worker skips it. Build the spawner from the environment pin.
     let spawner = Spawner::from_env(session, &root)?;
 
+    // REQ-15 (AC-17, AC-18): deterministic crash recovery. BEFORE the pump loop,
+    // re-derive filesystem ground truth for every non-terminal issue and any
+    // `active_workers` row and advance / repeat / roll back idempotently — clean
+    // a crashed worker's workspace, replay an interrupted (idempotent)
+    // translation, or resume a mid-flight landing. This leaves each issue in a
+    // state the pump can then pick up and drive. Recovery is idempotent, so a
+    // restart mid-recovery re-runs it harmlessly.
+    let recovered = orchestrator::recovery::recover(&state, &log, &manager, Some(&crosslink))?;
+    for action in &recovered {
+        tracing::info!(?action, "crash recovery reconciled an issue");
+    }
+    tracing::info!(
+        reconciled = recovered.len(),
+        "crash recovery complete — entering the pump loop"
+    );
+
     let pump = BuildPump::new(config, state, log, manager, spawner, crosslink);
 
     tracing::info!("build pump ready — entering tick loop (Ctrl-C to stop)");

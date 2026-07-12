@@ -715,15 +715,19 @@ pub struct TranslationItem {
 /// - any other declared artifact (`DONE`, `progress.jsonl`, …) is not
 ///   translated to a comment and is skipped.
 ///
-/// `worker_uuid` is threaded through for symmetry with the ledger key (the
-/// ledger's primary key is `(worker_uuid, artifact_path, content_sha,
-/// finding_index)`), but does not affect item ordering or bodies — the plan is
-/// per-worker already.
+/// `worker_uuid` is threaded through for provenance (recovery records it as the
+/// ledger's audit column), but does not affect item ordering or bodies and is
+/// **not** part of the dedup key. The ledger's primary key is content-addressed
+/// and issue-scoped — `(issue_id, artifact_path, content_sha, finding_index)` —
+/// so a re-translation of identical content under a different uuid still posts at
+/// most once (AC-17). Each item carries the per-artifact `(artifact_path,
+/// content_sha, finding_index)` triple the orchestrator combines with the issue
+/// id at post time.
 pub fn translation_plan(
     worker_uuid: &str,
     set: &ArtifactSet,
 ) -> Result<Vec<TranslationItem>, ArtifactError> {
-    let _ = worker_uuid; // key symmetry; see doc comment.
+    let _ = worker_uuid; // provenance only; see doc comment.
     let mut items = Vec::new();
     let is_success = set.done.exit_status() == ExitStatus::Success;
 

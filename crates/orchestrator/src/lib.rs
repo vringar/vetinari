@@ -6,8 +6,9 @@
 //!
 //! - [`state`] — the SQLite-backed `state.db`, the orchestrator's
 //!   authoritative state (REQ-2, REQ-2a, REQ-3b).
-//! - [`recovery`] — the crash-safe resumption scaffold (REQ-15); the full
-//!   deterministic table lands in P2 (#16).
+//! - [`recovery`] — the deterministic crash-safe resumption table (REQ-15,
+//!   AC-17, AC-18): on start, for every non-terminal issue, re-derive
+//!   filesystem ground truth and advance / repeat / roll back idempotently.
 //! - [`workspace`] — the per-worker jj workspace lifecycle behind the
 //!   serializing `.jj/` gate (REQ-5a, REQ-12).
 //! - [`artifacts`] — the worker → orchestrator artifact contract, the DONE
