@@ -19,6 +19,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use thiserror::Error;
@@ -210,10 +211,15 @@ pub enum SpawnError {
 // QA gate errors (REQ-9, AC-7)
 // ============================================================================
 
-/// Errors raised by [`crate::QaError::ToolNonZero`] are the common case and get
-/// translated to `--kind blocker` comments. The other variants indicate the QA
-/// script itself is malformed — those bypass the normal blocker path and route
-/// the issue to `phase:orchestrator-error`.
+/// Errors raised by the static QA gate.
+///
+/// Every variant here is **poison**: it means the gate itself is broken, hung,
+/// or died — not that a QA tool returned non-zero. A real QA-tool failure is a
+/// deterministic *verdict*, carried by `QaOutcome::Fail`, never a `QaError`.
+/// These variants all route the issue to `phase:orchestrator-error` for human
+/// inspection, never a `--kind blocker` (see the design's error-handling
+/// section: "`static_qa.sh` itself errors" is distinct from "a QA tool returned
+/// non-zero").
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum QaError {
@@ -228,36 +234,74 @@ pub enum QaError {
         path: PathBuf,
     },
 
-    /// The script itself failed before any tool ran (e.g. shebang missing,
-    /// syntax error). Distinguished from [`ToolNonZero`] because it indicates
-    /// repo misconfiguration rather than a real failed check.
+    /// The `bash <script>` child could not even be spawned — `bash` itself is
+    /// missing from PATH, or the path could not be reached (an unsearchable
+    /// parent directory). The script's own `+x` bit is irrelevant: the gate runs
+    /// it as `bash <path>`, so the shebang and the executable bit are ignored
+    /// (only `bash` needs to be executable). Like [`ScriptNotFound`], this is
+    /// repo/host misconfiguration, not a failed check, so it routes to
+    /// `phase:orchestrator-error`, never a blocker.
+    ///
+    /// [`ScriptNotFound`]: QaError::ScriptNotFound
+    #[error("static QA script `{path}` could not be spawned")]
+    #[diagnostic(
+        code(vetinari::qa::script_unspawnable),
+        help("Check that `bash` is on PATH and the script's parent directory is reachable. The script need not be executable — it is run as `bash <path>`.")
+    )]
+    ScriptUnspawnable {
+        /// Path the orchestrator tried to run.
+        path: PathBuf,
+        /// Underlying spawn (I/O) error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The gate is structurally broken: `bash` could not execute the script
+    /// (exit 126 — not executable / not a valid program), or a command *inside*
+    /// the script was not found (exit 127 — e.g. `cargo` missing from PATH).
+    /// Either way the gate never ran the QA tools, so this is repo/host
+    /// misconfiguration rather than a real failed check.
     #[error("static QA script errored before running any tool (exit {exit_code})")]
     #[diagnostic(
         code(vetinari::qa::script_errored),
-        help("Run the script directly and read the shell error; the orchestrator cannot proceed until it's well-formed.")
+        help("Run the script directly and read the shell error; the orchestrator cannot proceed until it's well-formed. Exit 126 means not executable / cannot exec; 127 means a command inside the script (e.g. `cargo`) is missing from PATH.")
     )]
     ScriptItselfErrored {
-        /// Script exit code.
+        /// Script exit code (126 = cannot exec, 127 = command-not-found).
         exit_code: i32,
-        /// Captured stderr from the script's own shell invocation.
+        /// Last ~50 lines of the script's combined output, for the human who
+        /// inspects the poison state.
         message: String,
     },
 
-    /// A QA tool returned non-zero. This is the routine path that triggers a
-    /// `--kind blocker` comment and re-spawns the Implementer.
-    #[error("QA tool `{tool}` failed (exit {exit_code})")]
+    /// The QA script was killed by a signal (exit code is `None`): an OOM kill,
+    /// a `SIGKILL`, or similar. That is an environmental anomaly, not a QA tool
+    /// saying no, so it is poison — the orchestrator surfaces it rather than
+    /// treating it as a routine blocker.
+    #[error("static QA script was killed by a signal{}", match signal { Some(s) => format!(" ({s})"), None => String::new() })]
     #[diagnostic(
-        code(vetinari::qa::tool_non_zero),
-        help("The Implementer re-spawn will receive `output_tail` as input; fix the failing check there.")
+        code(vetinari::qa::script_killed),
+        help("The script died before exiting normally — check for OOM (dmesg), a `kill`, or a resource limit. This is an environment anomaly, not a failed check.")
     )]
-    ToolNonZero {
-        /// Tool name (e.g. `cargo clippy`, `pytest`).
-        tool: String,
-        /// Tool's exit code.
-        exit_code: i32,
-        /// Last ~50 lines of combined stdout+stderr, preserved verbatim for the
-        /// blocker comment body.
-        output_tail: String,
+    Killed {
+        /// The terminating signal number, if the platform exposed it.
+        signal: Option<i32>,
+        /// Last ~50 lines of output captured before the kill, for inspection.
+        message: String,
+    },
+
+    /// The QA script did not finish within the gate's timeout. A wedged script
+    /// (a hung `cargo`, a deadlocked test) must not brick the headless pump —
+    /// no heartbeat watchdog covers the orchestrator-run gate — so the gate
+    /// kills the child and surfaces this as poison for human inspection.
+    #[error("static QA script timed out after {after:.1?}")]
+    #[diagnostic(
+        code(vetinari::qa::timed_out),
+        help("The script exceeded DEFAULT_QA_TIMEOUT. A hang is an anomaly the orchestrator must surface, not silently retry — inspect why the gate wedged (deadlocked test, network wait).")
+    )]
+    TimedOut {
+        /// How long the gate waited before killing the child.
+        after: Duration,
     },
 }
 
@@ -681,8 +725,10 @@ mod tests {
             "vetinari::spawn::io",
             "vetinari::spawn::workspace_prep",
             "vetinari::qa::script_not_found",
+            "vetinari::qa::script_unspawnable",
             "vetinari::qa::script_errored",
-            "vetinari::qa::tool_non_zero",
+            "vetinari::qa::script_killed",
+            "vetinari::qa::timed_out",
             "vetinari::landing::rebase_conflict",
             "vetinari::landing::push_conflict",
             "vetinari::landing::bookmark_move_failed",
@@ -716,10 +762,9 @@ mod tests {
     #[test]
     fn errors_flow_through_question_mark() {
         fn level_one() -> Result<()> {
-            Err(QaError::ToolNonZero {
-                tool: "cargo clippy".into(),
-                exit_code: 101,
-                output_tail: "error: unused variable\n".into(),
+            Err(QaError::ScriptItselfErrored {
+                exit_code: 127,
+                message: "cargo: command not found\n".into(),
             }
             .into())
         }
@@ -730,7 +775,7 @@ mod tests {
         let err = level_two().unwrap_err();
         assert!(matches!(
             err,
-            OrchestratorError::Qa(QaError::ToolNonZero { .. })
+            OrchestratorError::Qa(QaError::ScriptItselfErrored { .. })
         ));
     }
 

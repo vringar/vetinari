@@ -17,12 +17,16 @@
 //! - [`spawn`] — hosting a worker in a zellij pane inside a prepared jj
 //!   workspace, behind the per-role mount matrix and the `claude-sandbox`
 //!   version-pin guard (REQ-1d, REQ-4, REQ-4a, REQ-5, REQ-13, AC-19, AC-27).
+//! - [`qa`] — the static QA gate: runs `.orchestrator/static_qa.sh` against a
+//!   worker's workspace and derives a deterministic, exit-code-owned pass/fail
+//!   verdict (REQ-9, REQ-9a, AC-7).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod artifacts;
 pub mod events;
+pub mod qa;
 pub mod recovery;
 pub mod spawn;
 pub mod state;
