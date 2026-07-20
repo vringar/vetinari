@@ -233,6 +233,7 @@ fn ac19_spawn_refuses_claude_worker_on_mismatch_without_creating_a_pane() {
         role: WorkerRole::Implementer,
         task: "irrelevant — the spawn must refuse first".into(),
         allowlist: "Read".into(),
+        denylist: "Bash(git:*)".into(),
         system_prompt: "You are the Implementer.".into(),
         max_turns: 80,
         mounts: orchestrator::spawn::MountMatrix::for_role(
@@ -274,6 +275,7 @@ fn claude_spawn_errors_cleanly_when_workspace_has_no_shell_nix() {
         prepared.path(),
         "task body",
         "Read",
+        "Bash(git:*)",
         "You are the Implementer.",
         80,
     );
@@ -332,6 +334,7 @@ fn claude_spawn(role: WorkerRole, root: &Path, workspace: &Path) -> ClaudeSpawn 
         workspace,
         "probe task",
         "Read",
+        "",
         "probe prompt",
         1,
     ) {

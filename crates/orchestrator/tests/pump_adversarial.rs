@@ -75,6 +75,7 @@ fn config_for(script: &Path) -> OrchestratorConfig {
     OrchestratorConfig {
         worker: WorkerConfig {
             argv: vec!["bash".to_owned(), script.to_string_lossy().into_owned()],
+            ..WorkerConfig::default()
         },
         worker_timeout_secs: 60,
         ..OrchestratorConfig::default()

@@ -25,6 +25,9 @@
 //! - [`landing`] — local-mode landing: rebases a converged issue's change onto
 //!   `main` and fast-forwards the `main` bookmark, driving a resumable substate
 //!   machine through the `.jj/` gate (REQ-17 local path, REQ-2a, AC-11a, AC-18).
+//! - [`roles`] — the per-role policy (tool allowlist, system prompt, turn cap)
+//!   a `claude` worker runs under; the Implementer role (S7) is the MVP's
+//!   primary VCS-isolation control (REQ-4, REQ-5, REQ-13).
 //! - [`config`] — the `.orchestrator/config.toml` parser: the concurrency
 //!   budget, poll cadence, timeouts, and dogfood worker command (REQ-13).
 //! - [`pump`] — the build pump: the integration keystone that drives one
@@ -41,6 +44,7 @@ pub mod landing;
 pub mod pump;
 pub mod qa;
 pub mod recovery;
+pub mod roles;
 pub mod spawn;
 pub mod state;
 pub mod workspace;

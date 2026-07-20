@@ -88,7 +88,7 @@ use uuid::Uuid;
 use vetinari_crosslink_api::CrosslinkRepo;
 
 use crate::artifacts::{ArtifactSet, DoneSentinel};
-use crate::config::OrchestratorConfig;
+use crate::config::{OrchestratorConfig, WorkerKind};
 use crate::events::{emit, EventLog};
 use crate::landing::{land_local, LandingOutcome};
 use crate::qa::{QaGate, QaOutcome};
@@ -398,7 +398,7 @@ impl BuildPump {
         let worker_uuid = Uuid::new_v4().simple().to_string();
         self.register_worker(&key, &worker_uuid, round, prepared.path())?;
 
-        let command = self.worker_command()?;
+        let command = self.worker_command(issue_id, prepared.path())?;
         let handle =
             self.spawner
                 .spawn(WorkerRole::Implementer, &key, round, &prepared, &command)?;
@@ -617,14 +617,47 @@ impl BuildPump {
 
     // --- helpers ------------------------------------------------------------
 
-    /// Build the Direct worker command from config, resolving the argv against
-    /// the repository root (so a relative fixture path works from any cwd).
-    fn worker_command(&self) -> Result<WorkerCommand, PumpError> {
-        let argv = self
-            .config
-            .worker_argv(self.manager.root())
-            .ok_or(PumpError::EmptyWorkerCommand)?;
-        Ok(WorkerCommand::direct(argv, Vec::<(String, String)>::new()))
+    /// Build the worker command for `issue_id`, dispatched into `workspace`,
+    /// per the typed `[worker] kind` (S7).
+    ///
+    /// - [`WorkerKind::Direct`] — the AC-11a dogfood: resolve the configured
+    ///   argv against the repository root (so a relative fixture path works from
+    ///   any cwd) and hand it to `WorkerCommand::Direct`. Unchanged from before
+    ///   S7, so the dogfood stays green.
+    /// - [`WorkerKind::Claude`] — a real Implementer: read the issue's title +
+    ///   description from crosslink as the task (REQ-8, **untrusted input** — see
+    ///   [`crate::roles::implementer::task_from_issue`]), and build the
+    ///   Implementer `WorkerCommand::Claude` from [`crate::roles::implementer`]
+    ///   (its allowlist, deny list, system prompt, and the config turn cap —
+    ///   `max_turns_implementer`). The `Spawner` then enforces the mount matrix,
+    ///   writes `task.md`, and verifies the `bwrap` pin.
+    fn worker_command(
+        &self,
+        issue_id: i64,
+        workspace: &std::path::Path,
+    ) -> Result<WorkerCommand, PumpError> {
+        match self.config.worker.kind {
+            WorkerKind::Direct => {
+                let argv = self
+                    .config
+                    .worker_argv(self.manager.root())
+                    .ok_or(PumpError::EmptyWorkerCommand)?;
+                Ok(WorkerCommand::direct(argv, Vec::<(String, String)>::new()))
+            }
+            WorkerKind::Claude => {
+                let info = self.crosslink.read_issue(issue_id)?;
+                let task = crate::roles::implementer::task_from_issue(
+                    &info.title,
+                    info.description.as_deref(),
+                );
+                Ok(crate::roles::implementer::worker_command(
+                    self.manager.root(),
+                    workspace,
+                    task,
+                    self.config.worker.max_turns_implementer,
+                ))
+            }
+        }
     }
 
     /// The worker's committed change: the working-copy commit id of the prepared

@@ -156,6 +156,7 @@ fn build_pump(
                 "bash".to_owned(),
                 fake_implementer().to_string_lossy().into_owned(),
             ],
+            ..WorkerConfig::default()
         },
         worker_timeout_secs: 60,
         ..OrchestratorConfig::default()

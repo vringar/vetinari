@@ -124,6 +124,7 @@ fn ac11a_dogfood_drives_graphed_to_merged_headless() {
                 "bash".to_owned(),
                 fake_implementer().to_string_lossy().into_owned(),
             ],
+            ..WorkerConfig::default()
         },
         // A tight worker timeout keeps a hung fixture from stalling CI; the fake
         // worker is a sub-second bash script.

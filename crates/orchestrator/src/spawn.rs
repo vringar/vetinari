@@ -15,10 +15,15 @@
 //!    `claude` inside the project dev shell; the per-role [`MountMatrix`] is
 //!    rendered into **real** `--bind` / `--ro-bind` flags (REQ-5/6/7), so the
 //!    mount differentiation is now *enforced by the kernel*, not merely
-//!    documented. The inner `claude` command is `--permission-mode default`
-//!    (never `--dangerously-skip-permissions`, REQ-4), the per-role
-//!    `--allowed-tools` allowlist, the role system prompt, and `--max-turns`
-//!    (REQ-4, REQ-13). Before any such spawn the store-path pin guard (REQ-4a /
+//!    documented. The inner `claude` command is headless (`-p`/`--print` with a
+//!    bootstrap prompt — a pane has no stdin, so without this the worker never
+//!    starts), `--permission-mode default` (never
+//!    `--dangerously-skip-permissions`, REQ-4), the per-role `--allowed-tools`
+//!    allowlist, a `--disallowed-tools` deny list for the known-dangerous VCS
+//!    verbs, the role system prompt, and `--max-turns` (REQ-4, REQ-13). These
+//!    are defense-in-depth guardrails, **not** a hard cage — the honest security
+//!    model lives in [`crate::roles`]. Before any such spawn the store-path pin
+//!    guard (REQ-4a /
 //!    AC-19) resolves `bwrap` on PATH and refuses unless it is the exact pinned
 //!    nix store path. This path is *not* exercised against a live Anthropic API
 //!    in tests — its argv assembly is proved by pure unit tests, and the
@@ -54,11 +59,16 @@
 //!
 //! RESOLUTION: the roles that need `.jj/` (Implementer, Merger) also get
 //! `<root>/.git` bound **RW** — jj must write objects to the colocated backend.
-//! Worker VCS isolation is therefore **no longer** enforced by withholding the
-//! `.git/` mount; it shifts to the **tool allowlist** (S7): a worker runs under
-//! `--permission-mode default` with only specific `jj` subcommands permitted,
-//! never `git` or arbitrary `Bash`. The kernel still hides `.git/` from the
-//! roles that have no `.jj/` (Adversary, Judge). See [`MountMatrix::for_role`].
+//! This means the mount matrix no longer withholds the VCS store from the
+//! committing roles. The tool allowlist + deny list narrow what the worker is
+//! *nudged* to do, but they are **not** a hard boundary: `Bash(cargo …)` runs
+//! arbitrary compiled code and `Write`/`Edit` can touch the RW `.jj/`/`.git/`,
+//! so a determined worker is not caged by any jj-verb allowlist. The real
+//! protection for `main` is **orchestrator-side validation** (the QA gate, the
+//! FF-guarded landing that can only advance trunk, and adversary review) — see
+//! the threat-model block in [`crate::roles`]. The kernel still hides `.git/`
+//! from the roles that have no `.jj/` (Adversary, Judge). See
+//! [`MountMatrix::for_role`].
 //!
 //! ## The Adversary's own workspace `.jj/` (finding #3, honest statement)
 //!
@@ -190,6 +200,15 @@ pub const TASK_FILE: &str = "_orchestrator/task.md";
 /// from the caller-supplied role prompt so the "read your task file" contract is
 /// invariant across roles and cannot be forgotten at a call site.
 const TASK_PROMPT_SUFFIX: &str = "Your task for this session is written to `_orchestrator/task.md` at the root of your working directory. Read that file first; it is the sole source of your instructions for this round.";
+
+/// The `-p`/`--print` bootstrap prompt that starts a **headless** `claude`
+/// worker (REQ-8). Without an initial prompt in print mode `claude` launches an
+/// interactive REPL and blocks on stdin — but a zellij pane has no stdin, so the
+/// worker would hang forever. Passing this as the positional prompt under `-p`
+/// makes `claude` run non-interactively from here and exit when the turn budget
+/// or the task completes. The prompt is deliberately a thin pointer at the task
+/// file; the actual per-round instructions live in [`TASK_FILE`], not here.
+pub const HEADLESS_BOOTSTRAP: &str = "Read _orchestrator/task.md and complete the task described there, then write _orchestrator/result.md and _orchestrator/DONE as instructed.";
 
 /// The minimal set of environment variable *names* a worker is allowed to
 /// inherit from the orchestrator's ambient environment. Everything else — API
@@ -361,10 +380,14 @@ impl MountMatrix {
     /// `.orchestrator/` (REQ-6) is physically absent for all roles — no branch
     /// here binds it.
     ///
-    /// **Isolation shift (finding #1):** with `.git/` now granted to the
-    /// committing roles, VCS isolation is enforced by the S7 tool allowlist
-    /// (only specific `jj` subcommands under `--permission-mode default`, never
-    /// `git`/arbitrary `Bash`), not by withholding the mount.
+    /// **Isolation shift (finding #1):** with `.git/` now granted RW to the
+    /// committing roles, the mount matrix no longer withholds the VCS store from
+    /// them. The S7 tool allowlist + deny list are defense-in-depth guardrails
+    /// (they make the intended `jj` path the easy one), **not** a hard cage: a
+    /// worker running `Bash(cargo …)` or `Write`/`Edit` against the RW
+    /// `.jj/`/`.git/` is not contained by any jj-verb allowlist. What actually
+    /// keeps a bad change off `main` is orchestrator-side validation before
+    /// landing — see the threat-model block in [`crate::roles`].
     ///
     /// **The Adversary's workspace still carries its own `<workspace>/.jj`
     /// (finding #3):** the workspace RW bind includes the jj *workspace's*
@@ -541,6 +564,14 @@ pub struct ClaudeSpawn {
     /// The per-role `--allowed-tools` value (REQ-4, REQ-5). A closed string the
     /// caller derives from the role's allowlist.
     pub allowlist: String,
+    /// The per-role `--disallowed-tools` value: a belt-and-suspenders deny list
+    /// of the known-dangerous VCS verbs (git, push/fetch, history/op-log
+    /// surgery). Unlike the allowlist — where an *unlisted* tool under
+    /// `--permission-mode default` merely ASKS and, headless, wedges the worker
+    /// until the pump's timeout — an explicitly denied tool is refused outright
+    /// with no prompt. Empty for roles that need no extra deny. This is
+    /// defense-in-depth, **not** a hard cage (see [`crate::roles`]).
+    pub denylist: String,
     /// The role system prompt, passed via `--append-system-prompt`.
     pub system_prompt: String,
     /// The per-role `--max-turns` cap (REQ-13).
@@ -571,6 +602,7 @@ impl WorkerCommand {
         workspace: &Path,
         task: impl Into<String>,
         allowlist: impl Into<String>,
+        denylist: impl Into<String>,
         system_prompt: impl Into<String>,
         max_turns: u32,
     ) -> Self {
@@ -578,6 +610,7 @@ impl WorkerCommand {
             role,
             task: task.into(),
             allowlist: allowlist.into(),
+            denylist: denylist.into(),
             system_prompt: system_prompt.into(),
             max_turns,
             mounts: MountMatrix::for_role(role, root, workspace),
@@ -590,34 +623,59 @@ impl ClaudeSpawn {
     /// REQ-13), as an inspectable argv:
     ///
     /// ```text
-    /// claude --permission-mode default \
+    /// claude -p '<bootstrap>' \
+    ///        --permission-mode default \
     ///        --allowed-tools <allowlist> \
+    ///        --disallowed-tools <denylist> \
     ///        --append-system-prompt <prompt> \
     ///        --max-turns <n>
     /// ```
     ///
+    /// **`-p`/`--print` is what makes the worker actually start.** Panes have no
+    /// stdin, and bare `claude` opens an interactive REPL that would block
+    /// forever waiting for input. `-p` with the positional [`HEADLESS_BOOTSTRAP`]
+    /// prompt runs `claude` non-interactively and lets it exit when the task or
+    /// the turn budget completes. The bootstrap only points the worker at its
+    /// task file; the per-round instructions are delivered as a file
+    /// ([`TASK_FILE`], REQ-8), and the system prompt carries a fixed instruction
+    /// ([`TASK_PROMPT_SUFFIX`]) to read it — the task text is never on argv.
+    ///
     /// `--permission-mode default` and the *absence* of
     /// `--dangerously-skip-permissions` are hard-coded (REQ-4): there is no
-    /// argument that could turn them off. The task prompt is **not** in this
-    /// vector: it is delivered as a file ([`TASK_FILE`], REQ-8), and the
-    /// system prompt carries a fixed instruction ([`TASK_PROMPT_SUFFIX`]) to
-    /// read it. Panes have no stdin, so there is no "task on stdin".
+    /// argument that could turn them off. Note that `default` mode **ASKS** for
+    /// an unlisted tool rather than cleanly denying it — headless, such a prompt
+    /// has no one to answer it and wedges the worker until the pump's
+    /// `worker_timeout` treats the stall as a crash. The `--disallowed-tools`
+    /// deny list ([`ClaudeSpawn::denylist`]) is therefore the *clean* refusal
+    /// path for the known-dangerous VCS verbs; it is emitted only when non-empty.
     ///
     /// This is the unit under test for the REQ-4/REQ-13 flag contract;
     /// [`to_argv`](Self::to_argv) shell-joins it into the `nix-shell --run`
     /// string.
     pub fn claude_argv(&self) -> Vec<String> {
-        vec![
+        let mut argv = vec![
             CLAUDE_BIN.to_owned(),
+            // Headless: run non-interactively from the bootstrap prompt and exit
+            // (a pane has no stdin for an interactive REPL to read).
+            "-p".to_owned(),
+            HEADLESS_BOOTSTRAP.to_owned(),
             "--permission-mode".to_owned(),
             "default".to_owned(),
             "--allowed-tools".to_owned(),
             self.allowlist.clone(),
-            "--append-system-prompt".to_owned(),
-            format!("{}\n\n{}", self.system_prompt, TASK_PROMPT_SUFFIX),
-            "--max-turns".to_owned(),
-            self.max_turns.to_string(),
-        ]
+        ];
+        // Belt-and-suspenders: cleanly deny the known-dangerous VCS verbs so
+        // they are refused outright rather than triggering a (headless-hanging)
+        // permission prompt. Emitted only when a deny list is configured.
+        if !self.denylist.is_empty() {
+            argv.push("--disallowed-tools".to_owned());
+            argv.push(self.denylist.clone());
+        }
+        argv.push("--append-system-prompt".to_owned());
+        argv.push(format!("{}\n\n{}", self.system_prompt, TASK_PROMPT_SUFFIX));
+        argv.push("--max-turns".to_owned());
+        argv.push(self.max_turns.to_string());
+        argv
     }
 
     /// Assemble the full **direct `bwrap`** argv as a pure function of the spawn
@@ -1417,13 +1475,20 @@ mod tests {
 
     // --- ClaudeSpawn argv assembly (pure; REQ-4, REQ-5/6/7, REQ-13) ---------
 
-    fn spawn_for(role: WorkerRole, allowlist: &str, prompt: &str, max_turns: u32) -> ClaudeSpawn {
+    fn spawn_for(
+        role: WorkerRole,
+        allowlist: &str,
+        denylist: &str,
+        prompt: &str,
+        max_turns: u32,
+    ) -> ClaudeSpawn {
         match WorkerCommand::claude(
             role,
             &root(),
             &ws(),
             "do the thing",
             allowlist,
+            denylist,
             prompt,
             max_turns,
         ) {
@@ -1436,6 +1501,7 @@ mod tests {
         spawn_for(
             WorkerRole::Implementer,
             "Bash(jj describe),Read,Edit,Write",
+            "Bash(git:*),Bash(jj abandon:*)",
             "You are the Implementer.",
             80,
         )
@@ -1459,9 +1525,28 @@ mod tests {
         // The inner `claude` command is the REQ-4/REQ-13 flag contract.
         let cargv = implementer_spawn().claude_argv();
         assert_eq!(cargv[0], CLAUDE_BIN);
+        // Headless start: `-p` with the bootstrap prompt, or the worker never
+        // begins (a pane has no stdin for an interactive REPL). The bootstrap
+        // points at the task file.
+        assert!(
+            cargv.windows(2).any(|w| w[0] == "-p" && w[1] == HEADLESS_BOOTSTRAP),
+            "REQ-8/finding #4: headless `-p <bootstrap>` must be present so the worker starts: {cargv:?}"
+        );
+        assert!(
+            HEADLESS_BOOTSTRAP.contains("_orchestrator/task.md"),
+            "the bootstrap must point the worker at its task file"
+        );
         assert!(cargv
             .windows(2)
             .any(|w| w == ["--permission-mode", "default"]));
+        // The belt-and-suspenders deny list rides through for known-dangerous
+        // VCS verbs (clean refusal, no headless-hanging prompt).
+        assert!(
+            cargv
+                .windows(2)
+                .any(|w| w[0] == "--disallowed-tools" && w[1] == "Bash(git:*),Bash(jj abandon:*)"),
+            "the configured deny list must be emitted as --disallowed-tools: {cargv:?}"
+        );
         assert!(cargv
             .windows(2)
             .any(|w| w[0] == "--allowed-tools" && w[1] == "Bash(jj describe),Read,Edit,Write"));
@@ -1562,7 +1647,13 @@ mod tests {
     /// whole point of the enforcement — while still binding workspace + crosslink.
     #[test]
     fn adversary_argv_carries_no_jj_bind() {
-        let spawn = spawn_for(WorkerRole::Adversary, "Read", "You are the Adversary.", 40);
+        let spawn = spawn_for(
+            WorkerRole::Adversary,
+            "Read",
+            "",
+            "You are the Adversary.",
+            40,
+        );
         let argv = spawn.to_argv(&ws(), &test_host());
         let mounts = &argv[..argv.iter().position(|a| a == "--").unwrap()];
 

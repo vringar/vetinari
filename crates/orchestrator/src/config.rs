@@ -16,13 +16,18 @@
 //! worker_timeout_secs = 120
 //!
 //! [worker]
-//! # The dogfood worker command (defaults to the fake implementer). argv[0] is
-//! # the program; the rest are its args.
+//! # Which worker to dispatch: "direct" (fake-worker dogfood, the default) or
+//! # "claude" (a real sandboxed Implementer, S7).
+//! kind = "direct"
+//! # The Direct worker command. argv[0] is the program; the rest are its args.
 //! argv = ["bash", "tests/fixtures/fake-implementer.sh"]
+//! # The Implementer turn cap when kind = "claude" (REQ-13).
+//! max_turns_implementer = 80
 //! ```
 //!
 //! The `[worker]` table is optional: absent, the pump falls back to the
-//! [`WorkerConfig::default`] (the fake implementer, resolved by the caller).
+//! [`WorkerConfig::default`] (`kind = "direct"`, the fake implementer, resolved
+//! by the caller).
 //!
 //! # No shell-out (AC-24)
 //!
@@ -93,28 +98,70 @@ pub enum ConfigError {
     },
 }
 
-/// The worker command the build pump dispatches for the dogfood (REQ-13).
+/// Which kind of worker the build pump dispatches (S7).
 ///
-/// A closed argv, not a free-form string: the pump hands it to the spawn
-/// layer's `WorkerCommand::Direct`. `argv[0]` is the program (`bash`), the rest
-/// its arguments (the fake-implementer path). The default resolves to the fake
-/// implementer with a **relative** path; the pump resolves it against the
-/// repository root so an absolute committed path is not baked into the config.
+/// A **typed** enum, never a stringly `kind` read in the pump: the pump matches
+/// on this to build either a `WorkerCommand::Direct` (the fake-worker dogfood)
+/// or a real Implementer `WorkerCommand::Claude`. Defaults to [`Direct`] so a
+/// fresh repo — and the AC-11a dogfood — runs the fake worker unchanged.
+///
+/// [`Direct`]: WorkerKind::Direct
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerKind {
+    /// Run the configured [`WorkerConfig::argv`] directly in the workspace (the
+    /// AC-11a tracer-bullet dogfood; no live `claude`, no sandbox).
+    #[default]
+    Direct,
+    /// Spawn a real sandboxed `claude` Implementer (S7): the pump builds the
+    /// command from [`crate::roles::implementer`] and dispatches it through the
+    /// `Spawner`, which enforces the mount matrix and the `bwrap` pin.
+    Claude,
+}
+
+/// The default Implementer turn cap (REQ-13 `max_turns_implementer`); mirrors
+/// [`crate::roles::implementer::DEFAULT_MAX_TURNS`].
+pub const DEFAULT_MAX_TURNS_IMPLEMENTER: u32 = crate::roles::implementer::DEFAULT_MAX_TURNS;
+
+/// The worker command the build pump dispatches (REQ-13, S7).
+///
+/// For [`WorkerKind::Direct`] this is a closed argv, not a free-form string:
+/// the pump hands it to the spawn layer's `WorkerCommand::Direct`. `argv[0]` is
+/// the program (`bash`), the rest its arguments (the fake-implementer path). The
+/// default resolves to the fake implementer with a **relative** path; the pump
+/// resolves it against the repository root so an absolute committed path is not
+/// baked into the config. For [`WorkerKind::Claude`] the argv is unused and the
+/// Implementer command is built from [`crate::roles::implementer`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
-    /// The worker program plus its arguments. Must be non-empty; an empty argv
-    /// is rejected by [`OrchestratorConfig::worker_argv`].
+    /// Which worker kind to dispatch (S7). Default [`WorkerKind::Direct`], so
+    /// the dogfood is unchanged.
+    #[serde(default)]
+    pub kind: WorkerKind,
+    /// The Direct worker's program plus its arguments. Must be non-empty; an
+    /// empty argv is rejected by [`OrchestratorConfig::worker_argv`]. Ignored
+    /// when [`kind`](Self::kind) is [`WorkerKind::Claude`].
     #[serde(default = "default_worker_argv")]
     pub argv: Vec<String>,
+    /// The Implementer `--max-turns` cap for [`WorkerKind::Claude`] (REQ-13).
+    /// Default [`DEFAULT_MAX_TURNS_IMPLEMENTER`].
+    #[serde(default = "default_max_turns_implementer")]
+    pub max_turns_implementer: u32,
 }
 
 impl Default for WorkerConfig {
     fn default() -> Self {
         WorkerConfig {
+            kind: WorkerKind::default(),
             argv: default_worker_argv(),
+            max_turns_implementer: default_max_turns_implementer(),
         }
     }
+}
+
+fn default_max_turns_implementer() -> u32 {
+    DEFAULT_MAX_TURNS_IMPLEMENTER
 }
 
 /// The default dogfood worker argv: `bash tests/fixtures/fake-implementer.sh`.
@@ -281,6 +328,47 @@ mod tests {
     }
 
     #[test]
+    fn worker_kind_defaults_to_direct() {
+        // Absent config, and a `[worker]` table that names only argv, both keep
+        // the dogfood on the Direct path (so AC-11a is unchanged).
+        assert_eq!(WorkerConfig::default().kind, WorkerKind::Direct);
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[worker]\nargv = [\"bash\"]\n",
+        )
+        .expect("write config");
+        let cfg = OrchestratorConfig::load(dir.path()).expect("parse");
+        assert_eq!(cfg.worker.kind, WorkerKind::Direct);
+        assert_eq!(
+            cfg.worker.max_turns_implementer,
+            DEFAULT_MAX_TURNS_IMPLEMENTER
+        );
+    }
+
+    #[test]
+    fn worker_kind_claude_is_selected_and_turns_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[worker]\nkind = \"claude\"\nmax_turns_implementer = 42\n",
+        )
+        .expect("write config");
+        let cfg = OrchestratorConfig::load(dir.path()).expect("parse");
+        assert_eq!(cfg.worker.kind, WorkerKind::Claude);
+        assert_eq!(cfg.worker.max_turns_implementer, 42);
+    }
+
+    #[test]
+    fn worker_kind_rejects_unknown_variant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(CONFIG_FILE), "[worker]\nkind = \"bogus\"\n")
+            .expect("write config");
+        let err = OrchestratorConfig::load(dir.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
     fn worker_table_overrides_argv() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -347,6 +435,7 @@ mod tests {
                     "--config".to_owned(),
                     "config.toml".to_owned(),
                 ],
+                ..WorkerConfig::default()
             },
             ..OrchestratorConfig::default()
         };
@@ -367,7 +456,10 @@ mod tests {
     #[test]
     fn empty_worker_argv_is_none() {
         let cfg = OrchestratorConfig {
-            worker: WorkerConfig { argv: Vec::new() },
+            worker: WorkerConfig {
+                argv: Vec::new(),
+                ..WorkerConfig::default()
+            },
             ..OrchestratorConfig::default()
         };
         assert!(cfg.worker_argv(Path::new("/repo")).is_none());
