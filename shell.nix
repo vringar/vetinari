@@ -1,12 +1,14 @@
 # vetinari dev shell — classic nixpkgs invocation, dependencies pinned via npins.
 #
-# Enter with `nix-shell` (or direnv). `claude-sandbox` auto-detects this file.
+# Enter with `nix-shell` (or direnv). The orchestrator enters this same file to
+# run each worker's `claude` inside a direct `bwrap` sandbox.
 # Sources are pinned in npins/sources.json; bump with `npins update`.
 #
-# `claude-sandbox` is NOT provided here. Install it via your nix profile and the
-# orchestrator pins the expected store-hash at runtime via VDD_CLAUDE_SANDBOX_PIN
-# (set by shellHook below). The version-mismatch assertion (AC-19) lands in
-# crosslink issue #8 (S1).
+# The orchestrator drives `bwrap` DIRECTLY to enforce the per-role worker mount
+# matrix (REQ-5/6/7), so `bwrap` is the pinned isolation binary: the shellHook
+# below exports its resolved store-hash as VDD_BWRAP_PIN (plus the dev-shell
+# launcher as VDD_NIX_SHELL_PIN), and the spawn guard refuses to run a worker
+# unless the `bwrap` on PATH resolves to exactly VDD_BWRAP_PIN (AC-19, REQ-4a).
 {
   sources ? import ./npins,
   pkgs ?
@@ -54,19 +56,24 @@ in
       CROSSLINK_SRC = "${sources.crosslink}";
     };
 
-    # `claude-sandbox` is resolved at shell-entry time so the realpath captures
-    # the user's currently-installed version. The orchestrator's spawn helper
-    # reads VDD_CLAUDE_SANDBOX_PIN and refuses to spawn if the resolved path
-    # drifts.
+    # `bwrap` and `nix-shell` are resolved at shell-entry time so the realpath
+    # captures the exact pinned store build. The orchestrator's spawn helper
+    # reads VDD_BWRAP_PIN and refuses to spawn a worker if the resolved `bwrap`
+    # drifts (VDD_NIX_SHELL_PIN is used to enter the dev shell by absolute path).
     shellHook = ''
-      if command -v claude-sandbox >/dev/null 2>&1; then
-        export VDD_CLAUDE_SANDBOX_PIN="$(readlink -f "$(command -v claude-sandbox)")"
+      if command -v bwrap >/dev/null 2>&1; then
+        export VDD_BWRAP_PIN="$(readlink -f "$(command -v bwrap)")"
       else
-        echo "WARNING: claude-sandbox not on PATH — install it (e.g. via your nix profile) before running the orchestrator." >&2
-        export VDD_CLAUDE_SANDBOX_PIN=""
+        echo "WARNING: bwrap (bubblewrap) not on PATH — the orchestrator cannot sandbox workers." >&2
+        export VDD_BWRAP_PIN=""
+      fi
+      if command -v nix-shell >/dev/null 2>&1; then
+        export VDD_NIX_SHELL_PIN="$(readlink -f "$(command -v nix-shell)")"
+      else
+        export VDD_NIX_SHELL_PIN=""
       fi
       echo "vetinari dev shell — rustc $(rustc --version | cut -d' ' -f2), jj $(jj --version | cut -d' ' -f2), zellij $(zellij --version | cut -d' ' -f2)"
-      [ -n "''${VDD_CLAUDE_SANDBOX_PIN:-}" ] && echo "claude-sandbox pinned at: $VDD_CLAUDE_SANDBOX_PIN"
+      [ -n "''${VDD_BWRAP_PIN:-}" ] && echo "bwrap pinned at: $VDD_BWRAP_PIN"
       # Keep .cargo/config.toml's jj-lib patch in sync with the pinned jj
       # source so a bare `cargo build` (no `just`) resolves correctly.
       if command -v just >/dev/null 2>&1 && [ -f justfile ]; then

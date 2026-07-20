@@ -16,8 +16,9 @@
 //! - [`events`] — the append-only `events.jsonl` writer and the heartbeat
 //!   reader / staleness check (REQ-14, AC-9, AC-14).
 //! - [`spawn`] — hosting a worker in a zellij pane inside a prepared jj
-//!   workspace, behind the per-role mount matrix and the `claude-sandbox`
-//!   version-pin guard (REQ-1d, REQ-4, REQ-4a, REQ-5, REQ-13, AC-19, AC-27).
+//!   workspace, enforcing the per-role mount matrix via a direct `bwrap`
+//!   invocation behind the `bwrap` store-path pin guard (REQ-1d, REQ-4,
+//!   REQ-4a, REQ-5, REQ-13, AC-19, AC-27).
 //! - [`qa`] — the static QA gate: runs `.orchestrator/static_qa.sh` against a
 //!   worker's workspace and derives a deterministic, exit-code-owned pass/fail
 //!   verdict (REQ-9, REQ-9a, AC-7).

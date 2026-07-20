@@ -81,29 +81,36 @@ pub type Result<T, E = OrchestratorError> = std::result::Result<T, E>;
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum SpawnError {
-    /// The pinned `claude-sandbox` binary doesn't match what's on `PATH`.
-    /// Refuses to spawn rather than risk a posture regression.
-    #[error("claude-sandbox version mismatch: expected `{expected}`, found `{found}`")]
+    /// The `bwrap` binary resolved on `PATH` doesn't match the pinned nix store
+    /// path. `bwrap` is the isolation boundary the per-role mount matrix is
+    /// enforced through (REQ-5/6/7), so a drifted `bwrap` is a posture risk:
+    /// refuse to spawn rather than enforce the matrix with an unpinned binary
+    /// (REQ-4a, AC-19).
+    #[error("bwrap store-path mismatch: expected `{expected}`, found `{found}`")]
     #[diagnostic(
-        code(vetinari::spawn::claude_sandbox_version_mismatch),
-        help("Re-enter the dev shell with `nix develop`. If the flake's pin needs bumping, see REQ-4a in .design/vdd-orchestrator.md."),
+        code(vetinari::spawn::bwrap_pin_mismatch),
+        help("Re-enter the dev shell with `nix-shell` — the shellHook exports VDD_BWRAP_PIN. If the pin needs bumping, see REQ-4a in .design/vdd-orchestrator.md."),
         url("https://github.com/vringar/vetinari/blob/main/.design/vdd-orchestrator.md#req-4a")
     )]
-    ClaudeSandboxVersionMismatch {
-        /// Nix store path or version string the flake baked in at build time.
+    BwrapPinMismatch {
+        /// Pinned `bwrap` nix store path (from `VDD_BWRAP_PIN`).
         expected: String,
-        /// Nix store path or version string discovered at runtime.
+        /// The `bwrap` store path discovered on `PATH` at runtime.
         found: String,
     },
 
-    /// `claude-sandbox` could not be located on the current `PATH`.
-    #[error("claude-sandbox binary not found (searched: {searched})")]
+    /// `bwrap` could not be located on the current `PATH`, or no pin was
+    /// configured. A real `claude` spawn cannot proceed without a pinned
+    /// isolation binary (REQ-4a, fail-closed).
+    #[error("bwrap not found or unpinned (searched: {searched})")]
     #[diagnostic(
-        code(vetinari::spawn::claude_sandbox_missing),
-        help("Enter the dev shell (`nix develop`) or install claude-sandbox into the active profile.")
+        code(vetinari::spawn::bwrap_missing),
+        help(
+            "Enter the dev shell (`nix-shell`) so VDD_BWRAP_PIN is set and bubblewrap is on PATH."
+        )
     )]
-    ClaudeSandboxMissing {
-        /// `PATH` value (or other search list) that turned up no binary.
+    BwrapMissing {
+        /// `PATH` value (or the pin env-var name) that turned up no binary.
         searched: String,
     },
 
@@ -164,6 +171,22 @@ pub enum SpawnError {
         exit_code: i32,
         /// Last ~50 lines of stderr — kept truncated for events.jsonl sanity.
         stderr_tail: String,
+    },
+
+    /// The worker's prepared workspace has no `shell.nix`, so the real
+    /// (`claude`) spawn path — which enters `<workspace>/shell.nix` via
+    /// `nix-shell` — cannot assemble its dev shell. Caught before `bwrap` runs
+    /// so the failure is a clean, typed error rather than an opaque nix-shell
+    /// crash deep inside the sandbox. (A fixture with no `shell.nix`, like the
+    /// `hello` dogfood, must use the Direct path, which never reaches here.)
+    #[error("worker workspace has no dev shell at `{path}`")]
+    #[diagnostic(
+        code(vetinari::spawn::shell_nix_missing),
+        help("The real `claude` path enters `<workspace>/shell.nix` via nix-shell. Ensure the repo ships a shell.nix (materialized into every jj workspace), or dispatch this worker via the Direct path.")
+    )]
+    ShellNixMissing {
+        /// The `<workspace>/shell.nix` path that was expected but absent.
+        path: PathBuf,
     },
 
     /// The Claude Code PostToolUse hook required for heartbeats is missing
@@ -760,12 +783,13 @@ mod tests {
         // copy-paste bug. Collected by hand because miette doesn't expose the
         // mapping at runtime.
         let codes = [
-            "vetinari::spawn::claude_sandbox_version_mismatch",
-            "vetinari::spawn::claude_sandbox_missing",
+            "vetinari::spawn::bwrap_pin_mismatch",
+            "vetinari::spawn::bwrap_missing",
             "vetinari::spawn::zellij_session_unavailable",
             "vetinari::spawn::zellij_pane_create_failed",
             "vetinari::spawn::workspace_path_conflict",
             "vetinari::spawn::bwrap_failed",
+            "vetinari::spawn::shell_nix_missing",
             "vetinari::spawn::hook_config_missing",
             "vetinari::spawn::io",
             "vetinari::spawn::workspace_prep",

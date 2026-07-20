@@ -1,7 +1,7 @@
 //! vetinari orchestrator entry point — wires the build pump into a headless
 //! run against the current repository (REQ-16, REQ-13, AC-11a/AC-11b).
 //!
-//! Startup: resolve the `claude-sandbox` pin (REQ-4a), open `state.db` and
+//! Startup: resolve the `bwrap` store-path pin (REQ-4a), open `state.db` and
 //! `events.jsonl` (REQ-2, REQ-14), ensure the long-lived headless zellij
 //! session (REQ-1d), then build the [`BuildPump`] from its collaborators and run
 //! its tick loop. The real per-issue work — implement → QA → land — lives in the
@@ -45,15 +45,16 @@ fn main() -> miette::Result<()> {
     let root = std::env::current_dir().into_diagnostic()?;
     let orchestrator_dir = root.join(ORCHESTRATOR_DIR);
 
-    let pinned = std::env::var("VDD_CLAUDE_SANDBOX_PIN")
+    let pinned = std::env::var("VDD_BWRAP_PIN")
         .into_diagnostic()
         .map_err(|e| {
             miette::miette!(
-                help = "Enter the dev shell with `nix develop` — the flake exports VDD_CLAUDE_SANDBOX_PIN.",
+                help =
+                    "Enter the dev shell with `nix-shell` — the shellHook exports VDD_BWRAP_PIN.",
                 "{e}"
             )
         })?;
-    tracing::info!(claude_sandbox = %pinned, "claude-sandbox pin resolved");
+    tracing::info!(bwrap = %pinned, "bwrap store-path pin resolved");
 
     // REQ-13: the concurrency budget, poll cadence, timeouts, and dogfood worker
     // command. An absent config.toml yields all-defaults.
