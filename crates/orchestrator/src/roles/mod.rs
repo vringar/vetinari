@@ -64,7 +64,11 @@
 //! Until that lands, the guardrails above plus orchestrator-side validation are
 //! the whole story, and this module claims nothing stronger.
 //!
-//! Only the Implementer role is defined here for the MVP (S7); the Adversary,
-//! Merger, and Judge roles are iteration-2+ and land with their own modules.
+//! The Implementer role (S7) and the Adversary role (A1) are defined here; the
+//! Merger and Judge roles are iteration-2+ and land with their own modules. The
+//! Adversary additionally owns the orchestrator-side pre-rendering of its inputs
+//! ([`adversary::render_inputs`]) — it reviews with fresh context and no `.jj/`
+//! mount, so the orchestrator renders its diff/log for it (REQ-8).
 
+pub mod adversary;
 pub mod implementer;

@@ -70,6 +70,24 @@ pub fn fake_implementer_empty() -> PathBuf {
     fixtures_path("fake-implementer-empty.sh")
 }
 
+/// Path to the committed fake-adversary worker script: reads the pre-rendered
+/// `_orchestrator/diff.patch` and writes a canned `findings.jsonl` + DONE (A1).
+pub fn fake_adversary() -> PathBuf {
+    fixtures_path("fake-adversary.sh")
+}
+
+/// Path to the fake adversary that found NOTHING: writes an EMPTY (but
+/// DONE-declared) `findings.jsonl` — a valid clean/converged round (REQ-10).
+pub fn fake_adversary_clean() -> PathBuf {
+    fixtures_path("fake-adversary-clean.sh")
+}
+
+/// Path to the BROKEN fake adversary that writes DONE but never produces
+/// `findings.jsonl` — an incomplete round the strict reader must reject.
+pub fn fake_adversary_no_findings() -> PathBuf {
+    fixtures_path("fake-adversary-no-findings.sh")
+}
+
 /// Run `program args...` in `cwd`, panicking with captured output on failure.
 fn run(program: &str, args: &[&str], cwd: &Path) {
     let out = Command::new(program)

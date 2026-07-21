@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use vetinari_error::{LandingError, SpawnError};
-use vetinari_jj_api::{CommitInfo, JjWorkspace, WorkspaceEntry};
+use vetinari_jj_api::{CommitInfo, JjError, JjWorkspace, WorkspaceEntry};
 
 use crate::state::Phase;
 
@@ -445,6 +445,31 @@ impl WorkspaceManager {
                 dest_revset: base_revset.to_owned(),
                 source: Box::new(source),
             })
+    }
+
+    /// Render a `git diff`-format patch describing how the tree of `to`
+    /// differs from the tree of `from`, read under the `.jj/` gate (REQ-5a).
+    ///
+    /// Exposed so the orchestrator can **pre-render** an Adversary worker's
+    /// `_orchestrator/diff.patch` input on its behalf (REQ-8, A1): the Adversary
+    /// has no repository `.jj/` mount and never runs `jj diff` itself. Reads
+    /// through the same serializing gate as every other `.jj/` access, so a
+    /// pre-render cannot race a concurrent workspace add / rebase. The `jj_api`
+    /// error is returned as-is for the caller to wrap with input context.
+    pub fn diff(&self, from: &str, to: &str) -> Result<String, JjError> {
+        self.gate().handle.diff(from, to)
+    }
+
+    /// The commit metadata for every commit `revset` resolves to, read under
+    /// the `.jj/` gate (REQ-5a).
+    ///
+    /// Exposed so the orchestrator can **pre-render** an Adversary worker's
+    /// `_orchestrator/log.txt` input on its behalf (REQ-8, A1) — see [`diff`].
+    /// The caller formats the returned [`CommitInfo`]s into the log text.
+    ///
+    /// [`diff`]: WorkspaceManager::diff
+    pub fn log(&self, revset: &str) -> Result<Vec<CommitInfo>, JjError> {
+        self.gate().handle.log(revset)
     }
 
     /// Fast-forward the local bookmark `name` to the commit `target_revset`

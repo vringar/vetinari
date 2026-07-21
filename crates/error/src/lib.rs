@@ -64,6 +64,12 @@ pub enum OrchestratorError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     State(#[from] StateError),
+
+    /// Failure pre-rendering an Adversary worker's inputs — see
+    /// [`AdversaryError`].
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Adversary(#[from] AdversaryError),
 }
 
 /// Convenience `Result` alias.
@@ -692,6 +698,29 @@ pub enum ArtifactError {
         source: std::io::Error,
     },
 
+    /// A DONE-verified worker did not declare a `findings.jsonl` artifact, so
+    /// the strict Adversary convergence reader ([`crate`]'s
+    /// `Findings::from_done`) cannot treat it as a clean round.
+    ///
+    /// A clean/converged Adversary round (REQ-10) MUST be an explicitly-present,
+    /// DONE-attested `findings.jsonl` — an empty-but-declared file is valid, but
+    /// an *absent/undeclared* one means the worker crashed or stopped before
+    /// producing its review. Distinguishing the two closes the false-convergence
+    /// hole where "wrote empty findings" was indistinguishable from "produced no
+    /// findings file at all". Treated as an incomplete worker → re-spawn, never
+    /// convergence.
+    #[error(
+        "DONE sentinel declares no `findings.jsonl` (declared: {declared:?}) — incomplete Adversary round, not convergence"
+    )]
+    #[diagnostic(
+        code(vetinari::artifact::findings_missing),
+        help("A clean Adversary round must write an (empty-is-valid) findings.jsonl AND list it in DONE. An undeclared findings file means the worker never produced its review; kill + re-spawn from the prior phase.")
+    )]
+    FindingsMissing {
+        /// The artifact paths the DONE sentinel actually declared, for context.
+        declared: Vec<String>,
+    },
+
     /// Idempotency guard tripped: this exact artifact-content + finding-index
     /// pair has already been posted as a crosslink comment. Not fatal; the
     /// caller skips the post and continues.
@@ -710,6 +739,79 @@ pub enum ArtifactError {
         /// -1 for whole-file artifacts like result.md.
         finding_index: i32,
     },
+}
+
+// ============================================================================
+// Adversary input pre-rendering errors (REQ-8, A1)
+// ============================================================================
+
+/// Errors raised while the orchestrator pre-renders an Adversary worker's
+/// inputs (REQ-8, A1).
+///
+/// The Adversary reviews an Implementer's change with fresh context and **no**
+/// `.jj/` mount, so it never runs `jj diff`/`jj log` itself: the orchestrator
+/// renders `_orchestrator/{diff.patch, log.txt, prior_findings.json, task.md}`
+/// on its behalf, through the serializing `.jj/` gate, *before* the Adversary
+/// spawn. A failure to render (a `jj_api` diff/log error) or to write those
+/// inputs to disk is surfaced as one of these, so a garbled input delivery is a
+/// clean typed error rather than a silently empty review.
+#[derive(Debug, Error, Diagnostic)]
+#[non_exhaustive]
+pub enum AdversaryError {
+    /// Rendering a pre-rendered input via `jj_api` (the change diff or the
+    /// issue-chain log) failed. `input` names the artifact being rendered
+    /// (`diff.patch` / `log.txt`) for context.
+    #[error("failed to render Adversary input `{input}` via jj_api")]
+    #[diagnostic(
+        code(vetinari::adversary::render),
+        help("The orchestrator renders the Adversary's diff/log through the `.jj/` gate. Inspect `jj log` for the issue's change; an unresolvable revset is the usual cause.")
+    )]
+    Render {
+        /// The input artifact being rendered (`diff.patch` or `log.txt`).
+        input: &'static str,
+        /// Underlying `jj_api` cause.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// Writing a pre-rendered input file (or its `_orchestrator/` parent) to
+    /// the Adversary's workspace failed.
+    #[error("io error writing Adversary input at `{path}`: {source}")]
+    #[diagnostic(code(vetinari::adversary::io))]
+    Io {
+        /// Path whose write failed.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Serializing the prior-round findings into `prior_findings.json` failed.
+    ///
+    /// Propagated as a hard error rather than silently emptied to `[]`: an empty
+    /// prior-findings input is the worst-direction default for a convergence
+    /// round (the Adversary would re-report findings a prior round already
+    /// raised), so a serialization failure must surface, not vanish.
+    #[error("failed to serialize Adversary prior findings into `{input}`")]
+    #[diagnostic(code(vetinari::adversary::serialize))]
+    Serialize {
+        /// The input artifact being serialized (`prior_findings.json`).
+        input: &'static str,
+        /// Underlying serializer cause.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+}
+
+impl AdversaryError {
+    /// Construct an [`AdversaryError::Io`] for `path` from an underlying I/O
+    /// error, mirroring [`SpawnError::io`].
+    pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        AdversaryError::Io {
+            path: path.into(),
+            source,
+        }
+    }
 }
 
 // ============================================================================
@@ -836,7 +938,11 @@ mod tests {
             "vetinari::artifact::done_artifact_missing",
             "vetinari::artifact::checksum_mismatch",
             "vetinari::artifact::read_failed",
+            "vetinari::artifact::findings_missing",
             "vetinari::artifact::duplicate_posting",
+            "vetinari::adversary::render",
+            "vetinari::adversary::io",
+            "vetinari::adversary::serialize",
             "vetinari::state::open",
             "vetinari::state::migration",
             "vetinari::state::query",

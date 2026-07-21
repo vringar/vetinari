@@ -332,6 +332,11 @@ impl Findings {
     /// line as a comment). A missing file is treated as an empty set (an
     /// Adversary that wrote no findings), matching the design's "possibly
     /// empty" contract.
+    ///
+    /// This is the **lenient** reader (missing ⇒ empty). The convergence path
+    /// must NOT use it — an absent file reading as "empty ⇒ converged" is the
+    /// false-convergence hole. Use [`from_done`](Findings::from_done), which
+    /// requires an explicitly DONE-attested `findings.jsonl`.
     pub fn read(artifact_dir: &Path) -> Result<Self, ArtifactError> {
         let path = artifact_dir.join(FINDINGS_FILE);
         let content = match std::fs::read_to_string(&path) {
@@ -340,6 +345,44 @@ impl Findings {
             Err(source) => return Err(ArtifactError::ReadFailed { path, source }),
         };
         Self::parse(&path, &content)
+    }
+
+    /// Strict convergence reader (REQ-10): parse `findings.jsonl` from a
+    /// **verified** [`DoneSentinel`], REQUIRING the worker to have declared it.
+    ///
+    /// This is the reader the Adversary/convergence path (#22/#23) must use —
+    /// NOT the lenient [`read`](Findings::read), which maps an absent file to an
+    /// empty set. That leniency is a false-convergence hole: a worker that wrote
+    /// `DONE` but never wrote `findings.jsonl` would read as "empty ⇒ converged"
+    /// and auto-land a buggy change on a crashed Adversary. Here a clean round
+    /// must be an explicitly-present, DONE-attested `findings.jsonl`:
+    ///
+    /// - **absent/undeclared** `findings.jsonl` ⇒ [`ArtifactError::FindingsMissing`]
+    ///   (an incomplete worker; the pump/recovery re-spawns, never converges),
+    /// - **present-and-empty** (declared in DONE) ⇒ a valid clean round
+    ///   (`Findings::is_empty`).
+    ///
+    /// Presence is decided by the sentinel's declared artifacts (equivalent to
+    /// `done.sha_for("_orchestrator/findings.jsonl").is_some()`), and the body is
+    /// parsed from the sentinel's VERIFIED bytes — hashed once at verify time —
+    /// so there is no re-read and no TOCTOU (the same guarantee
+    /// [`translation_plan`] relies on).
+    pub fn from_done(done: &DoneSentinel) -> Result<Self, ArtifactError> {
+        let artifact = done
+            .artifacts()
+            .iter()
+            .find(|a| artifact_file_name(a.path()) == FINDINGS_FILE)
+            .ok_or_else(|| ArtifactError::FindingsMissing {
+                declared: done
+                    .artifacts()
+                    .iter()
+                    .map(|a| a.path().to_owned())
+                    .collect(),
+            })?;
+        // Parse the *verified* bytes, exactly as `translation_plan` does, so the
+        // convergence decision and the posted comments come from identical bytes.
+        let content = String::from_utf8_lossy(artifact.bytes());
+        Self::parse(Path::new(artifact.path()), &content)
     }
 
     /// Parse already-read `findings.jsonl` content. Split out from [`read`] so
@@ -1255,6 +1298,66 @@ mod tests {
         let set = ArtifactSet { done };
         drop(tmp);
         assert!(translation_plan("w", &set).expect("plan").is_empty());
+    }
+
+    // --- strict convergence reader (Findings::from_done) --------------------
+
+    #[test]
+    fn from_done_parses_declared_findings() {
+        // A DONE that declares a populated findings.jsonl yields those findings.
+        let (_tmp, root) = workspace();
+        let body = valid_findings_content();
+        write_artifact(&root, FINDINGS_FILE, &body);
+        write_done(&root, "success", &[(FINDINGS_PATH, &sha(body.as_bytes()))]);
+        let done = DoneSentinel::verify(&root).expect("verify");
+        let findings = Findings::from_done(&done).expect("declared findings parse");
+        assert_eq!(findings.findings().len(), 3);
+    }
+
+    #[test]
+    fn from_done_empty_declared_findings_is_a_clean_round() {
+        // A PRESENT-and-empty findings.jsonl, declared in DONE, IS a valid clean
+        // (converged) round — not an error.
+        let (_tmp, root) = workspace();
+        write_artifact(&root, FINDINGS_FILE, "");
+        write_done(&root, "success", &[(FINDINGS_PATH, &sha(b""))]);
+        let done = DoneSentinel::verify(&root).expect("verify");
+        let findings = Findings::from_done(&done).expect("empty-declared is clean");
+        assert!(
+            findings.is_empty(),
+            "an empty declared findings.jsonl is a clean round"
+        );
+    }
+
+    #[test]
+    fn from_done_absent_findings_is_rejected_not_converged() {
+        // The load-bearing case: a worker wrote DONE listing ONLY result.md and
+        // never declared findings.jsonl. The lenient `read` would map the absent
+        // file to empty ⇒ "converged"; the strict reader rejects it as an
+        // incomplete Adversary round (FindingsMissing), so the convergence loop
+        // re-spawns instead of auto-landing on a crashed worker.
+        let (_tmp, root) = workspace();
+        let body = "reviewed, but crashed before writing findings\n";
+        write_artifact(&root, RESULT_FILE, body);
+        write_done(&root, "success", &[(RESULT_PATH, &sha(body.as_bytes()))]);
+        let done = DoneSentinel::verify(&root).expect("verify");
+
+        // Sanity: the lenient reader WOULD have (wrongly) called this empty.
+        assert!(
+            Findings::read(&root.join(ARTIFACT_DIR))
+                .expect("lenient read")
+                .is_empty(),
+            "lenient read maps the absent file to empty — the hole we are closing"
+        );
+
+        // The strict reader refuses it.
+        let err = Findings::from_done(&done).unwrap_err();
+        match err {
+            ArtifactError::FindingsMissing { declared } => {
+                assert_eq!(declared, vec![RESULT_PATH.to_owned()]);
+            }
+            other => panic!("expected FindingsMissing, got {other:?}"),
+        }
     }
 
     #[test]
