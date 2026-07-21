@@ -13,6 +13,46 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
+use vetinari_zellij_host::{session_ensure, SessionHandle};
+
+/// Serializes zellij-touching tests: the `zellij` CLI shares one background
+/// server + socket, and cargo runs integration tests multithreaded. Shared by
+/// every integration test binary that spawns workers through a headless session.
+static ZELLIJ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds the process-wide zellij lock for a test and kills the ensured session
+/// on drop. Hold it for the lifetime of the test alongside the [`Fixture`].
+pub struct SessionGuard {
+    name: String,
+    _zellij: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("zellij")
+            .args(["kill-session", &self.name])
+            .output();
+    }
+}
+
+/// Ensure a uniquely-named headless zellij session (serialized against every
+/// other zellij-touching test via [`ZELLIJ_LOCK`]), returning the session handle
+/// and a guard that releases the lock + kills the session on drop.
+pub fn unique_session(tag: &str) -> (SessionHandle, SessionGuard) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let held = ZELLIJ_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!("vetinari-{tag}-{}-{n}", std::process::id());
+    let guard = SessionGuard {
+        name: name.clone(),
+        _zellij: held,
+    };
+    let session = session_ensure(&name).expect("ensure headless session");
+    (session, guard)
+}
 
 /// A materialized dogfood fixture. The repository is removed when this value is
 /// dropped, so hold it for the lifetime of the test.
@@ -74,6 +114,25 @@ pub fn fake_implementer_empty() -> PathBuf {
 /// `_orchestrator/diff.patch` and writes a canned `findings.jsonl` + DONE (A1).
 pub fn fake_adversary() -> PathBuf {
     fixtures_path("fake-adversary.sh")
+}
+
+/// Path to the CONTENT-DRIVEN fake implementer for the AC-15 iteration-2 E2E
+/// (A4): writes the FLAWED variant (an `unsafe { }` block calling `get_unchecked`
+/// behind a safe-looking API) on the first round, and the FIXED variant (safe
+/// indexing, no unsafe) once the ORCHESTRATOR delivers a prior Adversary finding
+/// into its workspace (`_orchestrator/prior_findings.jsonl`, REQ-8). Its output
+/// is driven by review content, not a round counter.
+pub fn fake_implementer_unsafe() -> PathBuf {
+    fixtures_path("fake-implementer-unsafe.sh")
+}
+
+/// Path to the CONTENT-DRIVEN fake adversary for the AC-15 iteration-2 E2E (A4):
+/// reads the pre-rendered `_orchestrator/diff.patch` and FLAGS a finding IFF the
+/// flaw's distinctive `get_unchecked` marker is present in the diff, signing off
+/// CLEAN once it is gone. Its verdict is driven by the actual change, closing the
+/// loop honestly; it records nothing outside its own `_orchestrator/` outputs.
+pub fn fake_adversary_unsafe() -> PathBuf {
+    fixtures_path("fake-adversary-unsafe.sh")
 }
 
 /// Path to the fake adversary that found NOTHING: writes an EMPTY (but

@@ -59,7 +59,7 @@
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vetinari_error::ArtifactError;
 
@@ -281,6 +281,31 @@ impl Finding {
             }
         }
         body
+    }
+
+    /// Render this finding as one `findings.jsonl` line — the wire schema the
+    /// Adversary emits and the pump reuses when it delivers accumulated prior
+    /// findings into a re-implement round's Implementer workspace (REQ-8). The
+    /// structured [`Location`] collapses back to the flat `"path:line"` string,
+    /// so the line round-trips through [`Findings::parse`].
+    ///
+    /// Returns the serializer error rather than unwrapping it. The fields are
+    /// plain strings, so a failure is not reachable in practice, but the pump
+    /// must never `unwrap`/`panic` on a non-test path (see `pump` module docs).
+    pub fn to_jsonl_line(&self) -> Result<String, serde_json::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            severity: &'a str,
+            location: String,
+            claim: &'a str,
+            evidence_files: &'a [String],
+        }
+        serde_json::to_string(&Wire {
+            severity: self.severity.as_str(),
+            location: self.location.to_string(),
+            claim: &self.claim,
+            evidence_files: &self.evidence_files,
+        })
     }
 }
 
@@ -1184,6 +1209,30 @@ mod tests {
             err,
             ArtifactError::SchemaViolation { line_no: 2, .. }
         ));
+    }
+
+    #[test]
+    fn finding_to_jsonl_line_round_trips_through_parse() {
+        // A finding serialized to a jsonl line re-parses back into the same
+        // finding — the pump delivers prior findings to a re-implement round's
+        // Implementer in exactly the schema the Adversary writes them (REQ-8).
+        let finding = Finding {
+            severity: Severity::High,
+            location: Location::parse("src/lib.rs:1").expect("location"),
+            claim: "greeting_head hides a get_unchecked call".to_owned(),
+            evidence_files: vec!["src/lib.rs".to_owned()],
+        };
+        let line = finding.to_jsonl_line().expect("serialize");
+        let reparsed = Findings::parse(Path::new("prior_findings.jsonl"), &line).expect("reparse");
+        assert_eq!(reparsed.findings(), std::slice::from_ref(&finding));
+        // A finding with no evidence still round-trips.
+        let no_evidence = Finding {
+            evidence_files: Vec::new(),
+            ..finding
+        };
+        let line = no_evidence.to_jsonl_line().expect("serialize");
+        let reparsed = Findings::parse(Path::new("f.jsonl"), &line).expect("reparse");
+        assert_eq!(reparsed.findings()[0], no_evidence);
     }
 
     // --- progress.jsonl -----------------------------------------------------

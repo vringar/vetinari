@@ -17,8 +17,42 @@
 
 use std::path::Path;
 
+use crate::artifacts::{Finding, ARTIFACT_DIR};
 use crate::spawn::WorkerCommand;
 use crate::state::WorkerRole;
+
+/// The prior-findings input filename the pump delivers into the Implementer's
+/// workspace (REQ-8), relative to [`ARTIFACT_DIR`]. The Implementer's analogue of
+/// the Adversary's `prior_findings.json`, but in the `findings.jsonl` line schema
+/// (one finding per line; an empty file when there are none) that a generalized
+/// worker reads directly.
+pub const PRIOR_FINDINGS_FILE: &str = "prior_findings.jsonl";
+
+/// Render the accumulated Adversary `prior_findings` into the prepared
+/// Implementer workspace's `_orchestrator/prior_findings.jsonl` (REQ-8), BEFORE
+/// the spawn — so a re-implement round's worker reads the findings it must
+/// address as a workspace input, exactly as the Adversary reads its
+/// pre-rendered `prior_findings.json`.
+///
+/// Delivered on EVERY round (a zero-byte file on the first, no-findings round),
+/// so the worker can always read a well-formed input rather than probe for a
+/// possibly-absent file. `_orchestrator/` is gitignored in the target repo, so
+/// this input never snapshots into the Implementer's change.
+///
+/// This is the delivery channel a **Direct**/generalized worker uses (the live
+/// `claude` Implementer additionally receives the same findings appended to its
+/// `task.md` — see the pump's `append_prior_findings`). No shell-out (AC-24):
+/// [`serde_json`](serde_json) via [`Finding::to_jsonl_line`] + [`std::fs`].
+pub fn render_prior_findings(workspace: &Path, prior_findings: &[Finding]) -> std::io::Result<()> {
+    let dir = workspace.join(ARTIFACT_DIR);
+    std::fs::create_dir_all(&dir)?;
+    let mut body = String::new();
+    for finding in prior_findings {
+        body.push_str(&finding.to_jsonl_line().map_err(std::io::Error::other)?);
+        body.push('\n');
+    }
+    std::fs::write(dir.join(PRIOR_FINDINGS_FILE), body)
+}
 
 /// The Implementer's default `--max-turns` cap (REQ-13 `max_turns_implementer`).
 /// A worker hitting its turn cap is treated like any other crash (no DONE
@@ -380,6 +414,30 @@ mod tests {
         // Isolation reminders.
         assert!(p.contains(".orchestrator/"), "warns off the private dir");
         assert!(p.to_lowercase().contains("push"), "forbids pushing");
+    }
+
+    #[test]
+    fn render_prior_findings_writes_empty_file_then_jsonl() {
+        use crate::artifacts::{Finding, Findings, Location, Severity, ARTIFACT_DIR};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path();
+
+        // No findings → an existing but zero-byte input (the first round).
+        render_prior_findings(ws, &[]).expect("render empty");
+        let path = ws.join(ARTIFACT_DIR).join(PRIOR_FINDINGS_FILE);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "");
+
+        // With findings → one jsonl line per finding, re-parsing to the same set.
+        let finding = Finding {
+            severity: Severity::High,
+            location: Location::parse("src/lib.rs:1").expect("location"),
+            claim: "greeting_head hides a get_unchecked call".to_owned(),
+            evidence_files: vec!["src/lib.rs".to_owned()],
+        };
+        render_prior_findings(ws, std::slice::from_ref(&finding)).expect("render findings");
+        let body = std::fs::read_to_string(&path).expect("read");
+        let reparsed = Findings::parse(&path, &body).expect("reparse delivered findings");
+        assert_eq!(reparsed.findings(), std::slice::from_ref(&finding));
     }
 
     #[test]

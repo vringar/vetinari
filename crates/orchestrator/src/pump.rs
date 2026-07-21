@@ -234,6 +234,19 @@ pub enum PumpError {
         issue_id: i64,
     },
 
+    /// Delivering the accumulated Adversary findings into a re-implement round's
+    /// Implementer workspace (REQ-8) failed — the pre-spawn
+    /// `_orchestrator/prior_findings.jsonl` input could not be written.
+    #[error("failed to deliver prior findings to the Implementer workspace `{workspace}`")]
+    #[diagnostic(code(vetinari::pump::prior_findings_delivery))]
+    PriorFindings {
+        /// The Implementer workspace whose prior-findings input write failed.
+        workspace: PathBuf,
+        /// Underlying I/O (or serialization) error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The configured worker command is empty — the pump has nothing to spawn.
     #[error("orchestrator config has an empty worker argv — nothing to spawn")]
     #[diagnostic(
@@ -532,6 +545,18 @@ impl BuildPump {
         }
         let name = WorkspaceName::generate(Phase::Implementing, key, round);
         let prepared = self.manager.prepare(&name, WORKER_BASE_REVSET)?;
+        // Deliver the accumulated Adversary findings into the Implementer's
+        // workspace (REQ-8) BEFORE the spawn, so a re-implement round's worker
+        // reads what it must address as a workspace input — the Direct/generalized
+        // worker's findings channel, mirroring the Adversary's pre-rendered
+        // `prior_findings.json`. Written on every round (empty on the first), and
+        // gitignored so it never lands in the change.
+        crate::roles::implementer::render_prior_findings(prepared.path(), prior_findings).map_err(
+            |source| PumpError::PriorFindings {
+                workspace: prepared.path().to_path_buf(),
+                source,
+            },
+        )?;
         // Mint the worker identity ONCE for this attempt and persist it as an
         // active_workers row (#2): a stable uuid dedupes a re-translation within
         // the run, and the row gives P2 (#16) the state to recover from.
@@ -1116,9 +1141,12 @@ impl BuildPump {
     ///   [`crate::roles::implementer`]. The `Spawner` then enforces the mount
     ///   matrix, writes `task.md`, and verifies the `bwrap` pin.
     ///
-    /// `prior_findings` is ignored on the Direct path (the fake worker reads no
-    /// task file); the deterministic tests exercise the findings-threading via the
-    /// Adversary's `prior_findings.json` instead.
+    /// `prior_findings` is threaded into the Claude Implementer's `task.md` here;
+    /// on the Direct path it is not folded into argv, because the pump already
+    /// delivered it to the worker's workspace as `_orchestrator/prior_findings.jsonl`
+    /// before the spawn ([`crate::roles::implementer::render_prior_findings`]) —
+    /// the channel a Direct/generalized worker reads. So both paths receive the
+    /// findings; only the delivery surface differs.
     fn worker_command(
         &self,
         issue_id: i64,
