@@ -136,6 +136,13 @@ fn ac11a_dogfood_drives_graphed_to_merged_headless() {
         // A tight worker timeout keeps a hung fixture from stalling CI; the fake
         // worker is a sub-second bash script.
         worker_timeout_secs: 60,
+        // Pin the dogfood to a single clean round so it lands on the first
+        // adversary pass (the default n_rounds = 2 is exercised by the A3
+        // convergence tests, not the dogfood).
+        convergence: orchestrator::config::ConvergenceConfig {
+            n_rounds: 1,
+            ..Default::default()
+        },
         ..OrchestratorConfig::default()
     };
 

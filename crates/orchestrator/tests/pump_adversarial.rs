@@ -88,6 +88,13 @@ fn config_for(script: &Path) -> OrchestratorConfig {
             ..WorkerConfig::default()
         },
         worker_timeout_secs: 60,
+        // These regressions predate the A3 n-rounds detector and assert a
+        // first-clean-round land; pin n_rounds = 1 so the always-clean fake
+        // adversary still converges on its first pass.
+        convergence: orchestrator::config::ConvergenceConfig {
+            n_rounds: 1,
+            ..Default::default()
+        },
         ..OrchestratorConfig::default()
     }
 }

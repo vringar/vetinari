@@ -232,8 +232,15 @@ CREATE TABLE issues (
   --   reset to 0 when: (a) findings.jsonl non-empty in any round,
   --                    (b) QA fails in any round,
   --                    (c) the Implementer is re-spawned for any reason
-  --   incremented when: a clean Adversary round produces 0 findings AND
-  --                     last_diff_hash matches the prior round
+  --   incremented when: a clean Adversary round produces 0 findings. The change
+  --                     under review is a fixed (immutable) commit id for the
+  --                     whole review, so N clean re-review rounds == N clean
+  --                     rounds on the SAME change; no diff-hash comparison gates
+  --                     the increment in this synchronous model (see pump.rs
+  --                     `on_clean_round`).
+  -- last_diff_hash is RESERVED (currently unwritten by the convergence path):
+  -- it would gate the streak only in a future async/concurrent model where the
+  -- change could move mid-review. See REQ-10 follow-up.
   last_diff_hash      TEXT,
   landing_retry_count INTEGER NOT NULL DEFAULT 0,
   updated_at          INTEGER NOT NULL

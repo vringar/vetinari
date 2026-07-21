@@ -102,6 +102,14 @@ pub fn fake_adversary_clean_record() -> PathBuf {
     fixtures_path("fake-adversary-clean-record.sh")
 }
 
+/// Path to the A3 mid-streak reset fake adversary: CLEAN on call 0 (streak → 1),
+/// FLAG on call 1 (reset streak, re-implement), CLEAN thereafter. Drives the
+/// diff-stability / streak-reset convergence test (a mid-streak finding forces a
+/// fresh N-consecutive-clean run). Uses a persisted counter under `.orchestrator/`.
+pub fn fake_adversary_flag_midstreak() -> PathBuf {
+    fixtures_path("fake-adversary-flag-midstreak.sh")
+}
+
 /// Run `program args...` in `cwd`, panicking with captured output on failure.
 fn run(program: &str, args: &[&str], cwd: &Path) {
     let out = Command::new(program)

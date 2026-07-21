@@ -251,6 +251,12 @@ fn ac11b_direct_dogfood_lands_on_shell_nix_target() {
             ..WorkerConfig::default()
         },
         worker_timeout_secs: 60,
+        // Pin to a single clean round so the deterministic target lands on the
+        // first adversary pass (the end state is unchanged).
+        convergence: orchestrator::config::ConvergenceConfig {
+            n_rounds: 1,
+            ..Default::default()
+        },
         ..OrchestratorConfig::default()
     };
 
@@ -295,7 +301,7 @@ fn ac11b_live_claude_lands_say_hi() {
     // worker/QA timeouts — a live agent takes minutes). Loaded through the real
     // config path (OrchestratorConfig::load), exactly as `main.rs` does.
     let fx = build_target_fixture(
-        "worker_timeout_secs = 1200\nqa_timeout_secs = 600\n\n[worker]\nkind = \"claude\"\nmax_turns_implementer = 200\nadversary_kind = \"claude\"\nmax_turns_adversary = 100\n",
+        "worker_timeout_secs = 1200\nqa_timeout_secs = 600\n\n[convergence]\nn_rounds = 1\n\n[worker]\nkind = \"claude\"\nmax_turns_implementer = 200\nadversary_kind = \"claude\"\nmax_turns_adversary = 100\n",
     );
     let orchestrator_dir = fx.root.join(ORCHESTRATOR_DIR);
     let config = OrchestratorConfig::load(&orchestrator_dir).expect("load target config");

@@ -37,11 +37,11 @@
 //!                     │            ├─ findings ─▶ post blockers, round++, back to
 //!                     │            │               implementing (findings as input,
 //!                     │            │               REQ-8); re-implement in-process
-//!                     │            └─ clean round ─▶ converged? (A2: empty_round_
-//!                     │                  streak >= convergence_n_rounds, default 1)
+//!                     │            └─ clean round ─▶ converged? (A3: N clean
+//!                     │                  rounds, empty_round_streak >= n_rounds, default 2)
 //!                     │                  ├─ yes ─▶ converged → landing (L2)
 //!                     │                  │           ├─ Merged / AwaitingHumanMerge
-//!                     │                  └─ no  ─▶ re-review (A3 n-rounds)
+//!                     │                  └─ no  ─▶ re-review same change, fresh Adversary
 //!                     ├─ Fail ─▶ blocker comment + back to implementing
 //!                     │           (bounded retries; requeued across ticks)
 //!                     └─ Err(poison) ─▶ orchestrator-error
@@ -63,10 +63,20 @@
 //! A **clean round** is read with the strict [`crate::artifacts::Findings::from_done`]:
 //! it REQUIRES a DONE-attested `findings.jsonl`, so an Adversary that wrote DONE
 //! but no findings is an *incomplete* review (poisoned), never a false
-//! convergence. The A2 convergence policy is a placeholder — one clean round
-//! (`convergence_n_rounds`, default 1) — that #23 (A3) replaces with the full
-//! n-rounds + `last_diff_hash`-stability detector behind the [`BuildPump::converged`]
-//! seam.
+//! convergence. Convergence (A3, #23) is the REQ-10 detector: **N consecutive
+//! clean Adversary rounds on the SAME change** — each clean round below the
+//! threshold re-spawns a FRESH Adversary on the same committed change (fresh
+//! context may catch what the prior missed), and `empty_round_streak` climbs by
+//! one per clean re-review round. Because the change is resolved to an immutable
+//! jj commit id for the whole review, it cannot move between rounds, so the
+//! streak alone captures "N consecutive clean rounds"; REQ-10's `last_diff_hash`
+//! stability condition is vestigial in this synchronous model (it would matter
+//! only if the change could move mid-review — a concurrent landing or a future
+//! async model — a documented follow-up, not faked here). `[convergence]
+//! n_rounds` (default 2, validated into `1..=MAX_ADVERSARY_ROUNDS` at config
+//! load) sets N; the dogfoods pin it to 1 so they land on their first clean
+//! round. The whole rule lives behind the [`BuildPump::converged`] +
+//! [`BuildPump::on_clean_round`] seam.
 //!
 //! # State authority (REQ-2): decisions read `state.db`, never labels
 //!
@@ -856,11 +866,12 @@ impl BuildPump {
                 return self.on_adversary_findings(issue_id, key, round, finding_count);
             }
 
-            // Clean round: increment the streak, record the diff hash for A3's
-            // stability check, and decide convergence via the A2 placeholder.
+            // Clean round: advance the consecutive-clean streak and decide
+            // convergence (A3 n-rounds detector). The change under review is a
+            // fixed commit id for the whole loop, so a clean re-review round
+            // unconditionally counts (see `on_clean_round`).
             let _ = self.manager.forget(&adv_name);
-            let streak = self.on_clean_round(key, &diff_from, &change)?;
-            if self.converged(streak) {
+            if self.on_clean_round(key)? {
                 self.transition(
                     key,
                     Phase::AdversaryReview,
@@ -943,22 +954,42 @@ impl BuildPump {
         Ok(ReviewStep::Reimplement)
     }
 
-    /// A clean Adversary round (zero findings): increment `empty_round_streak`,
-    /// record `last_diff_hash` (the round-N diff sha, for A3's stability check),
-    /// and emit a convergence event. Returns the new streak.
-    fn on_clean_round(&self, key: &str, diff_from: &str, diff_to: &str) -> Result<i64, PumpError> {
-        let diff_hash = self
-            .manager
-            .diff(diff_from, diff_to)
-            .ok()
-            .map(|patch| sha256_hex(patch.as_bytes()));
+    /// A clean Adversary round (zero findings) on the issue's fixed change:
+    /// increment `empty_round_streak`, emit a convergence event, and report
+    /// whether the convergence criterion is now met.
+    ///
+    /// # Why there is no diff-stability comparison here
+    ///
+    /// REQ-10 frames convergence as *N consecutive clean rounds on the SAME
+    /// unchanged change*, historically guarded by matching this round's diff
+    /// hash against the prior round's `last_diff_hash`. In THIS synchronous,
+    /// single-issue review loop that guard is **vestigial**:
+    /// [`run_adversary_review`](Self::run_adversary_review) resolves the
+    /// Implementer's change to an **immutable jj commit id once** and re-reviews
+    /// that exact id every round, so the diff is byte-identical across clean
+    /// rounds *by construction* — the hash could never fail to match, and a
+    /// comparison that cannot fail is not protection. So a clean re-review round
+    /// **unconditionally increments** the streak; it is reset to 0 only by the
+    /// findings / QA-fail / re-implement paths — the sole ways the change under
+    /// review can actually change.
+    ///
+    /// The `last_diff_hash` stability condition would become load-bearing only
+    /// if the change could move MID-REVIEW — a concurrent landing, or a future
+    /// async worker-pool model where re-review no longer pins one commit id.
+    /// That is a **documented follow-up** (REQ-10), NOT something this code
+    /// delivers today: the `last_diff_hash` column is retained but unused,
+    /// reserved for that model rather than faked here.
+    ///
+    /// Returns `true` once the streak reaches `[convergence] n_rounds` (computed
+    /// once, here, and reused by the caller so `converged` is not recomputed).
+    fn on_clean_round(&self, key: &str) -> Result<bool, PumpError> {
         let mut streak = 0;
         if let Some(mut issue) = self.state.get_issue(key)? {
             issue.empty_round_streak += 1;
-            issue.last_diff_hash = diff_hash;
             streak = issue.empty_round_streak;
             self.state.upsert_issue(&issue)?;
         }
+        let converged = self.converged(streak);
         emit(
             &self.state,
             &self.log,
@@ -967,22 +998,27 @@ impl BuildPump {
             None,
             &json!({
                 "empty_round_streak": streak,
-                "converged": self.converged(streak),
+                "converged": converged,
             }),
         )?;
-        Ok(streak)
+        Ok(converged)
     }
 
-    /// The A2 placeholder convergence detector — the seam #23 (A3) hardens.
+    /// The convergence detector (REQ-10, A3): an issue has converged once its
+    /// `empty_round_streak` reaches the configured `[convergence] n_rounds`.
     ///
-    /// A2 converges once `empty_round_streak` reaches the configured
-    /// `convergence_n_rounds` (default **1** for A2, so the first DONE-attested
-    /// clean round converges and the dogfoods land unchanged). A3 replaces this
-    /// with the full REQ-10 detector — configurable n consecutive clean rounds
-    /// **plus** `last_diff_hash` stability — behind this same call site, so only
-    /// the body changes.
+    /// The streak counts **consecutive clean Adversary rounds** on the SAME
+    /// (immutable-commit-id) change — [`on_clean_round`](Self::on_clean_round)
+    /// increments it on every clean re-review round, and every findings /
+    /// QA-fail / re-implement path resets it to 0. So this threshold check alone
+    /// is the whole n-rounds rule: N fresh clean re-reviews (default N = 2) land
+    /// the change; a single clean round no longer suffices unless `n_rounds = 1`
+    /// (the dogfood fast path). `n_rounds` is validated at config load to lie in
+    /// `1..=MAX_ADVERSARY_ROUNDS`, so this threshold is always reachable and
+    /// never zero. `judge`/`human` modes are rejected at config load, so the
+    /// mode here is always `n-rounds`.
     fn converged(&self, empty_round_streak: i64) -> bool {
-        empty_round_streak >= self.config.convergence_n_rounds as i64
+        empty_round_streak >= self.config.convergence.n_rounds as i64
     }
 
     /// Converged → land the Implementer's committed change (L2) and mirror the
@@ -1399,20 +1435,6 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-/// Lowercase-hex SHA-256 of `bytes` — the `last_diff_hash` for the round-N
-/// diff-stability check (REQ-10, recorded by A2 for A3 to consume). No shell-out
-/// (AC-24): the [`sha2`] crate, matching [`crate::artifacts`].
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 /// Reconstruct a [`Finding`] from the body of the `--kind blocker` comment it

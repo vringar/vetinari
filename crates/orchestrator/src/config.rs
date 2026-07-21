@@ -23,6 +23,15 @@
 //! argv = ["bash", "tests/fixtures/fake-implementer.sh"]
 //! # The Implementer turn cap when kind = "claude" (REQ-13).
 //! max_turns_implementer = 80
+//!
+//! [convergence]
+//! # Convergence strategy; only "n-rounds" ships today ("judge"/"human" deferred).
+//! mode     = "n-rounds"
+//! # Consecutive clean Adversary rounds required to land. Validated into
+//! # 1..=MAX_ADVERSARY_ROUNDS at load. NOTE: this is `[convergence].n_rounds`;
+//! # a legacy top-level `convergence_n_rounds` key is rejected by
+//! # deny_unknown_fields — move it under the `[convergence]` table.
+//! n_rounds = 2
 //! ```
 //!
 //! The `[worker]` table is optional: absent, the pump falls back to the
@@ -96,6 +105,46 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+
+    /// The `[convergence] mode` selects a strategy that is scoped in REQ-10 but
+    /// not implemented in this iteration (`judge` / `human`). Only `n-rounds`
+    /// ships now, so a config asking for a deferred mode is rejected up front
+    /// rather than silently mis-routing at transition time (REQ-2a).
+    #[error("convergence mode `{mode}` is not implemented yet (deferred to iteration 3+)")]
+    #[diagnostic(
+        code(vetinari::config::convergence_mode_unsupported),
+        help("Set `[convergence] mode = \"n-rounds\"` — `judge` and `human` are scoped in REQ-10 but not yet built.")
+    )]
+    ConvergenceModeUnsupported {
+        /// The requested-but-unimplemented mode token.
+        mode: &'static str,
+    },
+
+    /// `[convergence] n_rounds` is outside the reachable range. It must be at
+    /// least `1` (n_rounds = 0 would converge with ZERO adversary review — the
+    /// change would land on the very first clean round the detector never even
+    /// counts) and at most [`crate::pump::MAX_ADVERSARY_ROUNDS`] (a larger
+    /// threshold can never be reached by the bounded re-review loop, so EVERY
+    /// issue would exhaust the loop and poison to `orchestrator-error`). Rejected
+    /// at load so the misconfiguration surfaces once, up front, rather than
+    /// fleet-wide as an unland-able or unsafe-to-land pump (REQ-2a, REQ-10).
+    #[error(
+        "convergence n_rounds = {n_rounds} is out of range (valid: 1..={max}); \
+         0 would converge with no adversary review, and a value above the \
+         re-review bound can never be reached so every issue would poison"
+    )]
+    #[diagnostic(
+        code(vetinari::config::convergence_n_rounds_out_of_range),
+        help(
+            "Set `[convergence] n_rounds` to a value between 1 and MAX_ADVERSARY_ROUNDS inclusive."
+        )
+    )]
+    ConvergenceRoundsOutOfRange {
+        /// The requested-but-out-of-range round count.
+        n_rounds: u32,
+        /// The maximum reachable threshold ([`crate::pump::MAX_ADVERSARY_ROUNDS`]).
+        max: i64,
+    },
 }
 
 /// Which kind of worker the build pump dispatches (S7).
@@ -127,13 +176,13 @@ pub const DEFAULT_MAX_TURNS_IMPLEMENTER: u32 = crate::roles::implementer::DEFAUL
 /// [`crate::roles::adversary::DEFAULT_MAX_TURNS`].
 pub const DEFAULT_MAX_TURNS_ADVERSARY: u32 = crate::roles::adversary::DEFAULT_MAX_TURNS;
 
-/// The A2 placeholder convergence threshold (REQ-10): how many consecutive
-/// DONE-attested clean Adversary rounds converge an issue. **Default 1** for A2
-/// — the first clean round converges, so the AC-11a/AC-11b dogfoods land on
-/// their first clean adversary round unchanged. A3 (#23) hardens the detector
-/// (configurable n consecutive clean rounds **plus** diff-hash stability); the
-/// design's eventual default is 2.
-pub const DEFAULT_CONVERGENCE_N_ROUNDS: u32 = 1;
+/// The convergence threshold (REQ-10): how many consecutive DONE-attested clean
+/// Adversary rounds converge an issue. **Default 2** — the A3 detector requires
+/// two consecutive clean rounds on the same (immutable-commit-id) change (a
+/// fresh re-review may catch what the prior missed) before landing.
+/// The dogfood fixtures pin `n_rounds = 1` so they still land on their first
+/// clean round; the default 2 is exercised by A3's convergence tests.
+pub const DEFAULT_CONVERGENCE_N_ROUNDS: u32 = 2;
 
 /// The worker command the build pump dispatches (REQ-13, S7).
 ///
@@ -246,13 +295,12 @@ pub struct OrchestratorConfig {
     /// The dogfood worker command (REQ-13). Default: the fake implementer.
     #[serde(default)]
     pub worker: WorkerConfig,
-    /// The A2 placeholder convergence threshold (REQ-10): how many consecutive
-    /// DONE-attested clean Adversary rounds converge an issue. Default
-    /// [`DEFAULT_CONVERGENCE_N_ROUNDS`] (**1** for A2). A3 (#23) replaces the
-    /// pump's `converged` detector with the full n-rounds + diff-hash-stability
-    /// rule reading this same field.
-    #[serde(default = "default_convergence_n_rounds")]
-    pub convergence_n_rounds: u32,
+    /// The convergence detector's tuning (REQ-10): `[convergence] mode` +
+    /// `n_rounds`. Default [`ConvergenceConfig::default`] (`n-rounds`, `n_rounds
+    /// = 2`). The A3 detector reads `n_rounds` as the number of consecutive
+    /// diff-stable clean Adversary rounds required to land.
+    #[serde(default)]
+    pub convergence: ConvergenceConfig,
 }
 
 impl Default for OrchestratorConfig {
@@ -263,8 +311,104 @@ impl Default for OrchestratorConfig {
             qa_timeout_secs: DEFAULT_QA_TIMEOUT_SECS,
             worker_timeout_secs: DEFAULT_WORKER_TIMEOUT_SECS,
             worker: WorkerConfig::default(),
-            convergence_n_rounds: DEFAULT_CONVERGENCE_N_ROUNDS,
+            convergence: ConvergenceConfig::default(),
         }
+    }
+}
+
+/// How the orchestrator decides an issue's review loop has converged (REQ-10).
+///
+/// A **typed** enum, never a stringly mode read in the pump. Only
+/// [`NRounds`](ConvergenceMode::NRounds) ships in this iteration; the
+/// [`Judge`](ConvergenceMode::Judge) and [`Human`](ConvergenceMode::Human)
+/// modes are scoped in REQ-10 but deferred to iteration 3+ — selecting one is a
+/// typed [`ConfigError::ConvergenceModeUnsupported`], not a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConvergenceMode {
+    /// Converged after N consecutive DONE-attested clean Adversary rounds (the
+    /// A3 detector). The only mode implemented in this iteration.
+    #[default]
+    NRounds,
+    /// Converged when a Judge worker says so (iteration 3+, DEFERRED).
+    Judge,
+    /// Converged when a human signs off (iteration 3+, DEFERRED).
+    Human,
+}
+
+impl ConvergenceMode {
+    /// The token this mode parses from / renders to in `[convergence] mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConvergenceMode::NRounds => "n-rounds",
+            ConvergenceMode::Judge => "judge",
+            ConvergenceMode::Human => "human",
+        }
+    }
+
+    /// Reject a mode that is scoped but not implemented in this iteration
+    /// (`judge` / `human`), so the misconfiguration surfaces at load time with a
+    /// clear "iteration 3+" diagnostic rather than mis-routing at transition
+    /// time (REQ-2a). `n-rounds` is the only supported mode today.
+    fn ensure_supported(self) -> Result<(), ConfigError> {
+        match self {
+            ConvergenceMode::NRounds => Ok(()),
+            ConvergenceMode::Judge | ConvergenceMode::Human => {
+                Err(ConfigError::ConvergenceModeUnsupported {
+                    mode: self.as_str(),
+                })
+            }
+        }
+    }
+}
+
+/// The convergence detector's tuning (REQ-10): the `[convergence]` config table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConvergenceConfig {
+    /// Which convergence strategy to run. Default [`ConvergenceMode::NRounds`];
+    /// `judge`/`human` are rejected at load ([`ConvergenceMode::ensure_supported`]).
+    #[serde(default)]
+    pub mode: ConvergenceMode,
+    /// How many consecutive clean Adversary rounds converge an issue (the
+    /// `n-rounds` detector). Default [`DEFAULT_CONVERGENCE_N_ROUNDS`] (2).
+    /// Validated at load into `1..=MAX_ADVERSARY_ROUNDS`
+    /// ([`ConfigError::ConvergenceRoundsOutOfRange`]).
+    ///
+    /// This lives under the `[convergence]` table as `n_rounds`. A legacy
+    /// **top-level** `convergence_n_rounds` key (an earlier shape) is now
+    /// rejected loud by `deny_unknown_fields` at load — move it under
+    /// `[convergence]` as `n_rounds`.
+    #[serde(default = "default_convergence_n_rounds")]
+    pub n_rounds: u32,
+}
+
+impl Default for ConvergenceConfig {
+    fn default() -> Self {
+        ConvergenceConfig {
+            mode: ConvergenceMode::default(),
+            n_rounds: DEFAULT_CONVERGENCE_N_ROUNDS,
+        }
+    }
+}
+
+impl ConvergenceConfig {
+    /// Reject an `n_rounds` outside the reachable range `1..=MAX_ADVERSARY_ROUNDS`.
+    ///
+    /// `0` is unsafe (it would land a change with no adversary review), and any
+    /// value above the bounded re-review loop's cap
+    /// ([`crate::pump::MAX_ADVERSARY_ROUNDS`]) is unreachable — the streak can
+    /// never climb to it, so every issue would poison. Both are typed
+    /// [`ConfigError::ConvergenceRoundsOutOfRange`] at load, not silent footguns.
+    fn ensure_rounds_reachable(&self) -> Result<(), ConfigError> {
+        let max = crate::pump::MAX_ADVERSARY_ROUNDS;
+        if self.n_rounds < 1 || i64::from(self.n_rounds) > max {
+            return Err(ConfigError::ConvergenceRoundsOutOfRange {
+                n_rounds: self.n_rounds,
+                max,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -287,7 +431,15 @@ impl OrchestratorConfig {
             }
             Err(source) => return Err(ConfigError::Read { path, source }),
         };
-        toml::from_str(&content).map_err(|source| ConfigError::Parse { path, source })
+        let config: OrchestratorConfig =
+            toml::from_str(&content).map_err(|source| ConfigError::Parse { path, source })?;
+        // Reject a scoped-but-deferred convergence mode up front (REQ-10): only
+        // `n-rounds` ships in this iteration.
+        config.convergence.mode.ensure_supported()?;
+        // Reject an out-of-range `n_rounds` (0 = no review; > cap = always
+        // poisons) before any issue is driven — a fleet-wide footgun otherwise.
+        config.convergence.ensure_rounds_reachable()?;
+        Ok(config)
     }
 
     /// The poll interval as a [`Duration`].
@@ -524,6 +676,131 @@ mod tests {
             argv[3], "config.toml",
             "an incidental existing-file argument must NOT be rewritten (#6)"
         );
+    }
+
+    #[test]
+    fn convergence_defaults_to_n_rounds_two() {
+        // The A3 detector default: `n-rounds`, two consecutive clean rounds.
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.convergence.mode, ConvergenceMode::NRounds);
+        assert_eq!(cfg.convergence.n_rounds, 2);
+        // An absent file yields the same default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let loaded = OrchestratorConfig::load(dir.path()).expect("absent = defaults");
+        assert_eq!(loaded.convergence, ConvergenceConfig::default());
+    }
+
+    #[test]
+    fn convergence_table_overrides_n_rounds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[convergence]\nn_rounds = 1\n",
+        )
+        .expect("write config");
+        let cfg = OrchestratorConfig::load(dir.path()).expect("parse convergence");
+        assert_eq!(cfg.convergence.mode, ConvergenceMode::NRounds);
+        assert_eq!(
+            cfg.convergence.n_rounds, 1,
+            "the dogfood fast-path override"
+        );
+    }
+
+    #[test]
+    fn convergence_judge_and_human_modes_are_rejected_as_deferred() {
+        for mode in ["judge", "human"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                format!("[convergence]\nmode = \"{mode}\"\n"),
+            )
+            .expect("write config");
+            let err = OrchestratorConfig::load(dir.path()).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::ConvergenceModeUnsupported { .. }),
+                "`{mode}` mode must be rejected as deferred, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn convergence_unknown_mode_is_a_parse_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[convergence]\nmode = \"bogus\"\n",
+        )
+        .expect("write config");
+        let err = OrchestratorConfig::load(dir.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn convergence_n_rounds_zero_is_rejected() {
+        // n_rounds = 0 would converge with ZERO adversary review — a change would
+        // land unreviewed. It must be rejected at load, not silently accepted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[convergence]\nn_rounds = 0\n",
+        )
+        .expect("write config");
+        let err = OrchestratorConfig::load(dir.path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::ConvergenceRoundsOutOfRange { n_rounds: 0, .. }
+            ),
+            "n_rounds = 0 must be rejected as out of range, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn convergence_n_rounds_above_cap_is_rejected() {
+        // n_rounds above the bounded re-review cap can never be reached, so every
+        // issue would poison. Reject it up front rather than fleet-wide.
+        let over = (crate::pump::MAX_ADVERSARY_ROUNDS + 1) as u32;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            format!("[convergence]\nn_rounds = {over}\n"),
+        )
+        .expect("write config");
+        let err = OrchestratorConfig::load(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ConvergenceRoundsOutOfRange { .. }),
+            "n_rounds above MAX_ADVERSARY_ROUNDS must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn convergence_n_rounds_at_cap_is_accepted() {
+        // The upper boundary is reachable and valid — it must round-trip.
+        let cap = crate::pump::MAX_ADVERSARY_ROUNDS as u32;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            format!("[convergence]\nn_rounds = {cap}\n"),
+        )
+        .expect("write config");
+        let cfg = OrchestratorConfig::load(dir.path()).expect("n_rounds at the cap is valid");
+        assert_eq!(cfg.convergence.n_rounds, cap);
+    }
+
+    #[test]
+    fn config_diagnostic_codes_are_unique() {
+        // Copy-paste guard for this module's `code(...)` diagnostics — mirrors
+        // the vetinari-error crate's uniqueness test.
+        let codes = [
+            "vetinari::config::read",
+            "vetinari::config::parse",
+            "vetinari::config::convergence_mode_unsupported",
+            "vetinari::config::convergence_n_rounds_out_of_range",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for c in codes {
+            assert!(seen.insert(c), "duplicate diagnostic code: {c}");
+        }
     }
 
     #[test]

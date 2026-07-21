@@ -102,6 +102,13 @@ fn config_for(implementer: &Path, adversary: &Path) -> OrchestratorConfig {
             ..WorkerConfig::default()
         },
         worker_timeout_secs: 60,
+        // A2's loop tests assert a first-clean-round land; pin n_rounds = 1 so
+        // the default (2, the A3 detector) does not change their round/streak
+        // expectations. The A3 needs-N-rounds behaviour has its own tests.
+        convergence: orchestrator::config::ConvergenceConfig {
+            n_rounds: 1,
+            ..Default::default()
+        },
         ..OrchestratorConfig::default()
     }
 }
