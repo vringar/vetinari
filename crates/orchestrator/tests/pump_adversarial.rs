@@ -16,7 +16,10 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use common::{build_fixture, fake_implementer, fake_implementer_empty, fake_implementer_qa_fail};
+use common::{
+    build_fixture, fake_adversary_clean, fake_implementer, fake_implementer_empty,
+    fake_implementer_qa_fail,
+};
 use orchestrator::config::{OrchestratorConfig, WorkerConfig};
 use orchestrator::pump::{BuildPump, IssueOutcome, MAX_QA_RETRIES};
 use orchestrator::spawn::{SandboxPin, Spawner};
@@ -69,12 +72,19 @@ fn main_commit(cwd: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A config that dispatches `script` as the Direct worker (absolute path passes
-/// through `worker_argv` untouched), with tight timeouts for CI.
+/// A config that dispatches `script` as the Direct implementer (absolute path
+/// passes through `worker_argv` untouched), with tight timeouts for CI. The
+/// Adversary is the Direct clean fake (A2: QA-pass now runs a review round
+/// before landing, so a resolvable, converging Adversary keeps the happy-path
+/// cases landing on their first clean round).
 fn config_for(script: &Path) -> OrchestratorConfig {
     OrchestratorConfig {
         worker: WorkerConfig {
             argv: vec!["bash".to_owned(), script.to_string_lossy().into_owned()],
+            adversary_argv: vec![
+                "bash".to_owned(),
+                fake_adversary_clean().to_string_lossy().into_owned(),
+            ],
             ..WorkerConfig::default()
         },
         worker_timeout_secs: 60,

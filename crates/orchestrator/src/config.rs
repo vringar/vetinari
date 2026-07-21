@@ -123,6 +123,18 @@ pub enum WorkerKind {
 /// [`crate::roles::implementer::DEFAULT_MAX_TURNS`].
 pub const DEFAULT_MAX_TURNS_IMPLEMENTER: u32 = crate::roles::implementer::DEFAULT_MAX_TURNS;
 
+/// The default Adversary turn cap (REQ-13 `max_turns_adversary`); mirrors
+/// [`crate::roles::adversary::DEFAULT_MAX_TURNS`].
+pub const DEFAULT_MAX_TURNS_ADVERSARY: u32 = crate::roles::adversary::DEFAULT_MAX_TURNS;
+
+/// The A2 placeholder convergence threshold (REQ-10): how many consecutive
+/// DONE-attested clean Adversary rounds converge an issue. **Default 1** for A2
+/// — the first clean round converges, so the AC-11a/AC-11b dogfoods land on
+/// their first clean adversary round unchanged. A3 (#23) hardens the detector
+/// (configurable n consecutive clean rounds **plus** diff-hash stability); the
+/// design's eventual default is 2.
+pub const DEFAULT_CONVERGENCE_N_ROUNDS: u32 = 1;
+
 /// The worker command the build pump dispatches (REQ-13, S7).
 ///
 /// For [`WorkerKind::Direct`] this is a closed argv, not a free-form string:
@@ -148,6 +160,22 @@ pub struct WorkerConfig {
     /// Default [`DEFAULT_MAX_TURNS_IMPLEMENTER`].
     #[serde(default = "default_max_turns_implementer")]
     pub max_turns_implementer: u32,
+    /// Which Adversary worker kind to dispatch for the review phase (A2), mirror
+    /// of [`kind`](Self::kind). Default [`WorkerKind::Direct`] so tests use a
+    /// deterministic fake Adversary; real runs set `adversary_kind = "claude"`.
+    #[serde(default)]
+    pub adversary_kind: WorkerKind,
+    /// The Direct Adversary's program plus arguments, resolved against the repo
+    /// root like [`argv`](Self::argv). Ignored when
+    /// [`adversary_kind`](Self::adversary_kind) is [`WorkerKind::Claude`].
+    /// Default: the committed `fake-adversary-clean.sh` (a clean/converging
+    /// round), so the dogfoods land on their first review round.
+    #[serde(default = "default_adversary_argv")]
+    pub adversary_argv: Vec<String>,
+    /// The Adversary `--max-turns` cap for [`WorkerKind::Claude`] (REQ-13).
+    /// Default [`DEFAULT_MAX_TURNS_ADVERSARY`].
+    #[serde(default = "default_max_turns_adversary")]
+    pub max_turns_adversary: u32,
 }
 
 impl Default for WorkerConfig {
@@ -156,12 +184,19 @@ impl Default for WorkerConfig {
             kind: WorkerKind::default(),
             argv: default_worker_argv(),
             max_turns_implementer: default_max_turns_implementer(),
+            adversary_kind: WorkerKind::default(),
+            adversary_argv: default_adversary_argv(),
+            max_turns_adversary: default_max_turns_adversary(),
         }
     }
 }
 
 fn default_max_turns_implementer() -> u32 {
     DEFAULT_MAX_TURNS_IMPLEMENTER
+}
+
+fn default_max_turns_adversary() -> u32 {
+    DEFAULT_MAX_TURNS_ADVERSARY
 }
 
 /// The default dogfood worker argv: `bash tests/fixtures/fake-implementer.sh`.
@@ -171,6 +206,16 @@ fn default_worker_argv() -> Vec<String> {
     vec![
         "bash".to_owned(),
         "tests/fixtures/fake-implementer.sh".to_owned(),
+    ]
+}
+
+/// The default dogfood Adversary argv: `bash tests/fixtures/fake-adversary-clean.sh`
+/// (a clean/converging round). Relative to the repo root like
+/// [`default_worker_argv`]; the pump joins it against the root before dispatch.
+fn default_adversary_argv() -> Vec<String> {
+    vec![
+        "bash".to_owned(),
+        "tests/fixtures/fake-adversary-clean.sh".to_owned(),
     ]
 }
 
@@ -201,6 +246,13 @@ pub struct OrchestratorConfig {
     /// The dogfood worker command (REQ-13). Default: the fake implementer.
     #[serde(default)]
     pub worker: WorkerConfig,
+    /// The A2 placeholder convergence threshold (REQ-10): how many consecutive
+    /// DONE-attested clean Adversary rounds converge an issue. Default
+    /// [`DEFAULT_CONVERGENCE_N_ROUNDS`] (**1** for A2). A3 (#23) replaces the
+    /// pump's `converged` detector with the full n-rounds + diff-hash-stability
+    /// rule reading this same field.
+    #[serde(default = "default_convergence_n_rounds")]
+    pub convergence_n_rounds: u32,
 }
 
 impl Default for OrchestratorConfig {
@@ -211,8 +263,13 @@ impl Default for OrchestratorConfig {
             qa_timeout_secs: DEFAULT_QA_TIMEOUT_SECS,
             worker_timeout_secs: DEFAULT_WORKER_TIMEOUT_SECS,
             worker: WorkerConfig::default(),
+            convergence_n_rounds: DEFAULT_CONVERGENCE_N_ROUNDS,
         }
     }
+}
+
+fn default_convergence_n_rounds() -> u32 {
+    DEFAULT_CONVERGENCE_N_ROUNDS
 }
 
 impl OrchestratorConfig {
@@ -263,18 +320,34 @@ impl OrchestratorConfig {
     /// existing file (e.g. a `--config foo.toml` value) is never silently
     /// rewritten into a path.
     pub fn worker_argv(&self, root: &Path) -> Option<Vec<String>> {
-        if self.worker.argv.is_empty() {
-            return None;
-        }
-        let mut resolved = self.worker.argv.clone();
-        if let Some(script) = resolved.get_mut(SCRIPT_ARGV_INDEX) {
-            let candidate = Path::new(script.as_str());
-            if candidate.is_relative() && root.join(candidate).exists() {
-                *script = root.join(candidate).to_string_lossy().into_owned();
-            }
-        }
-        Some(resolved)
+        resolve_script_argv(&self.worker.argv, root)
     }
+
+    /// The Direct Adversary argv with its designated script field resolved
+    /// against `root`, mirroring [`worker_argv`](Self::worker_argv). Returns
+    /// `None` for an empty argv (a misconfiguration the pump reports rather than
+    /// spawning nothing).
+    pub fn adversary_argv(&self, root: &Path) -> Option<Vec<String>> {
+        resolve_script_argv(&self.worker.adversary_argv, root)
+    }
+}
+
+/// Resolve the [`SCRIPT_ARGV_INDEX`] script field of `argv` against `root` when
+/// it is an existing relative path, leaving every other position verbatim (see
+/// [`OrchestratorConfig::worker_argv`] for the rationale). Returns `None` for an
+/// empty argv. Shared by the Implementer and Adversary Direct argv resolvers.
+fn resolve_script_argv(argv: &[String], root: &Path) -> Option<Vec<String>> {
+    if argv.is_empty() {
+        return None;
+    }
+    let mut resolved = argv.to_vec();
+    if let Some(script) = resolved.get_mut(SCRIPT_ARGV_INDEX) {
+        let candidate = Path::new(script.as_str());
+        if candidate.is_relative() && root.join(candidate).exists() {
+            *script = root.join(candidate).to_string_lossy().into_owned();
+        }
+    }
+    Some(resolved)
 }
 
 fn default_poll_interval_ms() -> u64 {

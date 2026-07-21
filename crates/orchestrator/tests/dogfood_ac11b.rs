@@ -32,7 +32,7 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use common::{build_target_fixture, fake_implementer};
+use common::{build_target_fixture, fake_adversary_clean, fake_implementer};
 use orchestrator::config::{OrchestratorConfig, WorkerConfig, WorkerKind};
 use orchestrator::events::{read_all, EventLog, ORCHESTRATOR_DIR};
 use orchestrator::pump::{BuildPump, IssueOutcome};
@@ -241,6 +241,13 @@ fn ac11b_direct_dogfood_lands_on_shell_nix_target() {
                 "bash".to_owned(),
                 fake_implementer().to_string_lossy().into_owned(),
             ],
+            // A2: a Direct clean fake-adversary so the review round converges on
+            // the first pass → lands → merged (the end state is unchanged).
+            adversary_kind: WorkerKind::Direct,
+            adversary_argv: vec![
+                "bash".to_owned(),
+                fake_adversary_clean().to_string_lossy().into_owned(),
+            ],
             ..WorkerConfig::default()
         },
         worker_timeout_secs: 60,
@@ -288,7 +295,7 @@ fn ac11b_live_claude_lands_say_hi() {
     // worker/QA timeouts — a live agent takes minutes). Loaded through the real
     // config path (OrchestratorConfig::load), exactly as `main.rs` does.
     let fx = build_target_fixture(
-        "worker_timeout_secs = 1200\nqa_timeout_secs = 600\n\n[worker]\nkind = \"claude\"\nmax_turns_implementer = 200\n",
+        "worker_timeout_secs = 1200\nqa_timeout_secs = 600\n\n[worker]\nkind = \"claude\"\nmax_turns_implementer = 200\nadversary_kind = \"claude\"\nmax_turns_adversary = 100\n",
     );
     let orchestrator_dir = fx.root.join(ORCHESTRATOR_DIR);
     let config = OrchestratorConfig::load(&orchestrator_dir).expect("load target config");

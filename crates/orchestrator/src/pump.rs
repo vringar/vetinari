@@ -22,32 +22,51 @@
 //! show` matches the pump's authority — but a mirrored label is never read back
 //! to make a routing decision.
 //!
-//! # The per-issue state machine (MVP: QA pass → land directly)
+//! # The per-issue state machine (iteration 2: adversary review → converge → land)
 //!
 //! ```text
 //!   graphed
 //!     └─ label phase:implementing, prepare workspace on `main`,
-//!        spawn the Direct fake worker, wait
+//!        spawn the Implementer, wait
 //!          └─ verify DONE (S3)  ── missing ─▶ orchestrator-error (crash)
 //!             └─ translate artifacts → crosslink comments (idempotent, REQ-3b)
 //!                └─ qa-gate (S5): QaGate::run()
-//!                     ├─ Pass ─▶ landing (L2: land_local)
-//!                     │            ├─ Merged            ─▶ phase:merged (cleanup)
-//!                     │            └─ AwaitingHumanMerge ─▶ (terminal, parked)
+//!                     ├─ Pass ─▶ adversary-review (A2): render diff/log/prior-
+//!                     │            findings, spawn Adversary, verify DONE, read
+//!                     │            findings with the STRICT Findings::from_done
+//!                     │            ├─ findings ─▶ post blockers, round++, back to
+//!                     │            │               implementing (findings as input,
+//!                     │            │               REQ-8); re-implement in-process
+//!                     │            └─ clean round ─▶ converged? (A2: empty_round_
+//!                     │                  streak >= convergence_n_rounds, default 1)
+//!                     │                  ├─ yes ─▶ converged → landing (L2)
+//!                     │                  │           ├─ Merged / AwaitingHumanMerge
+//!                     │                  └─ no  ─▶ re-review (A3 n-rounds)
 //!                     ├─ Fail ─▶ blocker comment + back to implementing
-//!                     │           (bounded retries; MVP fixture passes first try)
+//!                     │           (bounded retries; requeued across ticks)
 //!                     └─ Err(poison) ─▶ orchestrator-error
 //! ```
 //!
-//! For the MVP the convergence rule is *QA pass → land* — there is **no**
-//! Adversary loop (that is iteration 2). The `Fail` path is **live**: a failing
-//! QA gate posts a blocker, bumps the round, and re-queues the issue at
-//! `Implementing` **in `state.db`**; the next tick's drive step re-selects it
-//! from `state.db` (the label is already off `phase:graphed`) and re-spawns a
-//! fresh worker. That loop is bounded by [`MAX_QA_RETRIES`]; the AC-11a fixture
-//! passes on the first try. (Before the ingest/drive split this retry was dead
-//! code — a requeued issue was never re-selected — which is exactly the bug this
-//! structure fixes.)
+//! The convergence rule is now *QA pass → adversary review → (findings ?
+//! re-implement : clean round → converge) → land* (A2, #22). Two loops:
+//!
+//! - **QA fail** re-implements **across ticks**: it posts a blocker, bumps the
+//!   round, and re-queues at `Implementing` **in `state.db`**; the next tick's
+//!   drive step re-selects it (the label is already off `phase:graphed`) and
+//!   re-spawns. Bounded by [`MAX_QA_RETRIES`].
+//! - **Adversary findings** re-implement **in-process**: findings are posted as
+//!   `--kind blocker`s, accumulated, and rendered into the next round's inputs
+//!   (REQ-8 fresh context — the Adversary's `prior_findings.json` and the
+//!   Implementer's task), so the whole implement→review cycle runs inside one
+//!   `drive_issue` call. Bounded by [`MAX_ADVERSARY_ROUNDS`].
+//!
+//! A **clean round** is read with the strict [`crate::artifacts::Findings::from_done`]:
+//! it REQUIRES a DONE-attested `findings.jsonl`, so an Adversary that wrote DONE
+//! but no findings is an *incomplete* review (poisoned), never a false
+//! convergence. The A2 convergence policy is a placeholder — one clean round
+//! (`convergence_n_rounds`, default 1) — that #23 (A3) replaces with the full
+//! n-rounds + `last_diff_hash`-stability detector behind the [`BuildPump::converged`]
+//! seam.
 //!
 //! # State authority (REQ-2): decisions read `state.db`, never labels
 //!
@@ -68,6 +87,20 @@
 //! against the `posted_artifacts` ledger (REQ-3b), so a crash mid-translation
 //! re-posts nothing.
 //!
+//! # Known limitation: the review loop blocks the tick (single-orchestrator)
+//!
+//! [`drive_issue`](BuildPump::drive_issue) runs an issue's whole
+//! implement→review→(re-implement|converge)→land machine **synchronously**, so
+//! the in-process adversary loop (each of up to [`MAX_ADVERSARY_ROUNDS`] rounds
+//! spawns a worker and waits for it) holds the tick for that issue's entire
+//! review. A single tick therefore *starts* at most `max_concurrent_agents`
+//! issues but does not interleave their reviews: raising the budget above 1 buys
+//! no concurrency *within* one issue's review. This is an intentional property of
+//! the single-orchestrator, single-`state.db`-writer model (REQ-2, REQ-3), not a
+//! bug — concurrency across *distinct* issues is the budget's job; concurrency
+//! *within* one issue's review is out of scope here (a future async/worker-pool
+//! reactor would be the place for it, and is deliberately not built now).
+//!
 //! # No shell-out (AC-24)
 //!
 //! The pump constructs no `std::process::Command`. Its worker runs as a
@@ -87,11 +120,14 @@ use thiserror::Error;
 use uuid::Uuid;
 use vetinari_crosslink_api::CrosslinkRepo;
 
-use crate::artifacts::{ArtifactSet, DoneSentinel};
+use crate::artifacts::{
+    ArtifactSet, CommentKind, DoneSentinel, Finding, Findings, Location, Severity,
+};
 use crate::config::{OrchestratorConfig, WorkerKind};
 use crate::events::{emit, EventLog};
 use crate::landing::{land_local, LandingOutcome};
 use crate::qa::{QaGate, QaOutcome};
+use crate::roles::adversary::{render_inputs, RenderParams, RenderedAdversaryInputs};
 use crate::spawn::{SpawnOutcome, Spawner, WorkerCommand};
 use crate::state::{ActiveWorkerRow, EventKind, IssueRow, Phase, StateDb, WorkerRole};
 use crate::workspace::{WorkspaceManager, WorkspaceName};
@@ -109,6 +145,12 @@ pub const GRAPHED_LABEL: &str = "phase:graphed";
 /// worker is the fake/real Implementer; the pump posts on its behalf.
 pub const WORKER_ROLE_TAG: &str = "implementer";
 
+/// The role attribution recorded on Adversary-derived crosslink comments
+/// (AC-16): the Adversary's findings (`--kind blocker`) and review summary are
+/// posted by the pump on the Adversary's behalf, so they are attributed to it,
+/// not to the Implementer.
+pub const ADVERSARY_ROLE_TAG: &str = "adversary";
+
 /// The base revset a fresh worker workspace is rooted on: `main`, so the
 /// worker's change is a child of trunk and lands as a clean fast-forward
 /// (REQ-17 local path).
@@ -118,6 +160,14 @@ pub const WORKER_BASE_REVSET: &str = "main";
 /// the issue at `orchestrator-error`. The MVP fixture passes first try; this
 /// bounds a genuinely-failing worker so the pump can't loop forever.
 pub const MAX_QA_RETRIES: i64 = 3;
+
+/// How many implement→review rounds an issue may go through before the pump
+/// gives up and parks it at `orchestrator-error` (A2). Each Adversary round that
+/// reports findings bumps the round and re-implements; without a bound an issue
+/// the Adversary never signs off on would loop forever. The MVP fixtures
+/// converge within one or two rounds; this only trips a genuinely-diverging
+/// issue.
+pub const MAX_ADVERSARY_ROUNDS: i64 = 6;
 
 /// Failure of a pump operation that is not itself an issue-level outcome.
 ///
@@ -153,6 +203,12 @@ pub enum PumpError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Artifact(#[from] vetinari_error::ArtifactError),
+
+    /// Pre-rendering an Adversary worker's inputs (diff/log/prior-findings/task)
+    /// failed (REQ-8, A1).
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Adversary(#[from] vetinari_error::AdversaryError),
 
     /// The pump could not locate the worker's committed change to land — the
     /// prepared workspace has no working-copy commit registered (should be
@@ -363,25 +419,37 @@ impl BuildPump {
     /// Drive one drivable `state.db` issue to a terminal-or-requeued phase.
     ///
     /// The caller ([`tick`](Self::tick)) selected this issue from `state.db`
-    /// (never a label). This runs the implement → verify → translate → QA → land
-    /// pipeline for the current round. Every phase transition writes `state.db`
-    /// (the authority), mirrors the `phase:*` label to crosslink (presentation),
-    /// and emits an event (REQ-14).
+    /// (never a label). This runs the full iteration-2 loop for the issue:
+    ///
+    /// ```text
+    ///   implement → QA → adversary-review
+    ///                       ├─ findings   → re-implement (round++, findings as input)
+    ///                       └─ clean round → converge? → land : re-review
+    /// ```
+    ///
+    /// The **re-implement-on-findings** cycle runs in-process: when the Adversary
+    /// reports findings the pump posts them as `--kind blocker` comments, bumps
+    /// the round, and loops back to spawn a fresh Implementer whose task carries
+    /// the accumulated findings (REQ-8 fresh context, threaded through the local
+    /// `prior_findings` accumulator). That accumulator is **seeded on entry** from
+    /// the durable blocker comments ([`rehydrate_prior_findings`](Self::rehydrate_prior_findings)),
+    /// so a crash mid-review (recovery rolls the issue back to `implementing`)
+    /// does not make the re-implement blind. The **QA-fail** re-implement path is
+    /// unchanged: it still returns [`IssueOutcome::Requeued`] so the next tick
+    /// re-drives it from `state.db` (its own bounded retry). Every phase
+    /// transition writes `state.db` (the authority), mirrors the `phase:*` label
+    /// (presentation), and emits an event (REQ-14).
     ///
     /// While a worker is in flight an `active_workers` row is persisted (#2) so
     /// the `posted_artifacts` ledger (REQ-3b) has a stable identity and P2's
     /// crash-recovery (#16) has the state it needs; the row is removed on every
-    /// completion/cleanup path. **P1 does not itself recover a crashed worker
-    /// from that row** — it only persists it; cross-restart recovery is deferred
-    /// to #16 P2.
+    /// completion/cleanup path.
     fn drive_issue(&self, issue_id: i64) -> Result<IssueOutcome, PumpError> {
         let key = issue_id.to_string();
 
-        // graphed/implementing → implementing: prepare a fresh workspace, spawn
-        // the worker, wait. The `from` phase is read from state.db (authority)
-        // so a requeued issue's event reads `implementing→implementing`, not a
-        // fabricated `graphed→…`.
-        let round = self.current_round(&key)?;
+        // graphed/implementing → implementing: the `from` phase is read from
+        // state.db (authority) so a requeued issue's event reads
+        // `implementing→implementing`, not a fabricated `graphed→…`.
         let from = self
             .state
             .get_issue(&key)?
@@ -389,24 +457,92 @@ impl BuildPump {
             .unwrap_or(Phase::Graphed);
         self.transition(&key, from, Phase::Implementing, "build pump pickup")?;
 
-        let name = WorkspaceName::generate(Phase::Implementing, &key, round);
+        // Findings accumulate across in-process re-implement rounds and are
+        // rendered into every subsequent Adversary's `prior_findings.json` AND
+        // the fresh Implementer's task (REQ-8) — never carried as agent memory.
+        //
+        // The accumulator is SEEDED from the durable `--kind blocker` comments
+        // the Adversary's findings were posted as (#2): a crash mid-review
+        // rolls the issue back to `implementing` (recovery) and drops the
+        // in-memory accumulator, so re-hydrating it here keeps the re-implement
+        // round from re-implementing BLIND while the persisted `round` climbs
+        // toward the poison cap. On a first (non-crash) entry there are no
+        // blockers yet, so this is `[]` and the in-process loop fills it.
+        let mut prior_findings: Vec<Finding> = self.rehydrate_prior_findings(issue_id)?;
+        loop {
+            // === implement → QA for the current round ===
+            let name = match self.run_implementer_round(issue_id, &key, &prior_findings)? {
+                ImplStep::Done(outcome) => return Ok(outcome),
+                ImplStep::QaPassed { name } => name,
+            };
+
+            // === adversary review (may re-implement or converge+land) ===
+            match self.run_adversary_review(issue_id, &key, &name, &mut prior_findings)? {
+                ReviewStep::Done(outcome) => return Ok(outcome),
+                ReviewStep::Reimplement => {
+                    // Findings posted, round bumped, phase rolled back to
+                    // implementing: loop and spawn a fresh Implementer.
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Run one Implementer round: prepare a fresh workspace, spawn the worker,
+    /// verify DONE, translate artifacts, guard the empty commit, and run QA.
+    ///
+    /// Returns [`ImplStep::QaPassed`] with the prepared workspace + name when QA
+    /// passes (the caller then runs adversary review on that change), or
+    /// [`ImplStep::Done`] carrying the terminal/requeue outcome for every other
+    /// path (missing DONE → poison, empty change → poison, QA fail → requeue, QA
+    /// poison → poison). The phase is assumed to already be `Implementing` on
+    /// entry (the caller transitioned it); this emits `implementing → qa-gate`.
+    ///
+    /// `prior_findings` is threaded to [`worker_command`](Self::worker_command)
+    /// so a re-implement round's Implementer receives the accumulated Adversary
+    /// findings as task input (REQ-8).
+    fn run_implementer_round(
+        &self,
+        issue_id: i64,
+        key: &str,
+        prior_findings: &[Finding],
+    ) -> Result<ImplStep, PumpError> {
+        let round = self.current_round(key)?;
+        // Reset `empty_round_streak` on every Implementer (re-)spawn (the
+        // schema's reset rule (c)): a fresh implementation invalidates any clean
+        // Adversary rounds counted against the PRIOR implementation, so a stale
+        // streak can never fool A3's n-rounds convergence detector into landing
+        // a re-implemented change on carried-over clean rounds. A no-op write
+        // when the streak is already 0 (the common first-round case).
+        if let Some(mut issue) = self.state.get_issue(key)? {
+            if issue.empty_round_streak != 0 {
+                issue.empty_round_streak = 0;
+                self.state.upsert_issue(&issue)?;
+            }
+        }
+        let name = WorkspaceName::generate(Phase::Implementing, key, round);
         let prepared = self.manager.prepare(&name, WORKER_BASE_REVSET)?;
         // Mint the worker identity ONCE for this attempt and persist it as an
-        // active_workers row (#2). Keeping the uuid stable for the attempt makes
-        // the posted_artifacts ledger (REQ-3b) dedupe a re-translation within the
-        // run; persisting the row gives P2 (#16) the state to recover from.
+        // active_workers row (#2): a stable uuid dedupes a re-translation within
+        // the run, and the row gives P2 (#16) the state to recover from.
         let worker_uuid = Uuid::new_v4().simple().to_string();
-        self.register_worker(&key, &worker_uuid, round, prepared.path())?;
+        self.register_worker(
+            key,
+            &worker_uuid,
+            WorkerRole::Implementer,
+            round,
+            prepared.path(),
+        )?;
 
-        let command = self.worker_command(issue_id, prepared.path())?;
+        let command = self.worker_command(issue_id, prepared.path(), prior_findings)?;
         let handle =
             self.spawner
-                .spawn(WorkerRole::Implementer, &key, round, &prepared, &command)?;
+                .spawn(WorkerRole::Implementer, key, round, &prepared, &command)?;
         emit(
             &self.state,
             &self.log,
             EventKind::Spawn,
-            Some(&key),
+            Some(key),
             Some(&worker_uuid),
             &json!({
                 "role": WORKER_ROLE_TAG,
@@ -419,20 +555,18 @@ impl BuildPump {
         let outcome = handle.wait(self.config.worker_timeout(), Duration::from_millis(300))?;
         if outcome == SpawnOutcome::StillRunning {
             // The worker outran its budget without producing a DONE — a stall,
-            // treated like a crash (REQ-13). Before cleaning the workspace, make
-            // sure the worker is actually gone (#3): close the pane AND verify it
-            // is dead, so the forget+rm below does not race a surviving child.
+            // treated like a crash (REQ-13). Confirm it is gone (#3) before the
+            // forget+rm so the cleanup does not race a surviving child.
             let _confirmed_dead =
                 handle.close_and_wait(Duration::from_secs(5), Duration::from_millis(200));
             self.remove_worker(&worker_uuid);
-            return self.poison(
-                &key,
-                &name,
+            return Ok(ImplStep::Done(self.poison(
+                key,
+                Some(&name),
                 &format!("worker for #{issue_id} exceeded its timeout without exiting"),
-            );
+            )?));
         }
         // Clean exit: the pane closed itself on command exit (--close-on-exit).
-        // Still best-effort close to be safe; a self-closed pane is idempotent.
         handle.close();
 
         // Verify the DONE sentinel (S3). Absence — regardless of exit code — is a
@@ -444,44 +578,42 @@ impl BuildPump {
                     &self.state,
                     &self.log,
                     EventKind::Transition,
-                    Some(&key),
+                    Some(key),
                     Some(&worker_uuid),
                     &json!({"error": "done_sentinel_missing", "detail": source.to_string()}),
                 )?;
                 self.remove_worker(&worker_uuid);
-                return self.poison(
-                    &key,
-                    &name,
+                return Ok(ImplStep::Done(self.poison(
+                    key,
+                    Some(&name),
                     &format!("worker for #{issue_id} left no valid DONE sentinel: {source}"),
-                );
+                )?));
             }
         };
 
         // Translate artifacts → crosslink comments (REQ-3, idempotent REQ-3b).
-        self.translate_artifacts(issue_id, &worker_uuid, &done)?;
+        self.translate_artifacts(issue_id, &worker_uuid, WORKER_ROLE_TAG, &done)?;
 
         // Empty-commit guard (#4): a worker that wrote a valid DONE but made no
-        // change (never edited the tree / never `jj describe`d) leaves a working
-        // copy identical to `main`. Fast-forwarding that would advance `main` to
-        // a no-op commit and falsely report Merged. Refuse to land it — treat it
-        // as a worker failure and poison the issue instead.
+        // change leaves a working copy identical to `main`. Fast-forwarding that
+        // would advance `main` to a no-op commit and falsely report Merged.
         if !self
             .manager
             .change_differs_from(WORKER_BASE_REVSET, &self.change_revset(&name, issue_id)?)?
         {
             self.remove_worker(&worker_uuid);
-            return self.poison(
-                &key,
-                &name,
+            return Ok(ImplStep::Done(self.poison(
+                key,
+                Some(&name),
                 &format!(
                     "worker for #{issue_id} produced an empty change (no diff vs `{WORKER_BASE_REVSET}`) — refusing to land"
                 ),
-            );
+            )?));
         }
 
         // qa-gate (S5).
         self.transition(
-            &key,
+            key,
             Phase::Implementing,
             Phase::QaGate,
             "worker committed; running QA",
@@ -493,12 +625,19 @@ impl BuildPump {
                     &self.state,
                     &self.log,
                     EventKind::QaResult,
-                    Some(&key),
+                    Some(key),
                     Some(&worker_uuid),
                     &json!({"result": "pass"}),
                 )?;
                 self.remove_worker(&worker_uuid);
-                self.land(issue_id, &key, &name, &prepared)
+                // The Implementer's committed change is durable in `.jj/`; its
+                // WORKSPACE DIR is not needed by adversary review (renders the
+                // diff from the change revset) or landing (lands the change
+                // revset). `prepared` is dropped here (`PreparedWorkspace` has
+                // no `Drop`, so the dir survives) — `run_adversary_review`
+                // forgets it explicitly once it has resolved the change (#1).
+                drop(prepared);
+                Ok(ImplStep::QaPassed { name })
             }
             Ok(QaOutcome::Fail {
                 exit_code,
@@ -508,12 +647,18 @@ impl BuildPump {
                     &self.state,
                     &self.log,
                     EventKind::QaResult,
-                    Some(&key),
+                    Some(key),
                     Some(&worker_uuid),
                     &json!({"result": "fail", "exit_code": exit_code}),
                 )?;
                 self.remove_worker(&worker_uuid);
-                self.on_qa_fail(issue_id, &key, &name, exit_code, output_tail.as_str())
+                Ok(ImplStep::Done(self.on_qa_fail(
+                    issue_id,
+                    key,
+                    &name,
+                    exit_code,
+                    output_tail.as_str(),
+                )?))
             }
             Err(source) => {
                 // Poison: a broken/killed/timed-out gate is orchestrator-error,
@@ -522,47 +667,344 @@ impl BuildPump {
                     &self.state,
                     &self.log,
                     EventKind::QaResult,
-                    Some(&key),
+                    Some(key),
                     Some(&worker_uuid),
                     &json!({"result": "poison", "detail": source.to_string()}),
                 )?;
                 self.remove_worker(&worker_uuid);
-                self.poison(
-                    &key,
-                    &name,
+                Ok(ImplStep::Done(self.poison(
+                    key,
+                    Some(&name),
                     &format!("QA gate for #{issue_id} is broken/poison: {source}"),
-                )
+                )?))
             }
         }
     }
 
-    /// QA passed → land the worker's committed change (L2) and, on a clean land,
-    /// clean up the workspace and mirror `phase:merged`.
-    fn land(
+    /// Run the Adversary review of the Implementer's QA-passed change (A2).
+    ///
+    /// Spawns a config-selectable Adversary (a Direct fake for deterministic
+    /// tests, or a real `claude` Adversary) with the change pre-rendered into its
+    /// workspace (REQ-8: the Adversary has no repository `.jj/`, so the
+    /// orchestrator renders `diff.patch`/`log.txt`/`prior_findings.json`/`task.md`
+    /// on its behalf). A clean round is read with the **strict**
+    /// [`Findings::from_done`] — an Adversary that wrote DONE but no
+    /// `findings.jsonl` is an incomplete round (poison), NEVER a false
+    /// convergence.
+    ///
+    /// Returns:
+    /// - [`ReviewStep::Done`] with a terminal outcome — converged → landed
+    ///   (`Merged`/`AwaitingHumanMerge`), or an incomplete/timed-out Adversary
+    ///   poisoned, or the round cap tripped;
+    /// - [`ReviewStep::Reimplement`] — findings were posted as blockers, the round
+    ///   bumped, `empty_round_streak` reset, and the phase rolled back to
+    ///   `Implementing`; the caller loops to re-spawn the Implementer.
+    fn run_adversary_review(
         &self,
         issue_id: i64,
         key: &str,
-        name: &WorkspaceName,
-        prepared: &crate::workspace::PreparedWorkspace,
-    ) -> Result<IssueOutcome, PumpError> {
-        // The change to land is the worker's committed working-copy commit —
-        // read AFTER the worker ran `jj describe`, so it is the describe'd
-        // commit, not the empty pre-run one.
-        let _ = prepared;
-        let change = self.change_revset(name, issue_id)?;
+        impl_name: &WorkspaceName,
+        prior_findings: &mut Vec<Finding>,
+    ) -> Result<ReviewStep, PumpError> {
+        // The change under review: the Implementer's committed working-copy
+        // commit, diffed against its parent (REQ-8, A1). Resolve it to a stable
+        // commit id NOW, while the Implementer workspace is still registered,
+        // because we forget that workspace immediately below.
+        let change = self.change_revset(impl_name, issue_id)?;
+        let diff_from = format!("{change}-");
+        self.transition(
+            key,
+            Phase::QaGate,
+            Phase::AdversaryReview,
+            "QA passed — adversary review",
+        )?;
+
+        // #1 (no orphan workspace lingers): forget the Implementer workspace DIR
+        // now, before the (multi-round) review window. Its committed change is
+        // durable in `.jj/` (non-empty + described ⇒ `workspace forget` does not
+        // abandon it), and neither `render_inputs` (renders the diff/log from the
+        // change revset) nor `land` (lands the change revset) needs the DIR. So
+        // forgetting it here means a crash anywhere in the review can leave NO
+        // orphan Implementer workspace — recovery's `AdversaryReview` arm then
+        // just rolls the (workspace-less) issue back to `implementing`.
+        let _ = self.manager.forget(impl_name);
+
+        // The task the change was meant to accomplish (also handed to a live
+        // Adversary; ignored by the Direct fake). Untrusted crosslink input — the
+        // orchestrator-side validation, not the worker, protects `main`.
+        let info = self.crosslink.read_issue(issue_id)?;
+        let task =
+            crate::roles::implementer::task_from_issue(&info.title, info.description.as_deref());
+
+        // Adversary rounds on THIS (unchanged) Implementer change: a clean round
+        // increments the streak; convergence lands. A findings round breaks out
+        // to re-implement. Bounded so a never-converging clean stream can't spin
+        // forever.
+        for _ in 0..MAX_ADVERSARY_ROUNDS {
+            let round = self.current_round(key)?;
+            let adv_name = WorkspaceName::generate(Phase::AdversaryReview, key, round);
+            let adv_prepared = self.manager.prepare(&adv_name, WORKER_BASE_REVSET)?;
+            // Pre-render the Adversary's inputs into its workspace BEFORE the
+            // spawn (REQ-8). A render failure is a pump fault, not an issue-level
+            // outcome — but clean up both workspaces first so nothing leaks.
+            let rendered = match render_inputs(
+                &self.manager,
+                adv_prepared.path(),
+                &RenderParams {
+                    diff_from: &diff_from,
+                    diff_to: &change,
+                    log_revset: &change,
+                    prior_findings,
+                    task: &task,
+                },
+            ) {
+                Ok(rendered) => rendered,
+                Err(source) => {
+                    let _ = self.manager.forget(&adv_name);
+                    let _ = self.manager.forget(impl_name);
+                    return Err(source.into());
+                }
+            };
+
+            let worker_uuid = Uuid::new_v4().simple().to_string();
+            self.register_worker(
+                key,
+                &worker_uuid,
+                WorkerRole::Adversary,
+                round,
+                adv_prepared.path(),
+            )?;
+            let command = self.adversary_worker_command(issue_id, &rendered, &task)?;
+            let handle =
+                self.spawner
+                    .spawn(WorkerRole::Adversary, key, round, &adv_prepared, &command)?;
+            emit(
+                &self.state,
+                &self.log,
+                EventKind::Spawn,
+                Some(key),
+                Some(&worker_uuid),
+                &json!({
+                    "role": ADVERSARY_ROLE_TAG,
+                    "round": round,
+                    "pane": handle.pane.name.clone(),
+                    "workspace": adv_name.as_str(),
+                }),
+            )?;
+
+            let outcome = handle.wait(self.config.worker_timeout(), Duration::from_millis(300))?;
+            if outcome == SpawnOutcome::StillRunning {
+                let _dead =
+                    handle.close_and_wait(Duration::from_secs(5), Duration::from_millis(200));
+                self.remove_worker(&worker_uuid);
+                let _ = self.manager.forget(&adv_name);
+                return Ok(ReviewStep::Done(self.poison(
+                    key,
+                    None,
+                    &format!("adversary for #{issue_id} exceeded its timeout without exiting"),
+                )?));
+            }
+            handle.close();
+
+            // Verify DONE (S3): a missing/torn sentinel is an incomplete review,
+            // handled like any crashed worker — poison, NOT a clean convergence.
+            let done = match DoneSentinel::verify(adv_prepared.path()) {
+                Ok(done) => done,
+                Err(source) => {
+                    self.remove_worker(&worker_uuid);
+                    let _ = self.manager.forget(&adv_name);
+                    return Ok(ReviewStep::Done(self.poison(
+                        key,
+                        None,
+                        &format!("adversary for #{issue_id} left no valid DONE sentinel: {source}"),
+                    )?));
+                }
+            };
+
+            // STRICT convergence read (REQ-10): a clean round REQUIRES a
+            // DONE-attested `findings.jsonl`. An absent one is `FindingsMissing`
+            // — an incomplete Adversary, poisoned; it must NEVER read as
+            // "empty ⇒ converged" (the false-convergence hole A1 closed).
+            let findings = match Findings::from_done(&done) {
+                Ok(findings) => findings,
+                Err(source) => {
+                    self.remove_worker(&worker_uuid);
+                    let _ = self.manager.forget(&adv_name);
+                    return Ok(ReviewStep::Done(self.poison(
+                        key,
+                        None,
+                        &format!(
+                            "adversary for #{issue_id} produced no DONE-attested findings.jsonl \
+                             ({source}) — treating as an incomplete review, not a clean round"
+                        ),
+                    )?));
+                }
+            };
+            self.remove_worker(&worker_uuid);
+
+            if !findings.is_empty() {
+                // Findings → post each as an idempotent `--kind blocker`
+                // (content-addressed ledger dedupes a replay), accumulate them for
+                // the next round's inputs, and re-implement (round++).
+                self.translate_artifacts(issue_id, &worker_uuid, ADVERSARY_ROLE_TAG, &done)?;
+                prior_findings.extend(findings.findings().iter().cloned());
+                let finding_count = findings.findings().len();
+                // Clean up the Adversary workspace for the finished round (REQ-12).
+                // The Implementer workspace was already forgotten before the loop
+                // (#1), so nothing else lingers.
+                let _ = self.manager.forget(&adv_name);
+                return self.on_adversary_findings(issue_id, key, round, finding_count);
+            }
+
+            // Clean round: increment the streak, record the diff hash for A3's
+            // stability check, and decide convergence via the A2 placeholder.
+            let _ = self.manager.forget(&adv_name);
+            let streak = self.on_clean_round(key, &diff_from, &change)?;
+            if self.converged(streak) {
+                self.transition(
+                    key,
+                    Phase::AdversaryReview,
+                    Phase::Converged,
+                    "adversary clean; convergence criterion met",
+                )?;
+                return Ok(ReviewStep::Done(self.land(issue_id, key, &change)?));
+            }
+            // Not yet converged (A3 n-rounds): re-review the SAME change with a
+            // fresh Adversary. Loop.
+        }
+
+        // Never converged within the cap — poison rather than loop forever.
+        Ok(ReviewStep::Done(self.poison(
+            key,
+            None,
+            &format!(
+                "issue #{issue_id} did not converge within {MAX_ADVERSARY_ROUNDS} adversary rounds"
+            ),
+        )?))
+    }
+
+    /// Adversary reported findings: bump the round, reset `empty_round_streak`,
+    /// and roll the phase back to `Implementing` so the in-process loop re-spawns
+    /// a fresh Implementer (REQ-8). Poisons instead if the round cap is reached.
+    ///
+    /// The `empty_round_streak = 0` reset is emitted in the event payload so the
+    /// reset is observable (the schema's reset rule (a): findings in any round).
+    fn on_adversary_findings(
+        &self,
+        issue_id: i64,
+        key: &str,
+        round: u32,
+        finding_count: usize,
+    ) -> Result<ReviewStep, PumpError> {
+        let next_round = round as i64 + 1;
+        if next_round >= MAX_ADVERSARY_ROUNDS {
+            // Nothing to clean: the caller already forgot this round's Adversary
+            // workspace, and the Implementer workspace was forgotten before the
+            // review loop (#1). Poison WITHOUT a workspace — correct by
+            // construction, not by a fabricated-never-prepared name that only
+            // no-op'd by accident.
+            return Ok(ReviewStep::Done(self.poison(
+                key,
+                None,
+                &format!(
+                    "issue #{issue_id} still has adversary findings after {MAX_ADVERSARY_ROUNDS} rounds"
+                ),
+            )?));
+        }
+        // Bump round + reset streak in state.db (phase updated to Implementing
+        // by the emit below). upsert preserves the row's other columns.
+        if let Some(mut issue) = self.state.get_issue(key)? {
+            issue.round = next_round;
+            issue.empty_round_streak = 0;
+            issue.phase_substate = None;
+            self.state.upsert_issue(&issue)?;
+        }
+        // adversary-review → implementing, with the findings + reset in the
+        // payload so the re-implement round and streak reset are observable.
+        self.state.set_phase(key, Phase::Implementing, None)?;
+        self.set_phase_label(issue_id, Phase::Implementing)?;
+        emit(
+            &self.state,
+            &self.log,
+            EventKind::Transition,
+            Some(key),
+            None,
+            &json!({
+                "from_phase": Phase::AdversaryReview.as_str(),
+                "to_phase": Phase::Implementing.as_str(),
+                "reason": "adversary findings — re-implementing",
+                "findings": finding_count,
+                "empty_round_streak": 0,
+                "round": next_round,
+            }),
+        )?;
+        // Signal "re-implement" to the caller's loop (which re-preps a fresh
+        // Implementer workspace for `next_round`).
+        Ok(ReviewStep::Reimplement)
+    }
+
+    /// A clean Adversary round (zero findings): increment `empty_round_streak`,
+    /// record `last_diff_hash` (the round-N diff sha, for A3's stability check),
+    /// and emit a convergence event. Returns the new streak.
+    fn on_clean_round(&self, key: &str, diff_from: &str, diff_to: &str) -> Result<i64, PumpError> {
+        let diff_hash = self
+            .manager
+            .diff(diff_from, diff_to)
+            .ok()
+            .map(|patch| sha256_hex(patch.as_bytes()));
+        let mut streak = 0;
+        if let Some(mut issue) = self.state.get_issue(key)? {
+            issue.empty_round_streak += 1;
+            issue.last_diff_hash = diff_hash;
+            streak = issue.empty_round_streak;
+            self.state.upsert_issue(&issue)?;
+        }
+        emit(
+            &self.state,
+            &self.log,
+            EventKind::Convergence,
+            Some(key),
+            None,
+            &json!({
+                "empty_round_streak": streak,
+                "converged": self.converged(streak),
+            }),
+        )?;
+        Ok(streak)
+    }
+
+    /// The A2 placeholder convergence detector — the seam #23 (A3) hardens.
+    ///
+    /// A2 converges once `empty_round_streak` reaches the configured
+    /// `convergence_n_rounds` (default **1** for A2, so the first DONE-attested
+    /// clean round converges and the dogfoods land unchanged). A3 replaces this
+    /// with the full REQ-10 detector — configurable n consecutive clean rounds
+    /// **plus** `last_diff_hash` stability — behind this same call site, so only
+    /// the body changes.
+    fn converged(&self, empty_round_streak: i64) -> bool {
+        empty_round_streak >= self.config.convergence_n_rounds as i64
+    }
+
+    /// Converged → land the Implementer's committed change (L2) and mirror the
+    /// terminal `phase:*` label.
+    ///
+    /// `change` is the already-resolved commit id of the Implementer's change
+    /// (resolved by [`run_adversary_review`](Self::run_adversary_review) while
+    /// the Implementer workspace was still registered, then forgotten before the
+    /// review — #1). The committed change is durable in `.jj/`, so landing needs
+    /// no workspace DIR; there is nothing left to clean up here.
+    fn land(&self, issue_id: i64, key: &str, change: &str) -> Result<IssueOutcome, PumpError> {
         // land_local drives the whole rebase → fast-forward substate machine and
         // owns the Landing/Merged/AwaitingHumanMerge transitions + events.
-        let outcome = land_local(&self.state, &self.log, &self.manager, key, &change)?;
+        let outcome = land_local(&self.state, &self.log, &self.manager, key, change)?;
         match outcome {
             LandingOutcome::Merged => {
-                // Cleanup the ephemeral workspace and mirror the terminal label.
-                self.manager.forget(name)?;
                 self.set_phase_label(issue_id, Phase::Merged)?;
                 Ok(IssueOutcome::Merged)
             }
             LandingOutcome::AwaitingHumanMerge => {
-                // Parked for a human; leave the workspace for inspection but
-                // mirror the label so the crosslink trail shows the block.
+                // Parked for a human; mirror the label so the crosslink trail
+                // shows the block.
                 self.set_phase_label(issue_id, Phase::AwaitingHumanMerge)?;
                 Ok(IssueOutcome::AwaitingHumanMerge)
             }
@@ -593,17 +1035,22 @@ impl BuildPump {
         let issue = self.state.get_issue(key)?;
         let round = issue.as_ref().map(|i| i.round).unwrap_or(0);
         if round + 1 >= MAX_QA_RETRIES {
+            // The workspace was already forgotten above; poison without one.
             return self.poison(
                 key,
-                name,
+                None,
                 &format!("QA for #{issue_id} still failing after {MAX_QA_RETRIES} attempts"),
             );
         }
         // Bump the round and re-queue at implementing; a later tick re-drives.
+        // Reset `empty_round_streak` (the schema's reset rule (b): QA fail in any
+        // round) so a stale clean-round streak from a prior implementation can't
+        // survive a QA-fail re-spawn into A3's convergence detector.
         if let Some(mut issue) = issue {
             issue.round = round + 1;
             issue.phase = Phase::Implementing;
             issue.phase_substate = None;
+            issue.empty_round_streak = 0;
             self.state.upsert_issue(&issue)?;
         }
         self.transition(
@@ -626,15 +1073,21 @@ impl BuildPump {
     ///   S7, so the dogfood stays green.
     /// - [`WorkerKind::Claude`] — a real Implementer: read the issue's title +
     ///   description from crosslink as the task (REQ-8, **untrusted input** — see
-    ///   [`crate::roles::implementer::task_from_issue`]), and build the
-    ///   Implementer `WorkerCommand::Claude` from [`crate::roles::implementer`]
-    ///   (its allowlist, deny list, system prompt, and the config turn cap —
-    ///   `max_turns_implementer`). The `Spawner` then enforces the mount matrix,
-    ///   writes `task.md`, and verifies the `bwrap` pin.
+    ///   [`crate::roles::implementer::task_from_issue`]), append any accumulated
+    ///   Adversary `prior_findings` so a re-implement round addresses them (REQ-8
+    ///   fresh context — the findings reach the worker as task input, never as
+    ///   session memory), and build the Implementer `WorkerCommand::Claude` from
+    ///   [`crate::roles::implementer`]. The `Spawner` then enforces the mount
+    ///   matrix, writes `task.md`, and verifies the `bwrap` pin.
+    ///
+    /// `prior_findings` is ignored on the Direct path (the fake worker reads no
+    /// task file); the deterministic tests exercise the findings-threading via the
+    /// Adversary's `prior_findings.json` instead.
     fn worker_command(
         &self,
         issue_id: i64,
         workspace: &std::path::Path,
+        prior_findings: &[Finding],
     ) -> Result<WorkerCommand, PumpError> {
         match self.config.worker.kind {
             WorkerKind::Direct => {
@@ -650,6 +1103,7 @@ impl BuildPump {
                     &info.title,
                     info.description.as_deref(),
                 );
+                let task = append_prior_findings(task, prior_findings);
                 Ok(crate::roles::implementer::worker_command(
                     self.manager.root(),
                     workspace,
@@ -657,6 +1111,42 @@ impl BuildPump {
                     self.config.worker.max_turns_implementer,
                 ))
             }
+        }
+    }
+
+    /// Build the Adversary worker command for `issue_id`, dispatched into the
+    /// pre-rendered `rendered` workspace, per the typed `[worker] adversary_kind`.
+    ///
+    /// Mirrors [`worker_command`](Self::worker_command): a
+    /// [`WorkerKind::Direct`] Adversary runs the configured `adversary_argv`
+    /// straight in the pre-rendered workspace (the deterministic `fake-adversary*`
+    /// dogfood path — it reads `_orchestrator/diff.patch` and writes
+    /// `findings.jsonl`), while a [`WorkerKind::Claude`] Adversary is built from
+    /// [`crate::roles::adversary`] (its narrow allowlist, no-`.jj/` mount matrix,
+    /// system prompt, and `max_turns_adversary`). The Adversary's inputs were
+    /// already rendered by [`render_inputs`], proven by the
+    /// [`RenderedAdversaryInputs`] token this takes.
+    fn adversary_worker_command(
+        &self,
+        issue_id: i64,
+        rendered: &RenderedAdversaryInputs,
+        task: &str,
+    ) -> Result<WorkerCommand, PumpError> {
+        let _ = issue_id;
+        match self.config.worker.adversary_kind {
+            WorkerKind::Direct => {
+                let argv = self
+                    .config
+                    .adversary_argv(self.manager.root())
+                    .ok_or(PumpError::EmptyWorkerCommand)?;
+                Ok(WorkerCommand::direct(argv, Vec::<(String, String)>::new()))
+            }
+            WorkerKind::Claude => Ok(crate::roles::adversary::worker_command(
+                self.manager.root(),
+                rendered,
+                task.to_owned(),
+                self.config.worker.max_turns_adversary,
+            )),
         }
     }
 
@@ -691,6 +1181,7 @@ impl BuildPump {
         &self,
         key: &str,
         worker_uuid: &str,
+        role: WorkerRole,
         round: u32,
         workspace_path: &std::path::Path,
     ) -> Result<(), PumpError> {
@@ -698,7 +1189,7 @@ impl BuildPump {
         self.state.upsert_worker(&ActiveWorkerRow {
             worker_uuid: worker_uuid.to_owned(),
             issue_id: key.to_owned(),
-            role: WorkerRole::Implementer,
+            role,
             round: round as i64,
             workspace_path: workspace_path.to_path_buf(),
             pid: None,
@@ -715,6 +1206,40 @@ impl BuildPump {
         let _ = self.state.remove_worker(worker_uuid);
     }
 
+    /// Re-hydrate the prior Adversary findings for an issue from the durable
+    /// `--kind blocker` comments they were posted as (#2, REQ-8).
+    ///
+    /// The in-memory `prior_findings` accumulator that threads findings from one
+    /// re-implement round to the next is lost on a crash: recovery rolls the
+    /// issue back to `implementing`, and the next `drive_issue` starts with an
+    /// empty accumulator, so the re-implement would be BLIND while the persisted
+    /// `round` climbs toward the poison cap. The findings ARE durable, though —
+    /// each was posted as an idempotent `--kind blocker` with the `[adversary]`
+    /// role marker. Reading them back seeds the next Implementer's task (not
+    /// blind) AND the next Adversary's `prior_findings.json`.
+    ///
+    /// Only Adversary blockers are re-hydrated: they carry the `[adversary]`
+    /// marker line, distinguishing them from QA-failure blockers (posted with
+    /// the `[implementer]` marker), which are not findings and whose bodies
+    /// don't parse as one anyway. On a first (non-crash) entry there are no
+    /// blockers yet, so this returns `[]`.
+    fn rehydrate_prior_findings(&self, issue_id: i64) -> Result<Vec<Finding>, PumpError> {
+        let marker = format!("[{ADVERSARY_ROLE_TAG}]\n\n");
+        let mut out = Vec::new();
+        for comment in self.crosslink.list_comments(issue_id)? {
+            if comment.kind != CommentKind::Blocker.as_str() {
+                continue;
+            }
+            let Some(body) = comment.body.strip_prefix(&marker) else {
+                continue;
+            };
+            if let Some(finding) = parse_finding_from_body(body) {
+                out.push(finding);
+            }
+        }
+        Ok(out)
+    }
+
     /// The current round for an issue (0 if it has no state row yet).
     fn current_round(&self, key: &str) -> Result<u32, PumpError> {
         Ok(self
@@ -726,14 +1251,23 @@ impl BuildPump {
 
     /// Poison an issue: set `phase:orchestrator-error`, mirror the label, emit,
     /// and clean up its workspace. The terminal fault state (REQ error-handling).
+    ///
+    /// `workspace` is the workspace to clean up, or `None` when the caller has
+    /// already forgotten every workspace it owned (the adversary-review paths,
+    /// where the Implementer workspace was forgotten before the review and each
+    /// round's Adversary workspace is forgotten as the round ends) — so the
+    /// cleanup is correct by construction, never a fabricated name that only
+    /// no-ops by accident.
     fn poison(
         &self,
         key: &str,
-        name: &WorkspaceName,
+        workspace: Option<&WorkspaceName>,
         reason: &str,
     ) -> Result<IssueOutcome, PumpError> {
         // Best-effort workspace cleanup — a poison must not leak the workspace.
-        let _ = self.manager.forget(name);
+        if let Some(name) = workspace {
+            let _ = self.manager.forget(name);
+        }
         let from = self
             .state
             .get_issue(key)?
@@ -806,10 +1340,15 @@ impl BuildPump {
     /// the issue + content (not the worker uuid) means a re-translation of
     /// identical content under a fresh uuid — a crash-recovery re-drive — is also
     /// suppressed, so a comment posts at most once across attempts.
+    ///
+    /// `role_tag` is the AC-16 attribution recorded on the posted comments —
+    /// [`WORKER_ROLE_TAG`] for the Implementer's `result.md`, [`ADVERSARY_ROLE_TAG`]
+    /// for the Adversary's findings (`--kind blocker`) + review summary.
     fn translate_artifacts(
         &self,
         issue_id: i64,
         worker_uuid: &str,
+        role_tag: &str,
         done: &DoneSentinel,
     ) -> Result<(), PumpError> {
         let issue_key = issue_id.to_string();
@@ -828,7 +1367,7 @@ impl BuildPump {
                 issue_id,
                 item.kind.as_str(),
                 &item.body,
-                Some(WORKER_ROLE_TAG),
+                Some(role_tag),
             )?;
             self.state.record_posted(&crate::state::PostedArtifact {
                 issue_id: issue_key.clone(),
@@ -862,6 +1401,116 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Lowercase-hex SHA-256 of `bytes` — the `last_diff_hash` for the round-N
+/// diff-stability check (REQ-10, recorded by A2 for A3 to consume). No shell-out
+/// (AC-24): the [`sha2`] crate, matching [`crate::artifacts`].
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Reconstruct a [`Finding`] from the body of the `--kind blocker` comment it
+/// was posted as — the inverse of [`Finding::comment_body`], for re-hydrating
+/// prior findings from crosslink after a crash (#2, REQ-8).
+///
+/// The body shape is deterministic (produced by `comment_body`):
+///
+/// ```text
+/// [<severity>] <claim>
+/// location: <path>:<line>
+/// [evidence:
+/// - <file>
+/// - <file>]
+/// ```
+///
+/// A body that doesn't match (e.g. a QA-failure blocker, whose text is not a
+/// finding) yields `None` and is skipped — so only genuine Adversary findings
+/// re-hydrate. The reconstruction is close enough for both consumers: the
+/// Implementer's task text (the REQ-8 essence — the finding reaches the next
+/// round as input) and the Adversary's `prior_findings.json`.
+fn parse_finding_from_body(text: &str) -> Option<Finding> {
+    let mut lines = text.lines();
+    let head = lines.next()?;
+    let (sev_tok, claim) = head.strip_prefix('[')?.split_once("] ")?;
+    let severity = match sev_tok {
+        "high" => Severity::High,
+        "med" => Severity::Med,
+        "low" => Severity::Low,
+        _ => return None,
+    };
+    let mut location = None;
+    let mut evidence_files = Vec::new();
+    let mut in_evidence = false;
+    for line in lines {
+        if let Some(loc) = line.strip_prefix("location: ") {
+            location = Location::parse(loc);
+        } else if line == "evidence:" {
+            in_evidence = true;
+        } else if in_evidence {
+            if let Some(file) = line.strip_prefix("- ") {
+                evidence_files.push(file.to_owned());
+            }
+        }
+    }
+    Some(Finding {
+        severity,
+        location: location?,
+        claim: claim.to_owned(),
+        evidence_files,
+    })
+}
+
+/// Append the accumulated Adversary `prior_findings` to a fresh Implementer's
+/// task (REQ-8): the findings reach the worker as task input, so a re-implement
+/// round addresses them, never as agent session memory. Empty findings leave the
+/// task untouched.
+fn append_prior_findings(task: String, prior_findings: &[Finding]) -> String {
+    if prior_findings.is_empty() {
+        return task;
+    }
+    let mut out = task;
+    out.push_str("\n\n## Prior adversary findings to address\n");
+    for finding in prior_findings {
+        out.push_str(&format!(
+            "\n- {}",
+            finding.comment_body().replace('\n', "\n  ")
+        ));
+    }
+    out
+}
+
+/// One step of the Implementer round ([`BuildPump::run_implementer_round`]).
+enum ImplStep {
+    /// A terminal-or-requeued outcome was reached before review (poison, empty
+    /// change, QA fail → requeue, QA poison) — return it directly.
+    Done(IssueOutcome),
+    /// QA passed: the workspace name of the Implementer's change, from which the
+    /// adversary review resolves the change revset before forgetting the
+    /// workspace DIR (#1). The prepared workspace itself is not carried — it
+    /// holds no `Drop`, and the committed change is durable in `.jj/`.
+    QaPassed {
+        /// The Implementer workspace name — the change-revset handle.
+        name: WorkspaceName,
+    },
+}
+
+/// One step of the Adversary review ([`BuildPump::run_adversary_review`]).
+enum ReviewStep {
+    /// A terminal outcome was reached — converged → landed, an incomplete
+    /// Adversary poisoned, or the round cap tripped.
+    Done(IssueOutcome),
+    /// The Adversary reported findings: they were posted as blockers, the round
+    /// bumped, and the phase rolled back to `Implementing`. The caller loops to
+    /// re-spawn a fresh Implementer.
+    Reimplement,
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -885,5 +1534,48 @@ mod tests {
     fn state_db_path_is_under_orchestrator_dir() {
         let p = state_db_path(std::path::Path::new("/repo"));
         assert!(p.ends_with(".orchestrator/state.db"));
+    }
+
+    /// #2: a blocker body reconstructs exactly back into its `Finding` (the
+    /// inverse of `Finding::comment_body`), so a crash-re-hydrated finding is
+    /// faithful — and it reaches the next Implementer as task input (the REQ-8
+    /// essence: the re-implement is NOT blind).
+    #[test]
+    fn blocker_body_round_trips_into_finding_and_reaches_implementer() {
+        let finding = Finding {
+            severity: Severity::High,
+            location: Location::parse("src/lib.rs:12").expect("location"),
+            claim: "say_hi has no boundary test".to_owned(),
+            evidence_files: vec!["src/lib.rs".to_owned(), "src/main.rs".to_owned()],
+        };
+        // comment_body → parse_finding_from_body is a faithful round-trip.
+        let body = finding.comment_body();
+        let parsed = parse_finding_from_body(&body).expect("body must reconstruct a finding");
+        assert_eq!(parsed, finding);
+
+        // A finding with no evidence still round-trips.
+        let no_evidence = Finding {
+            evidence_files: Vec::new(),
+            ..finding.clone()
+        };
+        assert_eq!(
+            parse_finding_from_body(&no_evidence.comment_body()).expect("parse"),
+            no_evidence
+        );
+
+        // The reconstructed finding reaches the Implementer as task text — this
+        // is exactly what `worker_command` (Claude path) feeds a re-implement
+        // round, so the re-entry is not blind.
+        let task = append_prior_findings("Implement say_hi".to_owned(), &[parsed]);
+        assert!(task.contains("Prior adversary findings"));
+        assert!(task.contains("say_hi has no boundary test"));
+    }
+
+    /// A QA-failure blocker (not a finding) must NOT reconstruct as a finding —
+    /// so re-hydration ignores it (only `[adversary]` findings are seeded).
+    #[test]
+    fn qa_failure_blocker_body_is_not_parsed_as_a_finding() {
+        let qa_body = "Static QA failed (exit 1). Last output:\n\n```\nerror[E0308]\n```";
+        assert!(parse_finding_from_body(qa_body).is_none());
     }
 }

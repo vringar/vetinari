@@ -686,6 +686,37 @@ impl StateDb {
         Ok(count > 0)
     }
 
+    /// Every `posted_artifacts` ledger row for an issue, in insertion order — the
+    /// observable record of which comments the pump translated (REQ-3b). Used by
+    /// the adversary-loop tests to assert a finding's `--kind blocker` was posted
+    /// exactly once (idempotent, content-addressed); a `finding_index >= 0` row is
+    /// a per-finding blocker, `-1` a whole-file `result` comment.
+    pub fn list_posted_artifacts(&self, issue_id: &str) -> Result<Vec<PostedArtifact>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT issue_id, artifact_path, content_sha, finding_index, worker_uuid, \
+                 comment_id, posted_at FROM posted_artifacts WHERE issue_id = ?1 \
+                 ORDER BY posted_at, finding_index",
+            )
+            .map_err(query_err("prepare list posted artifacts"))?;
+        let rows = stmt
+            .query_map(params![issue_id], |row| {
+                Ok(PostedArtifact {
+                    issue_id: row.get(0)?,
+                    artifact_path: row.get(1)?,
+                    content_sha: row.get(2)?,
+                    finding_index: row.get(3)?,
+                    worker_uuid: row.get(4)?,
+                    comment_id: row.get(5)?,
+                    posted_at: row.get(6)?,
+                })
+            })
+            .map_err(query_err("query list posted artifacts"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(query_err("read posted artifact row"))
+    }
+
     // --- events -------------------------------------------------------------
 
     /// Append an event, returning its new autoincrement `id` and the `ts` (unix

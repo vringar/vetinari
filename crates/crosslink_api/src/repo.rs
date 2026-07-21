@@ -34,6 +34,21 @@ pub struct IssueInfo {
     pub labels: Vec<String>,
 }
 
+/// Adapter-owned snapshot of one crosslink comment.
+///
+/// A plain `(kind, body)` pair with no crosslink types in it. Used to
+/// re-hydrate durable orchestrator state that is *not* mirrored into `state.db`
+/// — specifically the prior Adversary `--kind blocker` findings the pump must
+/// re-derive after a crash so a re-implement round is not blind (REQ-8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentInfo {
+    /// Crosslink comment kind (`note`, `blocker`, `result`, …).
+    pub kind: String,
+    /// The comment body, verbatim — including any leading `[role]` marker line
+    /// the single-writer path records (see [`CrosslinkRepo::comment_write`]).
+    pub body: String,
+}
+
 /// A handle to a crosslink-tracked repository.
 ///
 /// Construct with [`CrosslinkRepo::discover`] or [`CrosslinkRepo::open`], then
@@ -183,6 +198,31 @@ impl CrosslinkRepo {
         }
         open.sort_unstable();
         Ok(open)
+    }
+
+    /// Every comment on issue `id`, oldest first, as adapter-owned
+    /// `(kind, body)` snapshots.
+    ///
+    /// The pump uses this to re-hydrate the prior Adversary findings after a
+    /// crash: those findings were posted as durable `--kind blocker` comments
+    /// (idempotently, REQ-3b), but the in-memory accumulator that threads them
+    /// into the next round is lost on restart. Reading them back from crosslink
+    /// keeps a re-implement round from re-implementing blind (REQ-8). Read-only:
+    /// it never writes, so it is safe to call on every `drive_issue` entry.
+    pub fn list_comments(&self, id: i64) -> Result<Vec<CommentInfo>> {
+        let db = self.db()?;
+        self.require_issue(&db, id)?;
+        let comments = db.get_comments(id).map_err(|source| CrosslinkError::Read {
+            operation: format!("read comments of issue #{id}"),
+            source: source.into(),
+        })?;
+        Ok(comments
+            .into_iter()
+            .map(|c| CommentInfo {
+                kind: c.kind,
+                body: c.content,
+            })
+            .collect())
     }
 
     /// Add a comment to issue `issue_id` and return the new comment's id.

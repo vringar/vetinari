@@ -88,6 +88,20 @@ pub fn fake_adversary_no_findings() -> PathBuf {
     fixtures_path("fake-adversary-no-findings.sh")
 }
 
+/// Path to the fake adversary that FLAGS a finding on round 0 (empty
+/// `prior_findings.json`) then signs off CLEAN on round 1+ (prior findings
+/// present) — drives the re-implement-on-findings → converge cycle (A2).
+pub fn fake_adversary_flag() -> PathBuf {
+    fixtures_path("fake-adversary-flag.sh")
+}
+
+/// Path to a CLEAN fake adversary that also records the `.workspace/` listing it
+/// observed while running, into `.orchestrator/adversary-workspaces-seen.txt` —
+/// proving the Implementer workspace was forgotten before review (#1).
+pub fn fake_adversary_clean_record() -> PathBuf {
+    fixtures_path("fake-adversary-clean-record.sh")
+}
+
 /// Run `program args...` in `cwd`, panicking with captured output on failure.
 fn run(program: &str, args: &[&str], cwd: &Path) {
     let out = Command::new(program)

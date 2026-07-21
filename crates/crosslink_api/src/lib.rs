@@ -16,4 +16,4 @@ mod error;
 mod repo;
 
 pub use error::{CrosslinkError, Result};
-pub use repo::{CrosslinkRepo, IssueInfo};
+pub use repo::{CommentInfo, CrosslinkRepo, IssueInfo};

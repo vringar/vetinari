@@ -22,7 +22,7 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use common::{build_fixture, fake_implementer};
+use common::{build_fixture, fake_adversary_clean, fake_implementer};
 use orchestrator::config::{OrchestratorConfig, WorkerConfig};
 use orchestrator::events::{read_all, EventLog, ORCHESTRATOR_DIR};
 use orchestrator::pump::{BuildPump, IssueOutcome};
@@ -123,6 +123,13 @@ fn ac11a_dogfood_drives_graphed_to_merged_headless() {
             argv: vec![
                 "bash".to_owned(),
                 fake_implementer().to_string_lossy().into_owned(),
+            ],
+            // A2: the adversary review now runs between QA-pass and landing. Use
+            // the Direct clean fake-adversary (empty, DONE-attested findings) so
+            // the first review round converges → lands → merged, unchanged.
+            adversary_argv: vec![
+                "bash".to_owned(),
+                fake_adversary_clean().to_string_lossy().into_owned(),
             ],
             ..WorkerConfig::default()
         },

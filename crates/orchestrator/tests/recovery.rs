@@ -26,7 +26,7 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use common::{build_fixture, fake_implementer, Fixture};
+use common::{build_fixture, fake_adversary_clean, fake_implementer, Fixture};
 use orchestrator::artifacts::{ArtifactSet, DoneSentinel};
 use orchestrator::config::{OrchestratorConfig, WorkerConfig};
 use orchestrator::events::{EventLog, ORCHESTRATOR_DIR};
@@ -156,6 +156,13 @@ fn build_pump(
                 "bash".to_owned(),
                 fake_implementer().to_string_lossy().into_owned(),
             ],
+            // A2: QA-pass now runs an adversary review before landing. Use the
+            // Direct clean fake-adversary so a recovered issue still drives all
+            // the way to `merged` on its first clean review round.
+            adversary_argv: vec![
+                "bash".to_owned(),
+                fake_adversary_clean().to_string_lossy().into_owned(),
+            ],
             ..WorkerConfig::default()
         },
         worker_timeout_secs: 60,
@@ -263,6 +270,104 @@ fn recover_cleans_crashed_implementer_then_pump_reaches_merged() {
     assert!(
         main_has_say_hi(&fx.root),
         "main must carry say_hi after the pump re-drove the recovered issue"
+    );
+}
+
+/// Crash mid-AdversaryReview (#1): the pump forgets the Implementer workspace
+/// BEFORE entering review, so a crash during review leaves only the Adversary
+/// worker (its workspace + row, no DONE) and NO orphan Implementer workspace.
+/// `recover` must clean the Adversary workspace, drop the row, roll the issue
+/// back to `implementing`, and leave `.workspace/` empty — then the pump
+/// re-drives the recovered issue all the way to `merged`.
+#[test]
+fn recover_cleans_crashed_adversary_leaves_no_orphan_then_reaches_merged() {
+    let fx = build_fixture();
+    let manager = WorkspaceManager::load(&fx.root).expect("load repo into gate");
+    let (state, log, issue_id) = open_state(&fx);
+
+    // Seed the issue mid-review at `adversary-review`. Per the #1 invariant the
+    // Implementer workspace was already forgotten before review, so it does NOT
+    // exist here — only the Adversary's does.
+    state
+        .upsert_issue(&IssueRow::new(&issue_id, Phase::AdversaryReview))
+        .expect("seed adversary-review issue");
+
+    // Materialize the crashed Adversary's workspace + row, with NO DONE.
+    let adv_name = WorkspaceName::generate(Phase::AdversaryReview, &issue_id, 0);
+    let adv_prepared = manager
+        .prepare(&adv_name, "main")
+        .expect("prepare adversary workspace");
+    let adv_path = adv_prepared.path().to_path_buf();
+    assert!(adv_path.exists(), "adversary workspace exists pre-recovery");
+    state
+        .upsert_worker(&ActiveWorkerRow {
+            worker_uuid: "crashed-adversary-1".to_owned(),
+            issue_id: issue_id.clone(),
+            role: WorkerRole::Adversary,
+            round: 0,
+            workspace_path: adv_path.clone(),
+            pid: None,
+            spawned_at: 1,
+            last_heartbeat: 1,
+        })
+        .expect("register crashed adversary row");
+
+    // Recover: cleans the adversary workspace + row, rolls back to implementing.
+    let actions = recover(&state, &log, &manager, None).expect("recover must succeed");
+    assert_eq!(
+        actions,
+        vec![RecoveryAction::CleanedCrashedWorker {
+            issue_id: issue_id.clone()
+        }],
+        "the crashed adversary must be the only reconciliation, got {actions:?}"
+    );
+    assert!(
+        !adv_path.exists(),
+        "recover must rm -rf the adversary workspace"
+    );
+    assert!(
+        state
+            .list_active_workers()
+            .expect("list workers")
+            .is_empty(),
+        "recover must drop the crashed adversary row"
+    );
+    assert_eq!(
+        state.get_issue(&issue_id).unwrap().unwrap().phase,
+        Phase::Implementing
+    );
+
+    // NO orphan Implementer (or any) workspace lingers under `.workspace/`.
+    let ws_root = fx.root.join(WORKSPACE_DIR);
+    if ws_root.exists() {
+        let lingering: Vec<_> = std::fs::read_dir(&ws_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            lingering.is_empty(),
+            "no orphan workspace (esp. an Implementer one) may linger, found {lingering:?}"
+        );
+    }
+
+    // Idempotent second pass, then the pump re-drives to merged.
+    let again = recover(&state, &log, &manager, None).expect("second recover");
+    assert!(
+        again.is_empty(),
+        "second recover must be a no-op, got {again:?}"
+    );
+
+    let (pump, _session_guard) = build_pump(&fx, state, log, manager);
+    let outcomes = pump.run_until_idle().expect("pump must run to idle");
+    assert_eq!(
+        outcomes,
+        vec![(fx.issue_id, IssueOutcome::Merged)],
+        "the recovered issue must land in one pass, got {outcomes:?}"
+    );
+    assert!(
+        main_has_say_hi(&fx.root),
+        "main must carry say_hi after re-drive"
     );
 }
 
