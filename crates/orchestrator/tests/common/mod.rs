@@ -117,8 +117,89 @@ pub fn build_fixture() -> Fixture {
     // 1. copy the committed crate source into the temp repo.
     copy_dir_contents(&fixtures_path("hello"), &root);
 
-    // 2. jj-colocated repo: describe the baseline containing the source.
-    run("jj", &["git", "init"], &root);
+    // 2. stand up the jj + crosslink repo around it and seed the graphed issue.
+    let issue_id = seed_repo(&root);
+
+    Fixture {
+        root,
+        issue_id,
+        _tmp: tmp,
+    }
+}
+
+/// The repository root of *this* workspace (two levels above the crate
+/// manifest: `crates/orchestrator` → `crates` → root). Used to source the
+/// pinned `npins/` a target fixture reuses for its dev shell.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root must resolve")
+}
+
+/// AC-11b — materialize a **shell.nix-bearing, real-cargo** target repo the
+/// orchestrator can drive to `merged`, generalizing [`build_fixture`].
+///
+/// Identical to the `hello` fixture (same crate, same `.orchestrator/static_qa.sh`
+/// running `cargo test`, same one `phase:graphed` say_hi issue, jj-git-colocated
+/// with a `main` bookmark, crosslink in local landing mode) with three additions
+/// a **live `claude`** Implementer needs that the bare `hello` fixture lacks:
+///
+/// 1. a real `shell.nix` (copied from `tests/fixtures/ac11b-target-shell.nix`)
+///    so `nix-shell <workspace>/shell.nix` inside the worker's bwrap sandbox
+///    enters a dev shell with the pinned cargo + jujutsu (the [`WorkerCommand::Claude`]
+///    path fails early without it — see `spawn::Spawner::spawn`);
+/// 2. this repo's `npins/` beside it, so that `shell.nix`'s `import ./npins`
+///    resolves to the exact pinned toolchain (reuse, no re-pin);
+/// 3. `.orchestrator/config.toml` selecting the worker: `[worker] kind`
+///    (`"claude"` for the live run, `"direct"` for the deterministic variant).
+///
+/// The shell.nix + npins are committed into the `main` baseline (folded with the
+/// crosslink scaffolding), so a worker's later say_hi change stays code-only and
+/// lands as a clean fast-forward, exactly as in [`build_fixture`].
+pub fn build_target_fixture(config_toml: &str) -> Fixture {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+
+    // 1. the same real-cargo crate the hello dogfood uses (Cargo.toml,
+    //    Cargo.lock, src/lib.rs, .orchestrator/static_qa.sh, .gitignore).
+    copy_dir_contents(&fixtures_path("hello"), &root);
+
+    // 2. a real dev shell + the pinned sources it imports, so a live claude
+    //    worker gets cargo/jj inside its sandbox (reuse this repo's toolchain).
+    std::fs::copy(
+        fixtures_path("ac11b-target-shell.nix"),
+        root.join("shell.nix"),
+    )
+    .expect("copy target shell.nix");
+    let npins_dst = root.join("npins");
+    std::fs::create_dir_all(&npins_dst).expect("mk npins dir");
+    copy_dir_contents(&workspace_root().join("npins"), &npins_dst);
+
+    // 3. the worker-kind config the pump reads (S7). `.orchestrator/` already
+    //    exists (static_qa.sh); drop config.toml beside it.
+    std::fs::write(root.join(".orchestrator").join("config.toml"), config_toml)
+        .expect("write config.toml");
+
+    // 4. stand up the jj + crosslink repo and seed the graphed issue. The
+    //    shell.nix + npins + config.toml are in the tree, so they fold into the
+    //    `main` baseline and never appear in the Implementer's change.
+    let issue_id = seed_repo(&root);
+
+    Fixture {
+        root,
+        issue_id,
+        _tmp: tmp,
+    }
+}
+
+/// Stand up the jj-colocated + crosslink repository around an already-populated
+/// `root`, point `main` at the folded baseline, and seed one `phase:graphed`
+/// say_hi issue. Returns the issue's crosslink id. Shared by [`build_fixture`]
+/// and [`build_target_fixture`].
+fn seed_repo(root: &Path) -> i64 {
+    // jj-colocated repo: describe the baseline containing the source.
+    run("jj", &["git", "init"], root);
     // NOTE: no jj user identity is configured. jj warns on commit with an empty
     // identity but still commits, and local-mode landing (rebase + fast-forward,
     // no push) does not need one. Setting a repo-local identity is avoided on
@@ -126,20 +207,20 @@ pub fn build_fixture() -> Fixture {
     // writable ~/.config/jj/ that some sandboxes mount read-only. When
     // remote-mode landing arrives (REQ-17), give the spawn a writable JJ config
     // via env instead.
-    run("jj", &["describe", "-m", "Initial hello fixture"], &root);
-    run("jj", &["new"], &root);
+    run("jj", &["describe", "-m", "Initial fixture baseline"], root);
+    run("jj", &["new"], root);
 
-    // 3. crosslink init (requires the git commit jj just exported) in local
-    //    landing mode — AC-11a rebases onto main rather than opening a PR. This
-    //    scaffolds ~59 files into the working copy; folding them into their own
-    //    commit (below) keeps them off the Implementer's change.
-    run("crosslink", &["init", "--defaults", "--quiet"], &root);
-    run("crosslink", &["config", "set", "tracker_remote", ""], &root);
+    // crosslink init (requires the git commit jj just exported) in local landing
+    // mode — AC-11a/AC-11b rebase onto main rather than opening a PR. This
+    // scaffolds ~59 files into the working copy; folding them into their own
+    // commit (below) keeps them off the Implementer's change.
+    run("crosslink", &["init", "--defaults", "--quiet"], root);
+    run("crosslink", &["config", "set", "tracker_remote", ""], root);
 
-    // 4. the seed issue, pre-graphed so the build pump picks it up (Q1: the
-    //    pump ignores unphased issues). `--quiet` prints the assigned id (and
-    //    nothing else) on the last line of stdout; parse it rather than assuming
-    //    the first issue is always `1`.
+    // the seed issue, pre-graphed so the build pump picks it up (Q1: the pump
+    // ignores unphased issues). `--quiet` prints the assigned id (and nothing
+    // else) on the last line of stdout; parse it rather than assuming the first
+    // issue is always `1`.
     let create_out = run_capture(
         "crosslink",
         &[
@@ -154,7 +235,7 @@ pub fn build_fixture() -> Fixture {
             "phase:graphed",
             "--quiet",
         ],
-        &root,
+        root,
     );
     let issue_id: i64 = create_out
         .lines()
@@ -164,19 +245,11 @@ pub fn build_fixture() -> Fixture {
             panic!("could not parse issue id from `issue create` output: {create_out:?}")
         });
 
-    // 5. fold the source + all crosslink scaffolding into the baseline, point
-    //    `main` at it, and leave `@` a fresh empty change for the worker.
-    run(
-        "jj",
-        &["describe", "-m", "Add crosslink scaffolding"],
-        &root,
-    );
-    run("jj", &["new"], &root);
-    run("jj", &["bookmark", "create", "main", "-r", "@-"], &root);
+    // fold the source + all scaffolding into the baseline, point `main` at it,
+    // and leave `@` a fresh empty change for the worker.
+    run("jj", &["describe", "-m", "Add crosslink scaffolding"], root);
+    run("jj", &["new"], root);
+    run("jj", &["bookmark", "create", "main", "-r", "@-"], root);
 
-    Fixture {
-        root,
-        issue_id,
-        _tmp: tmp,
-    }
+    issue_id
 }

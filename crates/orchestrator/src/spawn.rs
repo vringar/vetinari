@@ -216,14 +216,33 @@ pub const HEADLESS_BOOTSTRAP: &str = "Read _orchestrator/task.md and complete th
 /// secrets — is scrubbed before the worker starts (env hygiene). A worker only
 /// needs enough to find its interpreter (`PATH`), resolve `$HOME`-relative
 /// config, and render a terminal (`TERM`); anything role-specific is passed
-/// explicitly via [`WorkerCommand::Direct`]'s `env` list.
+/// explicitly via the command kind's `env` list.
+///
+/// # `CLAUDE_CONFIG_DIR` is NOT here — it is scoped to the `Claude` command (AC-11b)
+///
+/// `CLAUDE_CONFIG_DIR` is deliberately **absent** from this list. It is an
+/// accept-trust auth passthrough that only a live `claude` worker needs, so it
+/// must never leak to a [`WorkerCommand::Direct`] (fake-worker / AC-11a)
+/// dogfood. Instead of forwarding the ambient value indiscriminately, the
+/// `Claude` arm of [`Spawner::spawn`] injects the **resolved** config dir
+/// ([`SandboxHost::forwarded_config_dir`]) as a per-command extra env — so the
+/// forwarded path is always the one actually exposed into the sandbox
+/// ([`SandboxHost::base_mounts`] overlays it), never an ambient value that might
+/// aim at an unbound dir (finding #2). A Direct worker gets only the allowlist
+/// below plus its own explicit env, and never the operator's Claude auth.
 ///
 /// The scrub is realized by launching the worker under `env -i <ALLOWED=…>`
 /// (see [`scrub_env_prefix`]): `env -i` clears the inherited environment (the
 /// equivalent of [`std::process::Command::env_clear`] for a command we hand to
 /// zellij rather than spawn directly), then re-sets only these names plus any
-/// caller-supplied `Direct` env.
+/// caller-supplied extra env.
 pub const WORKER_ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "TERM"];
+
+/// The env var naming the `claude` config/credentials directory. Read from the
+/// orchestrator's environment to derive the sandbox's config-dir exposure and
+/// re-forwarded to a live `claude` worker (never to a `Direct` worker) — see
+/// [`WORKER_ENV_ALLOWLIST`] and [`SandboxHost::resolve`].
+pub const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
 // ============================================================================
 // PaneName — a validated `<role>-<issue>-r<round>` pane name (REQ-1d)
@@ -518,6 +537,57 @@ fn role_gets_jj(role: WorkerRole) -> bool {
     matches!(role, WorkerRole::Implementer | WorkerRole::Merger)
 }
 
+/// Resolve the `claude` config-dir exposure + the `CLAUDE_CONFIG_DIR` to forward
+/// to a live worker, from the orchestrator's environment (AC-11b, findings
+/// #2/#3). Returns `(forwarded, overlays)`:
+///
+/// - `overlays` — the config dirs to expose **write-discarding** into the
+///   sandbox ([`SandboxHost::config_overlays`]). Only dirs that exist on disk.
+/// - `forwarded` — the `CLAUDE_CONFIG_DIR` value a live `claude` worker gets,
+///   or `None` to let `claude` use its own default resolution.
+///
+/// Fails closed with [`SpawnError::ClaudeConfigMissing`] when
+/// `CLAUDE_CONFIG_DIR` is set but names a directory that does not exist: rather
+/// than forward a var aimed at an unbound dir (which would 401 the worker), the
+/// spawn is refused so the misconfiguration surfaces as a typed error.
+///
+/// When `CLAUDE_CONFIG_DIR` is set (and valid) it is the primary overlaid dir
+/// AND the forwarded value, keeping the two coupled. The legacy `~/.claude` is
+/// additionally overlaid when it exists (claude reads it for plugins, etc.).
+/// When unset, the default `~/.config/claude` + `~/.claude` are overlaid if
+/// present and nothing is forwarded — exactly the prior default behavior, now
+/// write-discarding.
+fn resolve_claude_config(home: &Path) -> Result<(Option<PathBuf>, Vec<PathBuf>), SpawnError> {
+    let mut overlays: Vec<PathBuf> = Vec::new();
+    let forwarded = match std::env::var_os(CLAUDE_CONFIG_DIR_ENV) {
+        Some(v) if !v.is_empty() => {
+            let dir = PathBuf::from(v);
+            if !dir.is_dir() {
+                // Fail closed: a set-but-absent CLAUDE_CONFIG_DIR must not ship a
+                // sandbox whose forwarded var aims at an unbound dir (finding #2).
+                return Err(SpawnError::ClaudeConfigMissing { path: dir });
+            }
+            overlays.push(dir.clone());
+            Some(dir)
+        }
+        _ => {
+            // Default resolution: expose the default config dir if it exists.
+            let default = home.join(".config/claude");
+            if default.is_dir() {
+                overlays.push(default);
+            }
+            None
+        }
+    };
+    // The legacy `~/.claude` is overlaid too when present (unless it is already
+    // the forwarded dir).
+    let legacy = home.join(".claude");
+    if legacy.is_dir() && !overlays.contains(&legacy) {
+        overlays.push(legacy);
+    }
+    Ok((forwarded, overlays))
+}
+
 // ============================================================================
 // WorkerCommand — the two spawn kinds
 // ============================================================================
@@ -783,6 +853,22 @@ fn shell_join(argv: &[String]) -> String {
 /// The base config binds are resolved to only the paths that actually exist:
 /// an unconditional `--ro-bind` of an absent path makes `bwrap` fail, so
 /// `resolve` stats each candidate and keeps the survivors.
+///
+/// # The claude config dir is exposed WRITE-DISCARDING (AC-11b, finding #3)
+///
+/// The operator's `claude` config/credentials directory is **not** bound
+/// read-write. An earlier revision `--bind`-ed it RW, which let a worker
+/// rewrite the operator's credentials, hooks, and MCP config — a persistence
+/// vector into the operator's next interactive session. Instead each config dir
+/// in [`config_overlays`] is exposed via bwrap's `--overlay-src …
+/// --tmp-overlay …`: the host dir is the **read-only lower layer** (so `claude`
+/// reads the real credentials and authenticates), and all writes land in an
+/// **invisible tmpfs upper layer** that is discarded when the sandbox tears
+/// down — the host config is never mutated. Verified empirically: a live
+/// `claude -p` authenticates through the overlay, and a write into the config
+/// dir inside the namespace does not appear on the host afterward.
+///
+/// [`config_overlays`]: SandboxHost::config_overlays
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxHost {
     /// Pinned, PATH-verified `bwrap` store path (the isolation binary).
@@ -797,9 +883,18 @@ pub struct SandboxHost {
     /// Existing host paths to expose read-only (nix profile + state, git/jj
     /// config). Only paths that exist on disk — see the type doc.
     ro_binds: Vec<PathBuf>,
-    /// Existing host paths to expose read-write (claude config + auth), so the
-    /// worker can authenticate. Only paths that exist on disk.
-    rw_binds: Vec<PathBuf>,
+    /// Existing `claude` config dirs to expose **write-discarding** (host RO
+    /// lower + tmpfs upper, via `--tmp-overlay`) so the worker authenticates
+    /// without being able to mutate the operator's config. Only paths that
+    /// exist on disk. See the type doc (finding #3).
+    config_overlays: Vec<PathBuf>,
+    /// The `CLAUDE_CONFIG_DIR` value to forward to a live `claude` worker, when
+    /// the orchestrator's environment set it (finding #2). `Some` only when the
+    /// operator selected a non-default config dir; that dir is guaranteed to be
+    /// present in [`config_overlays`], so the forwarded path always aims at an
+    /// exposed dir. `None` when unset — `claude` then uses its own default
+    /// resolution and no `CLAUDE_CONFIG_DIR` is forwarded.
+    forwarded_config_dir: Option<PathBuf>,
 }
 
 impl SandboxHost {
@@ -811,7 +906,8 @@ impl SandboxHost {
         sh: impl Into<PathBuf>,
         home: impl Into<PathBuf>,
         ro_binds: Vec<PathBuf>,
-        rw_binds: Vec<PathBuf>,
+        config_overlays: Vec<PathBuf>,
+        forwarded_config_dir: Option<PathBuf>,
     ) -> Self {
         SandboxHost {
             bwrap: bwrap.into(),
@@ -819,8 +915,17 @@ impl SandboxHost {
             sh: sh.into(),
             home: home.into(),
             ro_binds,
-            rw_binds,
+            config_overlays,
+            forwarded_config_dir,
         }
+    }
+
+    /// The `CLAUDE_CONFIG_DIR` to forward to a live `claude` worker, if the
+    /// orchestrator's environment selected a non-default config dir. Always
+    /// points at a dir exposed into the sandbox (finding #2). `None` ⇒ forward
+    /// nothing and let `claude` use its default resolution.
+    pub fn forwarded_config_dir(&self) -> Option<&Path> {
+        self.forwarded_config_dir.as_deref()
     }
 
     /// Resolve the host descriptor at spawn time from `pin` (the verified
@@ -865,7 +970,11 @@ impl SandboxHost {
             home.join(".config/git"),
             home.join(".config/jj"),
         ];
-        let rw_candidates = [home.join(".config/claude"), home.join(".claude")];
+
+        // Derive the claude config-dir exposure + forward from CLAUDE_CONFIG_DIR
+        // (finding #2/#3): the forwarded var and the overlaid dir come from the
+        // same source, so a forwarded path always aims at an exposed dir.
+        let (forwarded_config_dir, config_overlays) = resolve_claude_config(&home)?;
 
         Ok(SandboxHost {
             bwrap: PathBuf::from(pin.expected()),
@@ -873,7 +982,8 @@ impl SandboxHost {
             sh,
             home,
             ro_binds: ro_candidates.into_iter().filter(|p| p.exists()).collect(),
-            rw_binds: rw_candidates.into_iter().filter(|p| p.exists()).collect(),
+            config_overlays,
+            forwarded_config_dir,
         })
     }
 
@@ -887,8 +997,12 @@ impl SandboxHost {
     /// - `--proc /proc`, `--dev /dev` — kernel filesystems.
     /// - `--tmpfs /run`, `--tmpfs /tmp` — private, empty scratch.
     /// - `--symlink <sh> /bin/sh` — programs that spawn `/bin/sh`.
-    /// - `--ro-bind`/`--bind` of the existing config dirs (nix profile+state,
-    ///   git/jj config RO; claude config+auth RW).
+    /// - `--ro-bind` of the existing RO config dirs (nix profile+state, git/jj
+    ///   config).
+    /// - `--overlay-src <dir> --tmp-overlay <dir>` of each existing claude
+    ///   config dir — the worker reads the operator's credentials (RO lower
+    ///   layer) but its writes land in an invisible tmpfs and are discarded, so
+    ///   it cannot mutate the operator's config/credentials/hooks (finding #3).
     /// - `--setenv SHELL`, `--share-net`, `--unshare-pid`, `--chdir
     ///   <workspace>`.
     ///
@@ -948,12 +1062,16 @@ impl SandboxHost {
             }
             .render_into(&mut args);
         }
-        for rw in &self.rw_binds {
-            Mount {
-                source: rw.clone(),
-                mode: MountMode::ReadWrite,
-            }
-            .render_into(&mut args);
+        // Claude config dirs: exposed write-discarding (host RO lower + tmpfs
+        // upper) so the worker authenticates but cannot mutate the operator's
+        // config (finding #3). `--overlay-src` sets the lower layer for the
+        // `--tmp-overlay` that follows it.
+        for cfg in &self.config_overlays {
+            let dir = cfg.to_string_lossy().into_owned();
+            args.push("--overlay-src".to_owned());
+            args.push(dir.clone());
+            args.push("--tmp-overlay".to_owned());
+            args.push(dir);
         }
         args.extend([
             "--setenv".to_owned(),
@@ -1312,7 +1430,19 @@ impl Spawner {
                 // Deliver the round's task as a file the worker reads (REQ-8),
                 // before the pane exists so it is present when claude starts.
                 write_task_file(workspace.path(), &spawn.task)?;
-                (spawn.to_argv(workspace.path(), &host), Vec::new())
+                // Scope the CLAUDE_CONFIG_DIR passthrough to the live `claude`
+                // worker (findings #2 + creds-scope): forward the *resolved*
+                // config dir (guaranteed exposed into the sandbox), never the
+                // ambient value, and never to a Direct worker. `None` ⇒ forward
+                // nothing and let claude use its default resolution.
+                let env = match host.forwarded_config_dir() {
+                    Some(dir) => vec![(
+                        CLAUDE_CONFIG_DIR_ENV.to_owned(),
+                        dir.to_string_lossy().into_owned(),
+                    )],
+                    None => Vec::new(),
+                };
+                (spawn.to_argv(workspace.path(), &host), env)
             }
         };
 
@@ -1517,6 +1647,7 @@ mod tests {
             "/home/op",
             vec![PathBuf::from("/home/op/.nix-profile")],
             vec![PathBuf::from("/home/op/.config/claude")],
+            Some(PathBuf::from("/home/op/.config/claude")),
         )
     }
 

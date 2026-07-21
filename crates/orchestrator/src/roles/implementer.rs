@@ -402,6 +402,7 @@ mod tests {
             "/home/op",
             vec![PathBuf::from("/home/op/.nix-profile")],
             vec![PathBuf::from("/home/op/.config/claude")],
+            Some(PathBuf::from("/home/op/.config/claude")),
         )
     }
 

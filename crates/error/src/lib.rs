@@ -189,6 +189,22 @@ pub enum SpawnError {
         path: PathBuf,
     },
 
+    /// `CLAUDE_CONFIG_DIR` is set in the orchestrator's environment but points
+    /// at a directory that does not exist, so the real (`claude`) spawn path
+    /// cannot expose it into the sandbox. Forwarding `CLAUDE_CONFIG_DIR` at an
+    /// unbound/absent dir would ship a sandbox whose `claude` 401s on missing
+    /// credentials; fail closed instead of silently shipping a broken worker
+    /// (AC-11b, finding #2).
+    #[error("CLAUDE_CONFIG_DIR points at missing directory `{path}`")]
+    #[diagnostic(
+        code(vetinari::spawn::claude_config_missing),
+        help("CLAUDE_CONFIG_DIR is set but the directory is absent. Point it at your real Claude config dir (the one holding `.credentials.json`), or unset it to use the default `~/.config/claude` / `~/.claude`.")
+    )]
+    ClaudeConfigMissing {
+        /// The `CLAUDE_CONFIG_DIR` path that was set but does not exist.
+        path: PathBuf,
+    },
+
     /// The Claude Code PostToolUse hook required for heartbeats is missing
     /// from the worker's `.claude/hooks/` view.
     #[error("required hook `{hook}` is missing from the worker's hook configuration")]
@@ -790,6 +806,7 @@ mod tests {
             "vetinari::spawn::workspace_path_conflict",
             "vetinari::spawn::bwrap_failed",
             "vetinari::spawn::shell_nix_missing",
+            "vetinari::spawn::claude_config_missing",
             "vetinari::spawn::hook_config_missing",
             "vetinari::spawn::io",
             "vetinari::spawn::workspace_prep",

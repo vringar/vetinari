@@ -68,7 +68,13 @@ in
         export VDD_BWRAP_PIN=""
       fi
       if command -v nix-shell >/dev/null 2>&1; then
-        export VDD_NIX_SHELL_PIN="$(readlink -f "$(command -v nix-shell)")"
+        # Resolve to the store bin dir but KEEP the `nix-shell` basename: with
+        # lix/nix the `nix-shell` entry is a symlink to the multiplexed `nix`
+        # binary, and a plain `readlink -f` would collapse it to `.../bin/nix`.
+        # Invoked as `nix` (argv[0]) that binary parses `nix <shell.nix> --run`
+        # as a `nix` subcommand, NOT as `nix-shell`, so the worker's dev-shell
+        # entry breaks. Preserving the basename keeps argv[0] = `nix-shell`.
+        export VDD_NIX_SHELL_PIN="$(dirname "$(readlink -f "$(command -v nix-shell)")")/nix-shell"
       else
         export VDD_NIX_SHELL_PIN=""
       fi
