@@ -225,6 +225,49 @@ impl CrosslinkRepo {
             .collect())
     }
 
+    /// The configured `tracker_remote` git remote name, or `None` when it is
+    /// unset or empty — the REQ-17 landing-mode gate.
+    ///
+    /// `tracker_remote` empty ⇒ **local mode** (rebase + fast-forward `main`);
+    /// `tracker_remote` set (e.g. `origin`) ⇒ **remote mode** (push the issue
+    /// branch and open a GitHub PR). crosslink stores it in its layered
+    /// `hook-config.json` (team) / `hook-config.local.json` (local override)
+    /// files; crosslink's own reader lives behind its private `commands` module
+    /// (not re-exported from its lib), so this reads the JSON directly, applying
+    /// the same local-over-team precedence. A missing config file is not an
+    /// error — it simply yields `None` (local mode).
+    pub fn tracker_remote(&self) -> Result<Option<String>> {
+        // Local override wins over the team config, mirroring crosslink's own
+        // layered precedence. The first file that names the key decides.
+        for file in ["hook-config.local.json", "hook-config.json"] {
+            let path = self.crosslink_dir.join(file);
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(CrosslinkError::Read {
+                        operation: format!("read crosslink config `{file}`"),
+                        source: Box::new(source),
+                    })
+                }
+            };
+            let json: serde_json::Value =
+                serde_json::from_str(&content).map_err(|source| CrosslinkError::Read {
+                    operation: format!("parse crosslink config `{file}`"),
+                    source: Box::new(source),
+                })?;
+            if let Some(value) = json.get("tracker_remote") {
+                // A JSON null (explicit "unset") falls through to the next layer;
+                // a present string decides. An empty string is "local mode".
+                if let Some(remote) = value.as_str() {
+                    let trimmed = remote.trim();
+                    return Ok((!trimmed.is_empty()).then(|| trimmed.to_owned()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Add a comment to issue `issue_id` and return the new comment's id.
     ///
     /// `kind` must be a crosslink comment kind (note, plan, decision,

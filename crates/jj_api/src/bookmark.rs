@@ -76,6 +76,33 @@ impl JjWorkspace {
         Ok(())
     }
 
+    /// Forget the local bookmark `name`, leaving any remote branch it was
+    /// pushed to untouched.
+    ///
+    /// This clears only the *local* bookmark pointer (by setting its target
+    /// absent). It does **not** push a deletion, so a branch already pushed to a
+    /// git remote — e.g. a `vdd/<id>-<slug>` PR head — stays on the remote. Used
+    /// to reap the orchestrator's per-issue landing bookmark after a successful
+    /// push + PR so the local repository does not accrue one dead bookmark per
+    /// landed issue. Idempotent: forgetting an absent bookmark is a no-op.
+    pub fn bookmark_forget(&self, name: &str) -> Result<()> {
+        let repo = self.repo_at_head()?;
+        let ref_name = RefName::new(name);
+        if repo.view().get_local_bookmark(ref_name).is_absent() {
+            return Ok(());
+        }
+        let mut tx = repo.start_transaction();
+        tx.repo_mut()
+            .set_local_bookmark_target(ref_name, RefTarget::absent());
+        pollster::block_on(tx.commit(format!("forget bookmark {name}"))).map_err(|source| {
+            JjError::Transaction {
+                operation: "bookmark_forget".to_owned(),
+                source: Box::new(source),
+            }
+        })?;
+        Ok(())
+    }
+
     /// List every local bookmark, sorted by name.
     pub fn bookmark_list(&self) -> Result<Vec<BookmarkInfo>> {
         let repo = self.repo_at_head()?;

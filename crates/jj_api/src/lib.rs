@@ -25,6 +25,7 @@ mod error;
 mod log;
 mod push;
 mod rebase;
+mod remotes;
 mod revset;
 mod status;
 mod workspace;

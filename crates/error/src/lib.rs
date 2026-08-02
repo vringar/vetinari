@@ -384,6 +384,54 @@ pub enum LandingError {
         remote_ref: String,
     },
 
+    /// `jj git push` failed outright — a transport/backend failure of the push
+    /// operation itself, NOT a remote-diverged rejection (that is
+    /// [`PushConflict`], which triggers a Merger). Remote-mode landing (REQ-17)
+    /// surfaces this so the issue parks for a human rather than silently
+    /// leaving a half-pushed branch.
+    ///
+    /// [`PushConflict`]: LandingError::PushConflict
+    #[error("push of `{bookmark}` to `{remote}` failed")]
+    #[diagnostic(
+        code(vetinari::landing::push_failed),
+        help(
+            "Not a remote-diverged rejection (handled separately) — the push itself failed. \
+             Check the remote is reachable and the branch is exportable."
+        )
+    )]
+    PushFailed {
+        /// Remote name (typically `origin`).
+        remote: String,
+        /// Bookmark/branch the push targeted (e.g. `vdd/42-add-batch-retry`).
+        bookmark: String,
+        /// Underlying `jj_api` cause.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// Opening the GitHub pull request via `octocrab` failed (remote-mode
+    /// landing, REQ-17 / REQ-1a). Distinct from [`PrCreateFailed`] — the legacy
+    /// `gh`-subprocess shape keyed on an exit code — because the orchestrator
+    /// creates PRs through the `octocrab` library (AC-24 forbids a `gh`
+    /// subprocess), so the cause is a library error, not a process exit.
+    ///
+    /// [`PrCreateFailed`]: LandingError::PrCreateFailed
+    #[error("opening a GitHub pull request for `{head}` failed")]
+    #[diagnostic(
+        code(vetinari::landing::pr_open_failed),
+        help(
+            "octocrab could not create the PR. Check GH_TOKEN/GITHUB_TOKEN, the repository \
+             slug, and that the head branch was pushed."
+        )
+    )]
+    PrOpenFailed {
+        /// The head branch the PR was opened from.
+        head: String,
+        /// Underlying `octocrab` cause.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     /// The bookmark fast-forward step itself failed after a clean rebase.
     /// Distinct because the rebase succeeded; no Merger is needed.
     #[error("bookmark `{bookmark}` could not be moved")]
@@ -919,6 +967,8 @@ mod tests {
             "vetinari::qa::timed_out",
             "vetinari::landing::rebase_conflict",
             "vetinari::landing::push_conflict",
+            "vetinari::landing::push_failed",
+            "vetinari::landing::pr_open_failed",
             "vetinari::landing::bookmark_move_failed",
             "vetinari::landing::not_fast_forward",
             "vetinari::landing::rebase_failed",

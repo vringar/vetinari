@@ -64,7 +64,9 @@ use vetinari_error::RecoveryError;
 
 use crate::artifacts::{ArtifactSet, DoneSentinel};
 use crate::events::{emit, EventLog};
-use crate::landing::{self, land_local};
+use crate::landing::{
+    self, branch_name, land_local, OctocrabPrOpener, PrOpener, RemoteLanding, MAIN_BOOKMARK,
+};
 use crate::state::{ActiveWorkerRow, EventKind, Phase, PhaseSubstate, PostedArtifact, StateDb};
 use crate::workspace::{WorkspaceManager, WorkspaceName};
 
@@ -99,11 +101,24 @@ pub enum RecoveryPlan {
     /// so the pump re-drives to QA→land.
     ReplayDoneThenRedrive,
 
-    /// A `landing` substate: delegate to [`landing::resume_from`] with the
+    /// A local `landing` substate: delegate to [`landing::resume_from`] with the
     /// persisted substate, which reads bookmark ground truth and completes or
     /// no-ops idempotently (AC-18).
     ResumeLanding {
         /// The landing substate to resume from.
+        substate: PhaseSubstate,
+    },
+
+    /// A remote-mode `landing` substate (`push_started` / `push_done_pr_pending`
+    /// / `pr_created`): delegate to [`landing::resume_remote_from`] with the
+    /// persisted substate, reconstructing the [`RemoteLanding`] inputs + PR
+    /// opener the same way the pump's `land_remote_mode` does. The push is
+    /// idempotent (re-point + re-push) and PR creation is idempotent (an existing
+    /// open PR is adopted, never re-created — F1/F2), so a crash mid remote
+    /// landing RESUMES deterministically instead of quarantining and orphaning
+    /// the pushed branch.
+    ResumeRemoteLanding {
+        /// The remote-landing substate to resume from.
         substate: PhaseSubstate,
     },
 
@@ -241,11 +256,22 @@ pub fn plan_recovery(
             Ok(RecoveryPlan::CleanCrashedWorker)
         }
 
-        // Landing substates: delegate to the resumable landing machine (AC-18).
+        // Local landing substates: delegate to the resumable landing machine
+        // (AC-18).
         (Phase::Landing, Some(sub @ PhaseSubstate::RebaseStarted))
         | (Phase::Landing, Some(sub @ PhaseSubstate::RebaseDoneBookmarkPending))
         | (Phase::Landing, Some(sub @ PhaseSubstate::BookmarkMovedComplete)) => {
             Ok(RecoveryPlan::ResumeLanding { substate: sub })
+        }
+
+        // Remote-mode landing substates (REQ-17 remote path): delegate to the
+        // resumable remote-landing machine so a crash mid push/PR-create RESUMES
+        // (re-point + re-push + adopt-or-create the PR, all idempotent) instead
+        // of quarantining and orphaning the pushed branch (F1).
+        (Phase::Landing, Some(sub @ PhaseSubstate::PushStarted))
+        | (Phase::Landing, Some(sub @ PhaseSubstate::PushDonePrPending))
+        | (Phase::Landing, Some(sub @ PhaseSubstate::PrCreated)) => {
+            Ok(RecoveryPlan::ResumeRemoteLanding { substate: sub })
         }
 
         // Converged but never entered landing: land from the top (idempotent).
@@ -257,9 +283,8 @@ pub fn plan_recovery(
 
         // Any remaining pairing is an inconsistency: a substate that cannot
         // belong to the phase it was persisted under (e.g. a `landing` substate
-        // on `implementing`, a `qa` substate on `landing`, a `push_*`/`pr_*`
-        // remote-mode substate this local-mode binary can't reconcile). Refuse
-        // to advance rather than guess.
+        // on `implementing`, or a `qa` substate on `landing`). Refuse to advance
+        // rather than guess.
         (phase, substate) => Err(RecoveryError::StateDbInconsistent {
             detail: format!(
                 "phase `{}` with substate `{}` is not a recognized recoverable combination",
@@ -306,6 +331,50 @@ pub fn recover(
     manager: &WorkspaceManager,
     crosslink: Option<&CrosslinkRepo>,
 ) -> Result<Vec<RecoveryAction>, RecoveryError> {
+    // Resolve a PR opener for any remote-landing resume (F1), built from the SAME
+    // remote the branch was pushed to (F3). A build failure (no GitHub token, a
+    // non-GitHub remote, or local mode) is non-fatal: the opener stays `None` and
+    // a remote-landing substate is then quarantined rather than resumed — never
+    // worse than the pre-F1 behavior. Tests inject a fake via
+    // [`recover_with_opener`].
+    let opener = production_remote_opener(manager, crosslink);
+    recover_with(state, log, manager, crosslink, opener.as_deref())
+}
+
+/// Like [`recover`], but with an explicit [`PrOpener`] for remote-landing
+/// resumes — the seam through which tests drive a deterministic recovery with a
+/// fake opener (production resolves an [`OctocrabPrOpener`] via [`recover`]).
+pub fn recover_with_opener(
+    state: &StateDb,
+    log: &EventLog,
+    manager: &WorkspaceManager,
+    crosslink: Option<&CrosslinkRepo>,
+    opener: &dyn PrOpener,
+) -> Result<Vec<RecoveryAction>, RecoveryError> {
+    recover_with(state, log, manager, crosslink, Some(opener))
+}
+
+/// Build the production remote PR opener if remote mode is configured and a token
+/// is available, else `None` (non-fatal — see [`recover`]).
+fn production_remote_opener(
+    manager: &WorkspaceManager,
+    crosslink: Option<&CrosslinkRepo>,
+) -> Option<Box<dyn PrOpener>> {
+    let remote = crosslink?.tracker_remote().ok().flatten()?;
+    OctocrabPrOpener::for_remote(manager, &remote)
+        .ok()
+        .map(|opener| Box::new(opener) as Box<dyn PrOpener>)
+}
+
+/// The shared recovery pass: iterate `state.db` and reconcile each non-terminal
+/// issue, using `opener` for any remote-landing resume.
+fn recover_with(
+    state: &StateDb,
+    log: &EventLog,
+    manager: &WorkspaceManager,
+    crosslink: Option<&CrosslinkRepo>,
+    opener: Option<&dyn PrOpener>,
+) -> Result<Vec<RecoveryAction>, RecoveryError> {
     // A failure to even *read* the issue / worker lists is a global fault: no
     // issue can be classified, so recovery cannot proceed at all. This is the
     // only path that returns `Err` from `recover` — per-issue faults quarantine.
@@ -319,7 +388,7 @@ pub fn recover(
         }
         // Recover this one issue in isolation. On error, quarantine it and keep
         // going — one poison issue must never brick the whole node's startup.
-        match recover_issue(state, log, manager, crosslink, &issue, &workers) {
+        match recover_issue(state, log, manager, crosslink, opener, &issue, &workers) {
             Ok(mut issue_actions) => actions.append(&mut issue_actions),
             Err(err) => {
                 let reason = err.to_string();
@@ -344,6 +413,7 @@ fn recover_issue(
     log: &EventLog,
     manager: &WorkspaceManager,
     crosslink: Option<&CrosslinkRepo>,
+    opener: Option<&dyn PrOpener>,
     issue: &crate::state::IssueRow,
     workers: &[ActiveWorkerRow],
 ) -> Result<Vec<RecoveryAction>, RecoveryError> {
@@ -413,6 +483,15 @@ fn recover_issue(
                 landing::resume_from(state, log, manager, &issue.issue_id, &change, substate)
                     .map_err(landing_err)?
             };
+            actions.push(RecoveryAction::ResumedLanding {
+                issue_id: issue.issue_id.clone(),
+                outcome,
+            });
+        }
+
+        RecoveryPlan::ResumeRemoteLanding { substate } => {
+            let outcome =
+                resume_remote_landing(state, log, manager, crosslink, opener, issue, substate)?;
             actions.push(RecoveryAction::ResumedLanding {
                 issue_id: issue.issue_id.clone(),
                 outcome,
@@ -666,6 +745,97 @@ fn landing_change_revset(
     })
 }
 
+/// Resume a remote-mode landing found mid-flight on restart (F1).
+///
+/// Reconstructs the [`RemoteLanding`] inputs the same way the pump's
+/// `land_remote_mode` does — the per-issue branch (`vdd/<id>-<slug>`) from the
+/// crosslink issue title, the PR base/title/body — and delegates to
+/// [`landing::resume_remote_from`] with the persisted substate and the injected
+/// PR `opener`. The push is idempotent (re-point + re-push) and PR creation is
+/// idempotent (an existing open PR is adopted, never re-created), so this
+/// completes deterministically without a duplicate PR or a double-push.
+///
+/// The reviewed change's revset is the pushed **branch bookmark itself**: by the
+/// time landing runs, the pump has already forgotten the Implementer workspace
+/// (it does so before adversary review), so there is no `implementing` workspace
+/// to scan — but the branch the machine pushed points at exactly the reviewed
+/// change, and is a stable revset for it. A `push_started` resume re-points the
+/// branch at itself (a jj no-op) and re-pushes; the later substates never touch
+/// it.
+///
+/// Missing prerequisites (no PR opener — remote mode without a token; no
+/// crosslink handle; a non-numeric issue id; no configured `tracker_remote`) are
+/// [`RecoveryError::StateDbInconsistent`], which the caller quarantines — a safe
+/// fallback that is never worse than the pre-F1 unconditional quarantine.
+fn resume_remote_landing(
+    state: &StateDb,
+    log: &EventLog,
+    manager: &WorkspaceManager,
+    crosslink: Option<&CrosslinkRepo>,
+    opener: Option<&dyn PrOpener>,
+    issue: &crate::state::IssueRow,
+    substate: PhaseSubstate,
+) -> Result<landing::LandingOutcome, RecoveryError> {
+    let issue_id = &issue.issue_id;
+    let opener = opener.ok_or_else(|| RecoveryError::StateDbInconsistent {
+        detail: format!(
+            "issue `{issue_id}` is mid remote-landing (`{}`) but no GitHub PR opener is \
+             configured (remote mode needs a GH_TOKEN/GITHUB_TOKEN and a GitHub remote) — \
+             cannot resume",
+            substate.as_str()
+        ),
+    })?;
+    let crosslink = crosslink.ok_or_else(|| RecoveryError::StateDbInconsistent {
+        detail: format!(
+            "issue `{issue_id}` is mid remote-landing but recovery has no crosslink handle to \
+             reconstruct its branch and PR inputs"
+        ),
+    })?;
+    let remote = crosslink
+        .tracker_remote()
+        .map_err(|source| RecoveryError::StateDbInconsistent {
+            detail: format!("could not read `tracker_remote` recovering `{issue_id}`: {source}"),
+        })?
+        .ok_or_else(|| RecoveryError::StateDbInconsistent {
+            detail: format!(
+                "issue `{issue_id}` is mid remote-landing but `tracker_remote` is now unset — \
+                 cannot resume the push target"
+            ),
+        })?;
+    let numeric_id = issue_id
+        .parse::<i64>()
+        .map_err(|_| RecoveryError::StateDbInconsistent {
+            detail: format!(
+                "issue `{issue_id}` is mid remote-landing but its id is not numeric — cannot read \
+                 the crosslink issue to reconstruct the PR inputs"
+            ),
+        })?;
+    let info =
+        crosslink
+            .read_issue(numeric_id)
+            .map_err(|source| RecoveryError::StateDbInconsistent {
+                detail: format!("could not read crosslink issue `{issue_id}` to resume its remote landing: {source}"),
+            })?;
+    let branch = branch_name(issue_id, &info.title);
+    let title = info.title.clone();
+    let body = info
+        .description
+        .clone()
+        .unwrap_or_else(|| info.title.clone());
+    // The pushed branch bookmark is the reviewed change's revset (see the doc
+    // comment): the implement workspace is already gone by landing time.
+    let params = RemoteLanding {
+        issue_id,
+        change_revset: &branch,
+        remote: &remote,
+        branch: &branch,
+        base: MAIN_BOOKMARK,
+        title: &title,
+        body: &body,
+    };
+    landing::resume_remote_from(state, log, manager, opener, &params, substate).map_err(landing_err)
+}
+
 /// Whether a parsed workspace name belongs to `issue_id`. The name's issue
 /// segment is the *sanitized* issue id (see [`WorkspaceName`]); rather than
 /// re-expose the sanitizer, we re-derive the expected name from the typed
@@ -856,9 +1026,29 @@ mod tests {
             matches!(err, RecoveryError::StateDbInconsistent { .. }),
             "a landing substate on implementing must be a state.db inconsistency, got {err:?}"
         );
-        // A remote-mode push substate this local binary can't reconcile.
-        let err = plan_recovery(Phase::Landing, Some("push_started"), false, false).unwrap_err();
-        assert!(matches!(err, RecoveryError::StateDbInconsistent { .. }));
+        // A qa substate on a landing phase is not a recoverable combination.
+        let err = plan_recovery(Phase::Landing, Some("qa_running"), false, false).unwrap_err();
+        assert!(
+            matches!(err, RecoveryError::StateDbInconsistent { .. }),
+            "a qa substate on landing must be a state.db inconsistency, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_landing_substates_delegate_to_remote_resume() {
+        // The remote-mode landing substates now RESUME (F1) rather than
+        // quarantining — each routes to the resumable remote-landing machine.
+        for (token, sub) in [
+            ("push_started", PhaseSubstate::PushStarted),
+            ("push_done_pr_pending", PhaseSubstate::PushDonePrPending),
+            ("pr_created", PhaseSubstate::PrCreated),
+        ] {
+            assert_eq!(
+                plan_recovery(Phase::Landing, Some(token), false, false).unwrap(),
+                RecoveryPlan::ResumeRemoteLanding { substate: sub },
+                "remote landing substate `{token}` must resume, not quarantine",
+            );
+        }
     }
 
     #[test]

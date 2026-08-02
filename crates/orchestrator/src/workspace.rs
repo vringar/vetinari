@@ -539,6 +539,102 @@ impl WorkspaceManager {
             })
     }
 
+    /// Point the local bookmark `name` at the commit `revset` resolves to,
+    /// **creating** it if absent and **moving** it if present, under the `.jj/`
+    /// gate (REQ-17 remote path, REQ-5a). Idempotent: pointing a bookmark at the
+    /// commit it already names is a jj no-op, so this is safe to re-run on
+    /// resume.
+    ///
+    /// This is the remote-mode analogue of the local path's fast-forward move,
+    /// but without the fast-forward guard: the issue branch (`vdd/<id>-<slug>`)
+    /// is the orchestrator's own per-issue branch, not shared trunk, so pointing
+    /// it at the reviewed change is always correct — there is no `main` to
+    /// protect from a rewind here. The check-then-create/move runs under a single
+    /// gate hold so a concurrent `.jj/` mutator cannot race the decision.
+    pub fn point_bookmark(&self, name: &str, revset: &str) -> Result<(), LandingError> {
+        let gate = self.gate();
+        let exists = gate
+            .handle
+            .bookmark_list()
+            .map_err(|source| LandingError::BookmarkMoveFailed {
+                bookmark: name.to_owned(),
+                source: Box::new(source),
+            })?
+            .into_iter()
+            .any(|b| b.name == name);
+        let result = if exists {
+            gate.handle.bookmark_move(name, revset)
+        } else {
+            gate.handle.bookmark_create(name, revset)
+        };
+        result.map_err(|source| LandingError::BookmarkMoveFailed {
+            bookmark: name.to_owned(),
+            source: Box::new(source),
+        })
+    }
+
+    /// Forget the local bookmark `name` — clear its local pointer while leaving
+    /// any remote branch it was pushed to untouched — under the `.jj/` gate
+    /// (REQ-5a). Idempotent (forgetting an absent bookmark is a no-op).
+    ///
+    /// Reaps the orchestrator's per-issue landing bookmark (`vdd/<id>-<slug>`)
+    /// after a successful remote-mode push + PR: the branch already lives on the
+    /// git remote (it is the PR head), so the local pointer is dead weight and is
+    /// dropped so the repository does not accrue one stale bookmark per landed
+    /// issue.
+    pub fn forget_bookmark(&self, name: &str) -> Result<(), LandingError> {
+        self.gate().handle.bookmark_forget(name).map_err(|source| {
+            LandingError::BookmarkMoveFailed {
+                bookmark: name.to_owned(),
+                source: Box::new(source),
+            }
+        })
+    }
+
+    /// The fetch URL configured for the git remote `remote`, or `None` when the
+    /// remote is not configured, read under the `.jj/` gate (REQ-5a).
+    ///
+    /// Remote-mode landing derives the GitHub `owner/repo` the PR is opened
+    /// against from this URL, so the push target and the PR target are the same
+    /// remote by construction (rather than diverging via an independent
+    /// `GITHUB_REPOSITORY` env var). A backend read failure surfaces as
+    /// [`LandingError::BookmarkMoveFailed`] (reusing its context shape — there is
+    /// no dedicated remote-read variant, and the caller falls back).
+    pub fn remote_url(&self, remote: &str) -> Result<Option<String>, LandingError> {
+        self.gate()
+            .handle
+            .remote_url(remote)
+            .map_err(|source| LandingError::BookmarkMoveFailed {
+                bookmark: format!("remote `{remote}` url"),
+                source: Box::new(source),
+            })
+    }
+
+    /// Push the local bookmark `bookmark` to the git remote `remote` (REQ-17
+    /// remote path), under the `.jj/` gate (REQ-5a). Delegates to
+    /// [`vetinari_jj_api::JjWorkspace::git_push`] — jj-lib runs the `git`
+    /// subprocess itself, so no orchestrator-side `git`/`jj` shell-out (AC-24).
+    ///
+    /// A remote-diverged rejection maps to [`LandingError::PushConflict`] (the
+    /// Merger's cue to fetch + rebase, REQ-19); any other push failure maps to
+    /// [`LandingError::PushFailed`].
+    pub fn git_push(&self, remote: &str, bookmark: &str) -> Result<(), LandingError> {
+        self.gate()
+            .handle
+            .git_push(remote, bookmark)
+            .map_err(|source| match source {
+                JjError::PushRejected { .. } => LandingError::PushConflict {
+                    remote: remote.to_owned(),
+                    remote_ref: bookmark.to_owned(),
+                },
+                other => LandingError::PushFailed {
+                    remote: remote.to_owned(),
+                    bookmark: bookmark.to_owned(),
+                    source: Box::new(other),
+                },
+            })
+    }
+
     /// Take the serializing lock, yielding a [`JjGate`] through which — and only
     /// through which — `.jj/`-mutating operations can run.
     ///

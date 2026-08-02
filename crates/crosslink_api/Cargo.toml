@@ -14,6 +14,11 @@ repository.workspace = true
 [dependencies]
 miette = { workspace = true }
 thiserror = { workspace = true }
+# Parse crosslink's `.crosslink/hook-config*.json` config files to read the
+# `tracker_remote` key (REQ-17 mode gate). crosslink's own layered-config reader
+# lives under its private `commands` module (not re-exported from its lib), so
+# the adapter reads the JSON directly.
+serde_json = { workspace = true }
 # The crosslink library crate. crosslink is not published to crates.io, so it
 # is a path dependency through the `.crosslink-src` tree that `just bootstrap`
 # copies from the npins-pinned crosslink source (see the workspace justfile and

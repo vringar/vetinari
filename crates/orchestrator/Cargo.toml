@@ -40,6 +40,17 @@ sha2 = "0.10"
 # 0.8 requirement unifies with the `toml 0.8.x` already in the dependency graph
 # (transitively via the pinned crosslink tree) so it resolves to one copy.
 toml = "0.8"
+# GitHub PR creation for remote-mode landing (REQ-17, REQ-1a): the AC-24 lint
+# forbids a `gh` subprocess, so PRs are opened through octocrab's typed client.
+# Default features pull in the `rustls` TLS stack, unifying with the `rustls` /
+# `hyper-rustls` already in the graph (transitively via crosslink's reqwest) so
+# no second (native-tls/openssl) TLS backend is linked.
+octocrab = "0.54"
+# octocrab's client is async over hyper; the synchronous landing machine drives
+# a single PR-create future to completion on a current-thread runtime (no async
+# runtime is threaded through the rest of the orchestrator). Only the runtime +
+# IO/time drivers are needed.
+tokio = { version = "1", features = ["rt", "net", "time"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

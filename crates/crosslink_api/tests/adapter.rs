@@ -157,6 +157,50 @@ fn open_blockers_reports_only_open_blocking_issues() {
 }
 
 #[test]
+fn tracker_remote_reads_the_landing_mode_gate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fixture_repo(tmp.path());
+    let crosslink_dir = tmp.path().join(".crosslink");
+    let repo = CrosslinkRepo::open(tmp.path()).expect("open crosslink repo");
+
+    // No config file at all ⇒ local mode (None).
+    assert_eq!(repo.tracker_remote().expect("no config"), None);
+
+    // An empty string in the team config is still local mode.
+    std::fs::write(
+        crosslink_dir.join("hook-config.json"),
+        r#"{"tracker_remote": ""}"#,
+    )
+    .expect("write team config");
+    assert_eq!(repo.tracker_remote().expect("empty team"), None);
+
+    // A set value in the team config ⇒ remote mode.
+    std::fs::write(
+        crosslink_dir.join("hook-config.json"),
+        r#"{"tracker_remote": "origin"}"#,
+    )
+    .expect("write team config");
+    assert_eq!(
+        repo.tracker_remote().expect("team set").as_deref(),
+        Some("origin")
+    );
+
+    // The local override wins over the team config.
+    std::fs::write(
+        crosslink_dir.join("hook-config.local.json"),
+        r#"{"tracker_remote": "upstream"}"#,
+    )
+    .expect("write local config");
+    assert_eq!(
+        repo.tracker_remote()
+            .expect("local overrides team")
+            .as_deref(),
+        Some("upstream"),
+        "local config must take precedence over team config"
+    );
+}
+
+#[test]
 fn signing_without_an_identity_reports_identity_unavailable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fixture_repo(tmp.path());

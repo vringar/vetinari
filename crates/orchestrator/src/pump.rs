@@ -135,7 +135,10 @@ use crate::artifacts::{
 };
 use crate::config::{OrchestratorConfig, WorkerKind};
 use crate::events::{emit, EventLog};
-use crate::landing::{land_local, LandingOutcome};
+use crate::landing::{
+    branch_name, land_local, land_remote, LandingOutcome, OctocrabPrOpener, RemoteLanding,
+    MAIN_BOOKMARK,
+};
 use crate::qa::{QaGate, QaOutcome};
 use crate::roles::adversary::{render_inputs, RenderParams, RenderedAdversaryInputs};
 use crate::spawn::{SpawnOutcome, Spawner, WorkerCommand};
@@ -261,6 +264,9 @@ pub enum PumpError {
 pub enum IssueOutcome {
     /// The issue reached `phase:merged` — landed locally.
     Merged,
+    /// The issue reached `phase:pr-open` — landed remotely (branch pushed, PR
+    /// opened, REQ-17 remote path).
+    PrOpen,
     /// The issue is parked at `phase:awaiting-human-merge` (a landing conflict;
     /// the Merger role is deferred).
     AwaitingHumanMerge,
@@ -1055,13 +1061,45 @@ impl BuildPump {
     /// review — #1). The committed change is durable in `.jj/`, so landing needs
     /// no workspace DIR; there is nothing left to clean up here.
     fn land(&self, issue_id: i64, key: &str, change: &str) -> Result<IssueOutcome, PumpError> {
-        // land_local drives the whole rebase → fast-forward substate machine and
-        // owns the Landing/Merged/AwaitingHumanMerge transitions + events.
-        let outcome = land_local(&self.state, &self.log, &self.manager, key, change)?;
+        // Mode gate (REQ-17): crosslink's `tracker_remote` selects local FF vs.
+        // remote push+PR. Read at land time (never a compile-time cfg, REQ-2a);
+        // empty/unset ⇒ local mode (the default, unchanged).
+        let outcome = match self.crosslink.tracker_remote()? {
+            Some(remote) => {
+                // Build the PR opener from the SAME remote the branch is pushed to
+                // (F3: push target == PR target). A missing GitHub token is an
+                // ISSUE-level park, NOT a tick abort (F4): parking this one issue
+                // at orchestrator-error lets every other issue in the tick keep
+                // progressing, instead of a persistently-missing token bricking
+                // the whole pump.
+                let opener = match OctocrabPrOpener::for_remote(&self.manager, &remote) {
+                    Ok(opener) => opener,
+                    Err(vetinari_error::LandingError::GhAuthMissing) => {
+                        return self.poison(
+                            key,
+                            None,
+                            &format!(
+                                "remote-mode landing for #{issue_id} needs a GitHub token \
+                                 (GH_TOKEN or GITHUB_TOKEN) — parking this issue; other issues \
+                                 continue"
+                            ),
+                        );
+                    }
+                    Err(other) => return Err(other.into()),
+                };
+                self.land_remote_mode(issue_id, key, change, &remote, &opener)?
+            }
+            None => land_local(&self.state, &self.log, &self.manager, key, change)?,
+        };
         match outcome {
             LandingOutcome::Merged => {
                 self.set_phase_label(issue_id, Phase::Merged)?;
                 Ok(IssueOutcome::Merged)
+            }
+            LandingOutcome::PrOpen { .. } => {
+                // Landed remotely; mirror the terminal label for the trail.
+                self.set_phase_label(issue_id, Phase::PrOpen)?;
+                Ok(IssueOutcome::PrOpen)
             }
             LandingOutcome::AwaitingHumanMerge => {
                 // Parked for a human; mirror the label so the crosslink trail
@@ -1070,6 +1108,59 @@ impl BuildPump {
                 Ok(IssueOutcome::AwaitingHumanMerge)
             }
         }
+    }
+
+    /// Remote-mode landing (REQ-17 remote path): derive the issue branch, then
+    /// drive [`land_remote`] — push the branch and open a GitHub PR through the
+    /// [`OctocrabPrOpener`] seam. The title is the reviewed change's description
+    /// first line (falling back to the issue title); the body is the issue's
+    /// description (the worker's `_orchestrator/result.md` is not retained past
+    /// review, so the durable issue text is used).
+    fn land_remote_mode(
+        &self,
+        issue_id: i64,
+        key: &str,
+        change: &str,
+        remote: &str,
+        opener: &OctocrabPrOpener,
+    ) -> Result<LandingOutcome, PumpError> {
+        let info = self.crosslink.read_issue(issue_id)?;
+        let branch = branch_name(key, &info.title);
+        // Title: the change description's first line, else the issue title.
+        let described = self
+            .manager
+            .resolve_change(change)
+            .ok()
+            .map(|c| c.description);
+        let title = described
+            .as_deref()
+            .and_then(|d| d.lines().next())
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .unwrap_or(info.title.as_str())
+            .to_owned();
+        let body = info
+            .description
+            .clone()
+            .unwrap_or_else(|| info.title.clone());
+        // The `opener` was built by `land` from the same `remote` (F3) and its
+        // GitHub token; a missing-token park already happened there (F4).
+        let outcome = land_remote(
+            &self.state,
+            &self.log,
+            &self.manager,
+            opener,
+            &RemoteLanding {
+                issue_id: key,
+                change_revset: change,
+                remote,
+                branch: &branch,
+                base: MAIN_BOOKMARK,
+                title: &title,
+                body: &body,
+            },
+        )?;
+        Ok(outcome)
     }
 
     /// QA failed → post a `--kind blocker` and either re-queue at
