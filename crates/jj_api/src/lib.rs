@@ -13,7 +13,8 @@
 //!
 //! Each operation the orchestrator performs is a method on [`JjWorkspace`]:
 //! workspace load, `log`, `status`, `diff`, `describe`, bookmark create / move
-//! / list, `rebase`, workspace add / forget / list, and `git_push`.
+//! / list, `rebase`, working-copy `snapshot`, workspace add / forget / list, and
+//! `git_push`.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -27,6 +28,7 @@ mod push;
 mod rebase;
 mod remotes;
 mod revset;
+mod snapshot;
 mod status;
 mod workspace;
 mod workspaces;

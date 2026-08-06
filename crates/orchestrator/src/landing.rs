@@ -9,8 +9,13 @@
 //! After a worker's change passes QA, the orchestrator lands it *without* human
 //! intervention: it rebases the issue's change onto the current `main`, then
 //! moves the `main` bookmark to the landed change → `phase:merged`. A rebase
-//! that conflicts is **not** an error — it parks the issue at
-//! `phase:awaiting-human-merge` for a human (the Merger role, #L4, is deferred).
+//! that conflicts is **not** an error — the issue moves to the `Landing`
+//! substate `merging` and [`land_local`] returns [`LandingOutcome::RebaseConflict`]
+//! so the build pump can dispatch a **Merger** worker (REQ-19, L4). Once the
+//! Merger resolves the conflict and post-merge QA passes, the pump calls
+//! [`retry_land_after_merge`] to fast-forward `main` to the resolved commit —
+//! only a Merger failure (missing DONE, unresolved conflict, post-merge QA fail,
+//! or a still-not-fast-forward retry) falls back to `phase:awaiting-human-merge`.
 //!
 //! # The substate machine (REQ-2a, AC-18 resumable)
 //!
@@ -91,8 +96,9 @@ pub const MAIN_BOOKMARK: &str = "main";
 /// terminal phase, and a new outcome must force every match site to be updated
 /// rather than silently fall through a wildcard.
 ///
-/// Not `Copy`: [`PrOpen`](LandingOutcome::PrOpen) carries the PR url, so the
-/// outcome is `Clone` but moved by value like any other owned enum.
+/// Not `Copy`: [`PrOpen`](LandingOutcome::PrOpen) carries the PR url and
+/// [`RebaseConflict`](LandingOutcome::RebaseConflict) the conflicted commit id,
+/// so the outcome is `Clone` but moved by value like any other owned enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LandingOutcome {
     /// The change rebased cleanly and `main` was fast-forwarded to it — the
@@ -104,9 +110,23 @@ pub enum LandingOutcome {
         /// The URL of the opened pull request, recorded on the transition.
         url: String,
     },
-    /// The rebase produced conflicts; the issue is parked at
-    /// `phase:awaiting-human-merge` for a human (the Merger role is deferred).
-    /// `main` was **not** moved.
+    /// The rebase produced conflicts. The issue was moved to the `Landing`
+    /// substate `merging` (persisted, crash-safe) and a Merger worker must
+    /// resolve the conflict before the landing can be retried (REQ-19, L4).
+    /// `main` was **not** moved. The caller (the build pump, which owns the
+    /// worker `Spawner` and the QA gate) drives the Merger and then calls
+    /// [`retry_land_after_merge`]; only if the Merger fails does it fall back to
+    /// `phase:awaiting-human-merge`. Carries the conflicted rebase-result commit
+    /// the Merger workspace is checked out on.
+    RebaseConflict {
+        /// The commit id of the conflicted rebase result — the commit whose tree
+        /// carries the markers. A Merger workspace is prepared on top of it.
+        rebased_commit: String,
+    },
+    /// Landing could not proceed and the issue is parked at
+    /// `phase:awaiting-human-merge` for a human (REQ-15a). Reached when a
+    /// bookmark move would not be a fast-forward, or when a Merger attempt was
+    /// exhausted. `main` was **not** moved.
     AwaitingHumanMerge,
 }
 
@@ -116,9 +136,11 @@ pub enum LandingOutcome {
 /// AC-18).
 ///
 /// See the module docs for the state diagram. Returns [`LandingOutcome::Merged`]
-/// on a clean land, or [`LandingOutcome::AwaitingHumanMerge`] if the rebase
+/// on a clean land, or [`LandingOutcome::RebaseConflict`] if the rebase
 /// conflicted (an expected, non-error outcome — a conflict is a *successful* jj
-/// rebase whose result tree carries markers). Genuine jj-op failures surface as
+/// rebase whose result tree carries markers — the pump then dispatches a
+/// Merger). A non-fast-forward bookmark move parks at
+/// [`LandingOutcome::AwaitingHumanMerge`]. Genuine jj-op failures surface as
 /// [`LandingError`].
 pub fn land_local(
     state: &StateDb,
@@ -135,6 +157,40 @@ pub fn land_local(
         change_revset,
         PhaseSubstate::RebaseStarted,
     )
+}
+
+/// Retry the fast-forward landing after a Merger resolved a rebase conflict
+/// (REQ-19, L4) — the "retry the landing operation ONCE" step.
+///
+/// Called by the build pump once its Merger worker has produced a conflict-free
+/// `merged_commit` (a descendant of `main`) and post-merge QA has passed. This
+/// drives the same FF-guarded bookmark move as a clean land: it moves `main` to
+/// `merged_commit` iff that is a true fast-forward, then advances to
+/// `phase:merged`. A non-fast-forward is refused and parks the issue for a human
+/// ([`LandingOutcome::AwaitingHumanMerge`]) — `main` can only ever advance, never
+/// rewind, even on the merge-retry path. The move is idempotent (a no-op when
+/// `main` already points at `merged_commit`), so re-running it is safe.
+///
+/// The Merger's resolution is threaded here by **commit id** (what the pump read
+/// back from the resolved workspace), not a re-resolved revset a race could have
+/// advanced — the same discipline the fresh-land path uses.
+pub fn retry_land_after_merge(
+    state: &StateDb,
+    log: &EventLog,
+    manager: &WorkspaceManager,
+    issue_id: &str,
+    merged_commit: &str,
+) -> Result<LandingOutcome, LandingError> {
+    // The rebase step is already done (the Merger resolved the conflicted rebase
+    // result), so re-enter the machine at the bookmark move with the resolved
+    // commit as the FF target.
+    set_phase(
+        state,
+        issue_id,
+        Phase::Landing,
+        Some(PhaseSubstate::RebaseDoneBookmarkPending),
+    )?;
+    move_step(state, log, manager, issue_id, merged_commit)
 }
 
 /// Drive the landing substate machine starting at `from` — the resumable entry
@@ -172,6 +228,24 @@ pub fn resume_from(
             // Resume after a crash between the bookmark move and the terminal
             // transition. The move already happened; just finish.
             merged_step(state, log, issue_id)
+        }
+        PhaseSubstate::Merging => {
+            // A crash while a Merger was resolving the conflict (REQ-19). We
+            // cannot safely re-drive an in-flight worker's partial resolution
+            // from here — `resume_from` has no `Spawner`/QA gate — and re-running
+            // the rebase would just re-conflict. Park deterministically for a
+            // human (REQ-15a): `main` is untouched, so this fails *safe*. A human
+            // applying `human-resolved:retry` re-attempts the landing.
+            set_phase(state, issue_id, Phase::AwaitingHumanMerge, None)?;
+            emit_transition(
+                log,
+                state,
+                issue_id,
+                Phase::Landing,
+                Phase::AwaitingHumanMerge,
+                "crash during Merger resolution — parked for human merge (REQ-15a)",
+            )?;
+            Ok(LandingOutcome::AwaitingHumanMerge)
         }
         other => Err(LandingError::SubstateInconsistent {
             substate: other.as_str().to_owned(),
@@ -217,19 +291,29 @@ fn rebase_step(
     };
     if target.has_conflict {
         // A conflict is a *successful* jj rebase whose result tree carries
-        // markers — not a `LandingError`. The Merger role (#L4) is deferred, so
-        // the issue parks for a human at `phase:awaiting-human-merge` and `main`
-        // is left untouched.
-        set_phase(state, issue_id, Phase::AwaitingHumanMerge, None)?;
+        // markers — not a `LandingError`. Rather than park immediately, move to
+        // the `merging` substate (persisted, crash-safe) and surface the
+        // conflicted rebase result so the pump can dispatch a Merger worker
+        // (REQ-19, L4). `main` is left untouched; the pump retries the landing
+        // via [`retry_land_after_merge`] once the Merger resolves, and only
+        // falls back to `phase:awaiting-human-merge` if the Merger fails.
+        set_phase(
+            state,
+            issue_id,
+            Phase::Landing,
+            Some(PhaseSubstate::Merging),
+        )?;
         emit_transition(
             log,
             state,
             issue_id,
             Phase::Landing,
-            Phase::AwaitingHumanMerge,
-            "rebase conflict — parked for human merge (Merger deferred)",
+            Phase::Landing,
+            "rebase conflict — dispatching Merger to resolve (REQ-19)",
         )?;
-        return Ok(LandingOutcome::AwaitingHumanMerge);
+        return Ok(LandingOutcome::RebaseConflict {
+            rebased_commit: target.commit_id,
+        });
     }
     set_phase(
         state,

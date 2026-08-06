@@ -132,15 +132,17 @@ fn land_local_fast_forwards_main_and_reaches_merged() {
     assert_eq!(issue.phase_substate, None, "merged clears the substate");
 }
 
-/// Conflict path: a change whose rebase onto `main` produces conflicts parks the
-/// issue at `phase:awaiting-human-merge` (the Merger role is deferred) and
-/// leaves `main` untouched.
+/// Conflict path: a change whose rebase onto `main` produces conflicts surfaces
+/// [`LandingOutcome::RebaseConflict`] (so the pump can dispatch a Merger, REQ-19),
+/// moves the issue to the `Landing/merging` substate, and leaves `main`
+/// untouched. (The pump-level Merger dispatch + retry is covered in
+/// `pump_merger.rs`; `land_local` on its own only detects the conflict.)
 ///
 /// A real conflict is staged by having `main` advance the *same* file the
 /// worker's change edits, to a different content, so rebasing the worker change
 /// onto the new `main` cannot apply cleanly.
 #[test]
-fn land_local_conflict_parks_for_human_and_leaves_main() {
+fn land_local_conflict_surfaces_rebase_conflict_and_leaves_main() {
     let fx = build_fixture();
     let manager = WorkspaceManager::load(&fx.root).expect("load repo into gate");
     let (state, log, issue_id) = seed(&fx);
@@ -173,10 +175,9 @@ fn land_local_conflict_parks_for_human_and_leaves_main() {
 
     let outcome = land_local(&state, &log, &manager, &issue_id, &change)
         .expect("a rebase conflict is not an error");
-    assert_eq!(
-        outcome,
-        LandingOutcome::AwaitingHumanMerge,
-        "a conflicting rebase must park for a human, not merge"
+    assert!(
+        matches!(outcome, LandingOutcome::RebaseConflict { .. }),
+        "a conflicting rebase must surface RebaseConflict for the Merger, got {outcome:?}"
     );
 
     // main was NOT moved — it still points where it did before landing.
@@ -194,9 +195,11 @@ fn land_local_conflict_parks_for_human_and_leaves_main() {
         "main stayed at the conflicting edit"
     );
 
+    // The issue moved to the crash-safe `Landing/merging` substate (the pump
+    // takes over from here to dispatch the Merger).
     let issue = state.get_issue(&issue_id).unwrap().unwrap();
-    assert_eq!(issue.phase, Phase::AwaitingHumanMerge);
-    assert_eq!(issue.phase_substate, None);
+    assert_eq!(issue.phase, Phase::Landing);
+    assert_eq!(issue.phase_substate.as_deref(), Some("merging"));
 }
 
 /// AC-18 resume: simulate a crash between the rebase and the bookmark move —

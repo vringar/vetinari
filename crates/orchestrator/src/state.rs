@@ -157,6 +157,11 @@ str_enum! {
         RebaseStarted => "rebase_started",
         /// `landing`: rebase done; the bookmark move is pending.
         RebaseDoneBookmarkPending => "rebase_done_bookmark_pending",
+        /// `landing`: the rebase conflicted and a Merger worker is resolving it
+        /// (REQ-19). Persisted before the Merger spawn so a crash mid-merge is
+        /// recoverable — the resume path parks for a human rather than blindly
+        /// re-driving an in-flight resolution.
+        Merging => "merging",
         /// `landing`: the bookmark has been moved.
         BookmarkMovedComplete => "bookmark_moved_complete",
         /// `landing`: `jj git push` has started.

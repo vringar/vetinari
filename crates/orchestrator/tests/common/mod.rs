@@ -154,6 +154,20 @@ pub fn fake_adversary_flag() -> PathBuf {
     fixtures_path("fake-adversary-flag.sh")
 }
 
+/// Path to the committed fake-merger worker script (REQ-19, L4): resolves the
+/// fixture rebase conflict in `src/lib.rs`, snapshots the resolution, and writes
+/// `merge_result.md` + DONE.
+pub fn fake_merger() -> PathBuf {
+    fixtures_path("fake-merger.sh")
+}
+
+/// Path to the fake merger that FAILS to resolve: it writes a valid DONE but
+/// leaves the conflict markers in place, so the orchestrator's post-merge
+/// conflict check parks the issue at `phase:awaiting-human-merge` (AC-14).
+pub fn fake_merger_unresolved() -> PathBuf {
+    fixtures_path("fake-merger-unresolved.sh")
+}
+
 /// Path to a CLEAN fake adversary that also records the `.workspace/` listing it
 /// observed while running, into `.orchestrator/adversary-workspaces-seen.txt` —
 /// proving the Implementer workspace was forgotten before review (#1).

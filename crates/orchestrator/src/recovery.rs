@@ -103,7 +103,11 @@ pub enum RecoveryPlan {
 
     /// A local `landing` substate: delegate to [`landing::resume_from`] with the
     /// persisted substate, which reads bookmark ground truth and completes or
-    /// no-ops idempotently (AC-18).
+    /// no-ops idempotently (AC-18). For the `Merging` substate (a crash during
+    /// Merger resolution, REQ-19) [`recover`] first reaps the in-flight Merger
+    /// `active_workers` row and forgets its workspace, then lets `resume_from`
+    /// park the issue for a human — so neither the row nor the workspace dir leaks
+    /// (F1).
     ResumeLanding {
         /// The landing substate to resume from.
         substate: PhaseSubstate,
@@ -257,9 +261,15 @@ pub fn plan_recovery(
         }
 
         // Local landing substates: delegate to the resumable landing machine
-        // (AC-18).
+        // (AC-18). `Merging` (a crash while a Merger was resolving a conflict,
+        // REQ-19) is included: the landing machine's resume path parks it for a
+        // human (REQ-15a) rather than blindly re-driving an in-flight worker —
+        // safe, since `main` is untouched. `recover` additionally reaps the
+        // in-flight Merger row + its workspace before that park (F1), so neither
+        // leaks once the issue goes terminal.
         (Phase::Landing, Some(sub @ PhaseSubstate::RebaseStarted))
         | (Phase::Landing, Some(sub @ PhaseSubstate::RebaseDoneBookmarkPending))
+        | (Phase::Landing, Some(sub @ PhaseSubstate::Merging))
         | (Phase::Landing, Some(sub @ PhaseSubstate::BookmarkMovedComplete)) => {
             Ok(RecoveryPlan::ResumeLanding { substate: sub })
         }
@@ -469,11 +479,36 @@ fn recover_issue(
         }
 
         RecoveryPlan::ResumeLanding { substate } => {
+            // F1: a crash *during* Merger resolution (REQ-19) left an in-flight
+            // Merger `active_workers` row and its `landing-<id>-r<round>-<uuid>`
+            // workspace on disk. `resume_from(Merging)` parks the issue for a
+            // human (safe — `main` is untouched) but does NOT reclaim that worker
+            // or its workspace, and the reaper loop below only reaps rows *beyond*
+            // the first — so the in-flight Merger (the first, and typically only,
+            // row) would leak forever once the issue goes terminal. Reap it here,
+            // BEFORE parking, using the same forget+row-drop primitives the
+            // `CleanCrashedWorker` plan uses (but NOT its implementing rollback —
+            // the merge must still park, not re-drive). Idempotent: a second pass
+            // finds the issue terminal (`awaiting-human-merge`) and never
+            // re-enters, and `forget`/`remove_worker` are no-ops on an absent
+            // workspace/row regardless.
+            if substate == PhaseSubstate::Merging {
+                if let Some(merger) = worker {
+                    if let Some(name) = workspace_name_from(merger) {
+                        let _ = manager.forget(&name);
+                    }
+                    let _ = state.remove_worker(&merger.worker_uuid);
+                }
+            }
             // Resolve the landing change lazily: `BookmarkMovedComplete` completes
-            // from bookmark ground truth alone and never needs the workspace, so a
+            // from bookmark ground truth alone, and `Merging` parks for a human
+            // without touching the change — neither needs the workspace, so a
             // missing implement workspace must not brick a resume that could
             // finish. Only resolve when the plan actually needs a change revset.
-            let outcome = if substate == PhaseSubstate::BookmarkMovedComplete {
+            let outcome = if matches!(
+                substate,
+                PhaseSubstate::BookmarkMovedComplete | PhaseSubstate::Merging
+            ) {
                 // The change target is unused by the terminal-transition step;
                 // pass a placeholder — `resume_from` never resolves it here.
                 landing::resume_from(state, log, manager, &issue.issue_id, "", substate)
@@ -713,6 +748,17 @@ fn quarantine(
 /// this issue at this round and returns its working-copy commit id. If no such
 /// workspace is registered (it was already forgotten, or the crash predates its
 /// creation) recovery cannot reconstruct the target and refuses.
+///
+/// KNOWN LIMITATION (F3, fails safe): after a crash at
+/// `RebaseDoneBookmarkPending` that followed a Merger's
+/// [`retry_land_after_merge`](landing::retry_land_after_merge), the change this
+/// re-derives is the ORIGINAL, still-unmerged `implementing` commit — NOT the
+/// Merger's resolved commit (this scan only knows the `implementing` workspace).
+/// `main` is not an ancestor of that stale target, so the FF-guard refuses the
+/// move and the issue parks at `awaiting-human-merge`. That is safe (`main` is
+/// never rewound) but it DISCARDS a good merge rather than resuming it — the
+/// post-merge case is deliberately not resumed here, only re-derivable landings
+/// are. A human applying `human-resolved:retry` re-drives the landing.
 fn landing_change_revset(
     manager: &WorkspaceManager,
     issue_id: &str,
@@ -990,6 +1036,11 @@ mod tests {
                 "bookmark_moved_complete",
                 PhaseSubstate::BookmarkMovedComplete,
             ),
+            // `merging` (a crash during Merger resolution, REQ-19) is a landing
+            // resume point too — it delegates to `resume_from`, which parks for a
+            // human (the reap of the in-flight Merger row/workspace is `recover`'s
+            // job, exercised by the behavioral test in `tests/recovery.rs`).
+            ("merging", PhaseSubstate::Merging),
         ] {
             assert_eq!(
                 plan_recovery(Phase::Landing, Some(token), false, false).unwrap(),

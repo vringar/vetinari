@@ -136,11 +136,12 @@ use crate::artifacts::{
 use crate::config::{OrchestratorConfig, WorkerKind};
 use crate::events::{emit, EventLog};
 use crate::landing::{
-    branch_name, land_local, land_remote, LandingOutcome, OctocrabPrOpener, RemoteLanding,
-    MAIN_BOOKMARK,
+    branch_name, land_local, land_remote, retry_land_after_merge, LandingOutcome, OctocrabPrOpener,
+    RemoteLanding, MAIN_BOOKMARK,
 };
 use crate::qa::{QaGate, QaOutcome};
 use crate::roles::adversary::{render_inputs, RenderParams, RenderedAdversaryInputs};
+use crate::roles::merger::{render_conflict_input, ConflictContext};
 use crate::spawn::{SpawnOutcome, Spawner, WorkerCommand};
 use crate::state::{ActiveWorkerRow, EventKind, IssueRow, Phase, StateDb, WorkerRole};
 use crate::workspace::{WorkspaceManager, WorkspaceName};
@@ -164,6 +165,12 @@ pub const WORKER_ROLE_TAG: &str = "implementer";
 /// not to the Implementer.
 pub const ADVERSARY_ROLE_TAG: &str = "adversary";
 
+/// The role attribution recorded on Merger-derived crosslink comments (AC-16):
+/// the conflict-context blocker posted when a landing parks for a human merge
+/// (and, in a later iteration, the `--kind resolution` summary) is attributed to
+/// the Merger, not the Implementer.
+pub const MERGER_ROLE_TAG: &str = "merger";
+
 /// The base revset a fresh worker workspace is rooted on: `main`, so the
 /// worker's change is a child of trunk and lands as a clean fast-forward
 /// (REQ-17 local path).
@@ -181,6 +188,13 @@ pub const MAX_QA_RETRIES: i64 = 3;
 /// converge within one or two rounds; this only trips a genuinely-diverging
 /// issue.
 pub const MAX_ADVERSARY_ROUNDS: i64 = 6;
+
+/// How many Merger workers may be spawned per issue before the pump gives up and
+/// parks at `phase:awaiting-human-merge` (REQ-19, Q5: **one** Merger retry only).
+/// The Merger had full, fresh conflict context; repeating it almost certainly
+/// wastes inference, so a single failed attempt parks for a human (REQ-15a).
+/// Bounds the `landing_retry_count` column.
+pub const MAX_MERGER_SPAWNS: i64 = 1;
 
 /// Failure of a pump operation that is not itself an issue-level outcome.
 ///
@@ -237,6 +251,20 @@ pub enum PumpError {
         issue_id: i64,
     },
 
+    /// The `main` bookmark did not resolve while rendering a Merger's
+    /// `conflict.md` (REQ-19). Landing only reaches the Merger path from a repo
+    /// whose `main` exists, so an unset `main` here is a corrupt state — surfaced
+    /// explicitly rather than silently rendered as a blank target field.
+    #[error(
+        "the `main` bookmark did not resolve while preparing the Merger conflict input for \
+         issue #{issue_id} — cannot render conflict.md against an unknown target"
+    )]
+    #[diagnostic(code(vetinari::pump::main_bookmark_unresolved))]
+    MainBookmarkUnresolved {
+        /// The issue whose conflict input was being rendered.
+        issue_id: i64,
+    },
+
     /// Delivering the accumulated Adversary findings into a re-implement round's
     /// Implementer workspace (REQ-8) failed — the pre-spawn
     /// `_orchestrator/prior_findings.jsonl` input could not be written.
@@ -267,8 +295,10 @@ pub enum IssueOutcome {
     /// The issue reached `phase:pr-open` — landed remotely (branch pushed, PR
     /// opened, REQ-17 remote path).
     PrOpen,
-    /// The issue is parked at `phase:awaiting-human-merge` (a landing conflict;
-    /// the Merger role is deferred).
+    /// The issue is parked at `phase:awaiting-human-merge` — a landing conflict a
+    /// Merger could not resolve (missing DONE, unresolved conflict, post-merge QA
+    /// fail, or a non-fast-forward retry), or a non-fast-forward bookmark move
+    /// (REQ-19, REQ-15a).
     AwaitingHumanMerge,
     /// The issue was re-queued at `phase:implementing` after a QA failure
     /// (blocker posted; a later tick re-drives it).
@@ -1064,6 +1094,12 @@ impl BuildPump {
         // Mode gate (REQ-17): crosslink's `tracker_remote` selects local FF vs.
         // remote push+PR. Read at land time (never a compile-time cfg, REQ-2a);
         // empty/unset ⇒ local mode (the default, unchanged).
+        //
+        // Local mode's `land_local` drives the whole rebase → fast-forward
+        // substate machine and owns the Landing/Merged/RebaseConflict/
+        // AwaitingHumanMerge transitions; a RebaseConflict is then handled below
+        // by dispatching a Merger (REQ-19). Remote mode pushes + opens a PR and
+        // never yields a RebaseConflict (conflicts are resolved on GitHub).
         let outcome = match self.crosslink.tracker_remote()? {
             Some(remote) => {
                 // Build the PR opener from the SAME remote the branch is pushed to
@@ -1101,9 +1137,16 @@ impl BuildPump {
                 self.set_phase_label(issue_id, Phase::PrOpen)?;
                 Ok(IssueOutcome::PrOpen)
             }
+            LandingOutcome::RebaseConflict { rebased_commit } => {
+                // The rebase conflicted (issue now at `Landing/merging`). Dispatch
+                // a Merger to resolve it, re-run QA on the merged tree, and retry
+                // the fast-forward ONCE (REQ-19, L4). Only a Merger failure falls
+                // back to `phase:awaiting-human-merge`.
+                self.resolve_conflict_with_merger(issue_id, key, change, &rebased_commit)
+            }
             LandingOutcome::AwaitingHumanMerge => {
-                // Parked for a human; mirror the label so the crosslink trail
-                // shows the block.
+                // A non-fast-forward move parked directly; mirror the label so the
+                // crosslink trail shows the block.
                 self.set_phase_label(issue_id, Phase::AwaitingHumanMerge)?;
                 Ok(IssueOutcome::AwaitingHumanMerge)
             }
@@ -1161,6 +1204,337 @@ impl BuildPump {
             },
         )?;
         Ok(outcome)
+    }
+
+    /// Test/recovery seam: drive the converged→land step for `issue_id` on the
+    /// already-resolved `change_revset`, exercising the full landing path
+    /// including the Merger conflict resolution (REQ-19). The issue must already
+    /// exist in `state.db`. Public so a landing-conflict integration test can
+    /// drive a real Merger `Spawner` + post-merge QA without standing up the
+    /// whole implement→review pipeline — mirroring how `land_local`/`resume_from`
+    /// are public entry points on the landing machine.
+    pub fn land_change(
+        &self,
+        issue_id: i64,
+        change_revset: &str,
+    ) -> Result<IssueOutcome, PumpError> {
+        self.land(issue_id, &issue_id.to_string(), change_revset)
+    }
+
+    /// Resolve a rebase conflict with a Merger worker, then re-run QA and retry
+    /// the fast-forward landing ONCE (REQ-19, L4).
+    ///
+    /// The flow, all fail-safe (never moves `main` sideways):
+    ///
+    /// 1. **Bound (Q5):** at most [`MAX_MERGER_SPAWNS`] Merger per issue. A second
+    ///    conflict after a Merger already ran parks for a human (REQ-15a).
+    /// 2. Prepare a fresh workspace **checked out on the conflicted rebase
+    ///    result** (`rebased_commit`), so the Merger's files carry the markers,
+    ///    and pre-render `_orchestrator/conflict.md` (REQ-19).
+    /// 3. Spawn the Merger (Direct fake or real `claude`), wait, verify its DONE
+    ///    sentinel. A stall / missing DONE parks for a human.
+    /// 4. Read the Merger's resolved working-copy commit. If it **still carries a
+    ///    conflict**, the Merger failed → park.
+    /// 5. Re-run static QA on the merged tree. A QA fail/poison → park (REQ-19:
+    ///    a semantically-broken merge is a Merger failure, AC-21).
+    /// 6. Retry the FF landing ONCE via [`retry_land_after_merge`]: a clean FF →
+    ///    `phase:merged`; a non-fast-forward → park. Then forget the workspace.
+    ///
+    /// Every park posts a `--kind blocker` with the conflict context (AC-14) and
+    /// mirrors the `phase:awaiting-human-merge` label. The `landing_retry_count`
+    /// bump is persisted before the spawn so a crash cannot silently re-spawn an
+    /// unbounded number of Mergers.
+    fn resolve_conflict_with_merger(
+        &self,
+        issue_id: i64,
+        key: &str,
+        change: &str,
+        rebased_commit: &str,
+    ) -> Result<IssueOutcome, PumpError> {
+        // (1) One Merger per issue (Q5). A second conflict parks for a human.
+        let retry_count = self
+            .state
+            .get_issue(key)?
+            .map(|i| i.landing_retry_count)
+            .unwrap_or(0);
+        if retry_count >= MAX_MERGER_SPAWNS {
+            return self.park_for_human(
+                issue_id,
+                key,
+                &format!(
+                    "rebase for #{issue_id} still conflicts after a Merger attempt — \
+                     no further retries (REQ-19)"
+                ),
+            );
+        }
+        // Persist the bump BEFORE spawning so a crash cannot re-spawn unbounded.
+        if let Some(mut issue) = self.state.get_issue(key)? {
+            issue.landing_retry_count = retry_count + 1;
+            self.state.upsert_issue(&issue)?;
+        }
+
+        let round = self.current_round(key)?;
+        // The Merger workspace is named under the Landing phase (there is no
+        // dedicated Merger phase); its pane is `merger-<issue>-r<round>`.
+        let name = WorkspaceName::generate(Phase::Landing, key, round);
+        let prepared = self.manager.prepare(&name, rebased_commit)?;
+
+        // (2) Pre-render conflict.md (REQ-19). The Merger reads it first. `main`
+        // must resolve here — landing only reaches this path from a repo with a
+        // live `main`; an unset bookmark is a corrupt state, surfaced explicitly
+        // (F6) rather than rendered as a mystifying blank target field.
+        let target_commit = match self
+            .manager
+            .bookmark_target(MAIN_BOOKMARK)
+            .map_err(PumpError::Landing)?
+        {
+            Some(commit) => commit,
+            None => {
+                let _ = self.manager.forget(&name);
+                return Err(PumpError::MainBookmarkUnresolved { issue_id });
+            }
+        };
+        let rendered = match render_conflict_input(
+            prepared.path(),
+            &ConflictContext {
+                operation: "rebase onto main",
+                target_bookmark: MAIN_BOOKMARK,
+                target_commit: &target_commit,
+                change_revset: change,
+                conflicted_commit: rebased_commit,
+            },
+        ) {
+            Ok(rendered) => rendered,
+            Err(source) => {
+                let _ = self.manager.forget(&name);
+                return Err(source.into());
+            }
+        };
+
+        // (3) Spawn the Merger and wait.
+        let worker_uuid = Uuid::new_v4().simple().to_string();
+        self.register_worker(
+            key,
+            &worker_uuid,
+            WorkerRole::Merger,
+            round,
+            prepared.path(),
+        )?;
+        let task = "Resolve the rebase conflict described in _orchestrator/conflict.md.";
+        let command = self.merger_worker_command(issue_id, &rendered, task)?;
+        let handle = self
+            .spawner
+            .spawn(WorkerRole::Merger, key, round, &prepared, &command)?;
+        emit(
+            &self.state,
+            &self.log,
+            EventKind::Spawn,
+            Some(key),
+            Some(&worker_uuid),
+            &json!({
+                "role": MERGER_ROLE_TAG,
+                "round": round,
+                "pane": handle.pane.name.clone(),
+                "workspace": name.as_str(),
+            }),
+        )?;
+
+        let outcome = handle.wait(self.config.worker_timeout(), Duration::from_millis(300))?;
+        if outcome == SpawnOutcome::StillRunning {
+            let _dead = handle.close_and_wait(Duration::from_secs(5), Duration::from_millis(200));
+            self.remove_worker(&worker_uuid);
+            let _ = self.manager.forget(&name);
+            return self.park_for_human(
+                issue_id,
+                key,
+                &format!("Merger for #{issue_id} exceeded its timeout without exiting"),
+            );
+        }
+        handle.close();
+
+        // Verify DONE (S3): a missing/torn sentinel is a Merger failure → park.
+        if let Err(source) = DoneSentinel::verify(prepared.path()) {
+            self.remove_worker(&worker_uuid);
+            let _ = self.manager.forget(&name);
+            return self.park_for_human(
+                issue_id,
+                key,
+                &format!("Merger for #{issue_id} left no valid DONE sentinel: {source}"),
+            );
+        }
+        self.remove_worker(&worker_uuid);
+
+        // (4) The Merger's resolved working-copy commit. If it STILL carries a
+        // conflict, the Merger did not resolve it → park (never land a conflict).
+        //
+        // Force a working-copy snapshot of the merger workspace FIRST (F5): a
+        // Merger that resolved purely via `Edit`/`Write` and never ran a
+        // snapshotting `jj` verb would leave its recorded commit stale, so the
+        // readback below would still see the pre-resolution conflict and falsely
+        // park a correct merge. The orchestrator owns the `.jj/` gate, so it folds
+        // the on-disk edits in itself rather than trusting the worker's command
+        // choices. Best-effort: a snapshot failure degrades to the prior
+        // trust-the-worker readback (never worse than before F5), so it must not
+        // fail the tick.
+        let _ = self.manager.snapshot_workspace(&name);
+        let merged = self.change_revset(&name, issue_id)?;
+        let still_conflicted = self
+            .manager
+            .resolve_change(&merged)
+            .map_err(PumpError::Landing)?
+            .has_conflict;
+        if still_conflicted {
+            let _ = self.manager.forget(&name);
+            return self.park_for_human(
+                issue_id,
+                key,
+                &format!("Merger for #{issue_id} left the tree conflicted — unresolved merge"),
+            );
+        }
+
+        // (5) Re-run static QA on the merged tree (REQ-19, AC-21). A fail/poison
+        // is a Merger failure — no retry, park.
+        let qa = QaGate::new(prepared.path()).with_timeout(self.config.qa_timeout());
+        match qa.run() {
+            Ok(QaOutcome::Pass) => {
+                emit(
+                    &self.state,
+                    &self.log,
+                    EventKind::QaResult,
+                    Some(key),
+                    None,
+                    &json!({"result": "pass", "phase": "post_merge"}),
+                )?;
+            }
+            Ok(QaOutcome::Fail { exit_code, .. }) => {
+                let _ = self.manager.forget(&name);
+                return self.park_for_human(
+                    issue_id,
+                    key,
+                    &format!("post-merge QA for #{issue_id} failed (exit {exit_code})"),
+                );
+            }
+            Err(source) => {
+                let _ = self.manager.forget(&name);
+                return self.park_for_human(
+                    issue_id,
+                    key,
+                    &format!("post-merge QA for #{issue_id} is broken/poison: {source}"),
+                );
+            }
+        }
+
+        // (6) Retry the FF landing ONCE. A clean FF → merged; a non-fast-forward
+        // → park. Move main BEFORE forgetting the workspace so the resolved
+        // commit is bookmark-referenced (never abandoned on forget).
+        let land = retry_land_after_merge(&self.state, &self.log, &self.manager, key, &merged)?;
+        let result = match land {
+            LandingOutcome::Merged => {
+                self.set_phase_label(issue_id, Phase::Merged)?;
+                Ok(IssueOutcome::Merged)
+            }
+            LandingOutcome::AwaitingHumanMerge => {
+                self.set_phase_label(issue_id, Phase::AwaitingHumanMerge)?;
+                self.post_conflict_blocker(
+                    issue_id,
+                    &format!("retry landing for #{issue_id} was not a fast-forward after merge"),
+                )?;
+                Ok(IssueOutcome::AwaitingHumanMerge)
+            }
+            // A retry that re-conflicts is impossible here (the Merger produced a
+            // conflict-free descendant of main); treat it as a park for safety.
+            LandingOutcome::RebaseConflict { .. } => self.park_for_human(
+                issue_id,
+                key,
+                &format!("retry landing for #{issue_id} unexpectedly re-conflicted"),
+            ),
+            // `retry_land_after_merge` drives only the local FF bookmark move
+            // (REQ-19); it can never push a branch or open a PR. An impossible
+            // `PrOpen` here is a safety park, not a merged/pr-open transition.
+            LandingOutcome::PrOpen { .. } => self.park_for_human(
+                issue_id,
+                key,
+                &format!("retry landing for #{issue_id} unexpectedly opened a PR"),
+            ),
+        };
+        let _ = self.manager.forget(&name);
+        result
+    }
+
+    /// Build the Merger worker command for `issue_id`, dispatched into the
+    /// pre-rendered `rendered` workspace, per the typed `[worker] merger_kind`.
+    ///
+    /// Mirrors [`worker_command`](Self::worker_command) /
+    /// [`adversary_worker_command`](Self::adversary_worker_command): a
+    /// [`WorkerKind::Direct`] Merger runs the configured `merger_argv` straight in
+    /// the conflicted workspace (the deterministic `fake-merger*` dogfood path —
+    /// it resolves the conflicted files and writes `merge_result.md` + DONE),
+    /// while a [`WorkerKind::Claude`] Merger is built from
+    /// [`crate::roles::merger`] (its conflict-resolution allowlist, the
+    /// `.jj/`+`.git/` RW mount matrix, system prompt, and `max_turns_merger`).
+    fn merger_worker_command(
+        &self,
+        issue_id: i64,
+        rendered: &crate::roles::merger::RenderedMergerInputs,
+        task: &str,
+    ) -> Result<WorkerCommand, PumpError> {
+        let _ = issue_id;
+        match self.config.worker.merger_kind {
+            WorkerKind::Direct => {
+                let argv = self
+                    .config
+                    .merger_argv(self.manager.root())
+                    .ok_or(PumpError::EmptyWorkerCommand)?;
+                Ok(WorkerCommand::direct(argv, Vec::<(String, String)>::new()))
+            }
+            WorkerKind::Claude => Ok(crate::roles::merger::worker_command(
+                self.manager.root(),
+                rendered,
+                task.to_owned(),
+                self.config.worker.max_turns_merger,
+            )),
+        }
+    }
+
+    /// Park an issue at `phase:awaiting-human-merge` (REQ-15a) after a Merger
+    /// failure: set the authoritative phase, mirror the label, emit the
+    /// transition, and post a `--kind blocker` with the conflict context (AC-14).
+    /// A human applying `human-resolved:retry` re-attempts the landing.
+    fn park_for_human(
+        &self,
+        issue_id: i64,
+        key: &str,
+        reason: &str,
+    ) -> Result<IssueOutcome, PumpError> {
+        self.state.set_phase(key, Phase::AwaitingHumanMerge, None)?;
+        self.set_phase_label(issue_id, Phase::AwaitingHumanMerge)?;
+        emit(
+            &self.state,
+            &self.log,
+            EventKind::Transition,
+            Some(key),
+            None,
+            &json!({
+                "from_phase": Phase::Landing.as_str(),
+                "to_phase": Phase::AwaitingHumanMerge.as_str(),
+                "reason": reason,
+            }),
+        )?;
+        self.post_conflict_blocker(issue_id, reason)?;
+        Ok(IssueOutcome::AwaitingHumanMerge)
+    }
+
+    /// Post a `--kind blocker` recording the conflict context on an issue parked
+    /// for a human merge (AC-14). Attributed to the Merger role (AC-16).
+    fn post_conflict_blocker(&self, issue_id: i64, reason: &str) -> Result<(), PumpError> {
+        let body = format!(
+            "Landing parked at `phase:awaiting-human-merge`: {reason}.\n\n\
+             A human must resolve the merge, then apply the `human-resolved:retry` \
+             label to re-attempt the landing (REQ-15a)."
+        );
+        self.crosslink
+            .comment_write(issue_id, "blocker", &body, Some(MERGER_ROLE_TAG))?;
+        Ok(())
     }
 
     /// QA failed → post a `--kind blocker` and either re-queue at

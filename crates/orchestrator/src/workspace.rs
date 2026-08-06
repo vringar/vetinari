@@ -399,6 +399,32 @@ impl WorkspaceManager {
             })
     }
 
+    /// Force a working-copy snapshot of the workspace `name` under the `.jj/`
+    /// gate (REQ-5a), folding its on-disk edits into its recorded working-copy
+    /// commit — exactly what the `jj` CLI does on every invocation.
+    ///
+    /// The orchestrator owns the `.jj/` gate and must not *trust* a worker to
+    /// have run a snapshotting `jj` verb before it reads a result back: a Merger
+    /// that resolves a conflict purely via file edits (never a `jj` command)
+    /// leaves its working-copy commit stale, so a naive readback still reports
+    /// the old conflicted tree and would falsely park a good resolution (REQ-19,
+    /// F5). Calling this first makes the readback reflect on-disk reality.
+    ///
+    /// A no-op when the on-disk tree already matches the recorded commit (a
+    /// worker that *did* snapshot), so it is safe to call unconditionally. Loads
+    /// a fresh handle on the target workspace's own working copy — the gate hold
+    /// still serializes it against every other `.jj/` mutator.
+    pub fn snapshot_workspace(&self, name: &WorkspaceName) -> Result<(), JjError> {
+        let dir = self.workspace_dir(name);
+        // Hold the serializing gate for the whole snapshot so it cannot race a
+        // concurrent workspace add / rebase (REQ-5a). The snapshot operates on a
+        // freshly-loaded handle for the *target* workspace's working copy, not
+        // the gate's root handle, since only that workspace can lock its own WC.
+        let _gate = self.gate();
+        let mut ws = JjWorkspace::load(&dir)?;
+        ws.snapshot_working_copy()
+    }
+
     /// Whether the commit `ancestor_revset` resolves to is an ancestor of (or
     /// equal to) the commit `descendant_revset` resolves to — i.e. moving a
     /// bookmark from the former to the latter would be a true fast-forward.

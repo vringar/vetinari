@@ -176,6 +176,10 @@ pub const DEFAULT_MAX_TURNS_IMPLEMENTER: u32 = crate::roles::implementer::DEFAUL
 /// [`crate::roles::adversary::DEFAULT_MAX_TURNS`].
 pub const DEFAULT_MAX_TURNS_ADVERSARY: u32 = crate::roles::adversary::DEFAULT_MAX_TURNS;
 
+/// The default Merger turn cap (REQ-13 `max_turns_merger`); mirrors
+/// [`crate::roles::merger::DEFAULT_MAX_TURNS`].
+pub const DEFAULT_MAX_TURNS_MERGER: u32 = crate::roles::merger::DEFAULT_MAX_TURNS;
+
 /// The convergence threshold (REQ-10): how many consecutive DONE-attested clean
 /// Adversary rounds converge an issue. **Default 2** — the A3 detector requires
 /// two consecutive clean rounds on the same (immutable-commit-id) change (a
@@ -225,6 +229,22 @@ pub struct WorkerConfig {
     /// Default [`DEFAULT_MAX_TURNS_ADVERSARY`].
     #[serde(default = "default_max_turns_adversary")]
     pub max_turns_adversary: u32,
+    /// Which Merger worker kind to dispatch for the landing-conflict phase (L4,
+    /// REQ-19), mirror of [`kind`](Self::kind). Default [`WorkerKind::Direct`] so
+    /// tests use a deterministic fake Merger; real runs set `merger_kind =
+    /// "claude"`.
+    #[serde(default)]
+    pub merger_kind: WorkerKind,
+    /// The Direct Merger's program plus arguments, resolved against the repo root
+    /// like [`argv`](Self::argv). Ignored when
+    /// [`merger_kind`](Self::merger_kind) is [`WorkerKind::Claude`]. Default: the
+    /// committed `fake-merger.sh` (resolves the fixture conflict).
+    #[serde(default = "default_merger_argv")]
+    pub merger_argv: Vec<String>,
+    /// The Merger `--max-turns` cap for [`WorkerKind::Claude`] (REQ-13).
+    /// Default [`DEFAULT_MAX_TURNS_MERGER`].
+    #[serde(default = "default_max_turns_merger")]
+    pub max_turns_merger: u32,
 }
 
 impl Default for WorkerConfig {
@@ -236,6 +256,9 @@ impl Default for WorkerConfig {
             adversary_kind: WorkerKind::default(),
             adversary_argv: default_adversary_argv(),
             max_turns_adversary: default_max_turns_adversary(),
+            merger_kind: WorkerKind::default(),
+            merger_argv: default_merger_argv(),
+            max_turns_merger: default_max_turns_merger(),
         }
     }
 }
@@ -246,6 +269,10 @@ fn default_max_turns_implementer() -> u32 {
 
 fn default_max_turns_adversary() -> u32 {
     DEFAULT_MAX_TURNS_ADVERSARY
+}
+
+fn default_max_turns_merger() -> u32 {
+    DEFAULT_MAX_TURNS_MERGER
 }
 
 /// The default dogfood worker argv: `bash tests/fixtures/fake-implementer.sh`.
@@ -265,6 +292,16 @@ fn default_adversary_argv() -> Vec<String> {
     vec![
         "bash".to_owned(),
         "tests/fixtures/fake-adversary-clean.sh".to_owned(),
+    ]
+}
+
+/// The default dogfood Merger argv: `bash tests/fixtures/fake-merger.sh` (L4,
+/// REQ-19). Relative to the repo root like [`default_worker_argv`]; the pump
+/// joins it against the root before dispatch.
+fn default_merger_argv() -> Vec<String> {
+    vec![
+        "bash".to_owned(),
+        "tests/fixtures/fake-merger.sh".to_owned(),
     ]
 }
 
@@ -481,6 +518,14 @@ impl OrchestratorConfig {
     /// spawning nothing).
     pub fn adversary_argv(&self, root: &Path) -> Option<Vec<String>> {
         resolve_script_argv(&self.worker.adversary_argv, root)
+    }
+
+    /// The Direct Merger argv with its designated script field resolved against
+    /// `root`, mirroring [`worker_argv`](Self::worker_argv) (REQ-19, L4). Returns
+    /// `None` for an empty argv (a misconfiguration the pump reports rather than
+    /// spawning nothing).
+    pub fn merger_argv(&self, root: &Path) -> Option<Vec<String>> {
+        resolve_script_argv(&self.worker.merger_argv, root)
     }
 }
 

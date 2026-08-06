@@ -897,3 +897,121 @@ fn landing_resume_parks_when_no_longer_a_fast_forward() {
         "main must be unmoved after a parked resume"
     );
 }
+
+/// Crash *during* Merger resolution (F1, REQ-19): the issue is at
+/// `landing / merging` with an in-flight Merger `active_workers` row and its
+/// on-disk merger workspace. `recover` must park the issue at
+/// `awaiting-human-merge` (main untouched, safe) AND reap the Merger row +
+/// forget its workspace so neither leaks once the issue goes terminal — and a
+/// second pass is a no-op.
+///
+/// This FAILS against the pre-F1 code: `resume_from(Merging)` parked the issue
+/// but left the Merger row and its workspace dir behind, and because the parked
+/// issue is now terminal the only reaper (`recover`'s skip-the-first-row loop)
+/// never reclaimed them.
+#[test]
+fn recover_reaps_merger_row_and_workspace_on_merging_crash() {
+    let fx = build_fixture();
+    let manager = WorkspaceManager::load(&fx.root).expect("load repo into gate");
+    let (state, log, issue_id) = open_state(&fx);
+
+    // Seed the crash-safe `landing / merging` substate the pump persists when a
+    // rebase conflicts and a Merger is dispatched (REQ-19).
+    state
+        .upsert_issue(&IssueRow::new(&issue_id, Phase::Landing))
+        .expect("seed landing issue");
+    state
+        .set_phase(&issue_id, Phase::Landing, Some(PhaseSubstate::Merging))
+        .expect("persist merging substate");
+
+    // Materialize the in-flight Merger's workspace (named under the Landing
+    // phase, exactly as `resolve_conflict_with_merger` names it) and register its
+    // live `active_workers` row — no DONE (it crashed mid-resolution).
+    let merger_name = WorkspaceName::generate(Phase::Landing, &issue_id, 0);
+    let prepared = manager
+        .prepare(&merger_name, "main")
+        .expect("prepare merger workspace");
+    let ws_path = prepared.path().to_path_buf();
+    assert!(ws_path.exists(), "merger workspace exists pre-recovery");
+    state
+        .upsert_worker(&ActiveWorkerRow {
+            worker_uuid: "in-flight-merger-1".to_owned(),
+            issue_id: issue_id.clone(),
+            role: WorkerRole::Merger,
+            round: 0,
+            workspace_path: ws_path.clone(),
+            pid: None,
+            spawned_at: 1,
+            last_heartbeat: 1,
+        })
+        .expect("register in-flight merger row");
+
+    let main_before = manager.bookmark_target("main").expect("read main");
+
+    // Recover: resume-parks for a human (safe) AND reaps the Merger row/workspace.
+    let actions = recover(&state, &log, &manager, None).expect("recover must not abort");
+    assert_eq!(
+        actions,
+        vec![RecoveryAction::ResumedLanding {
+            issue_id: issue_id.clone(),
+            outcome: LandingOutcome::AwaitingHumanMerge,
+        }],
+        "a merging crash must resume-park at awaiting-human-merge, got {actions:?}"
+    );
+
+    // (a) Parked at awaiting-human-merge, `main` untouched.
+    assert_eq!(
+        state.get_issue(&issue_id).unwrap().unwrap().phase,
+        Phase::AwaitingHumanMerge
+    );
+    assert_eq!(
+        manager.bookmark_target("main").expect("read main after"),
+        main_before,
+        "parking must never move main"
+    );
+
+    // (b) No leaked worker row (F1).
+    assert!(
+        state.list_active_workers().expect("workers").is_empty(),
+        "recover must reap the in-flight Merger row"
+    );
+
+    // (c) No lingering merger workspace dir — forgotten AND removed (F1).
+    assert!(
+        !ws_path.exists(),
+        "recover must forget + remove the merger workspace dir"
+    );
+    assert!(
+        manager
+            .list()
+            .expect("list workspaces")
+            .iter()
+            .all(|w| w != &merger_name.as_str()),
+        "recover must jj-forget the merger workspace"
+    );
+    let ws_root = fx.root.join(WORKSPACE_DIR);
+    if ws_root.exists() {
+        let lingering: Vec<_> = std::fs::read_dir(&ws_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            lingering.is_empty(),
+            "no merger workspace may linger after recovery, found {lingering:?}"
+        );
+    }
+
+    // (d) Idempotent: the parked issue is now terminal, so a second pass takes no
+    // action and leaves the state exactly as the first pass left it.
+    let again = recover(&state, &log, &manager, None).expect("second recover");
+    assert!(
+        again.is_empty(),
+        "second recover must be a no-op, got {again:?}"
+    );
+    assert_eq!(
+        state.get_issue(&issue_id).unwrap().unwrap().phase,
+        Phase::AwaitingHumanMerge
+    );
+    assert!(state.list_active_workers().expect("workers").is_empty());
+}

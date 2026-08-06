@@ -64,11 +64,15 @@
 //! Until that lands, the guardrails above plus orchestrator-side validation are
 //! the whole story, and this module claims nothing stronger.
 //!
-//! The Implementer role (S7) and the Adversary role (A1) are defined here; the
-//! Merger and Judge roles are iteration-2+ and land with their own modules. The
-//! Adversary additionally owns the orchestrator-side pre-rendering of its inputs
-//! ([`adversary::render_inputs`]) — it reviews with fresh context and no `.jj/`
-//! mount, so the orchestrator renders its diff/log for it (REQ-8).
+//! The Implementer role (S7), the Adversary role (A1), and the Merger role (L4,
+//! REQ-19) are defined here; the Judge role is iteration-3+ and lands with its
+//! own module. The Adversary owns the orchestrator-side pre-rendering of its
+//! inputs ([`adversary::render_inputs`]) — it reviews with fresh context and no
+//! `.jj/` mount, so the orchestrator renders its diff/log for it (REQ-8). The
+//! Merger likewise pre-renders its `conflict.md` input
+//! ([`merger::render_conflict_input`]) but, being a committing role, keeps the
+//! repository `.jj/`+`.git/` RW mount (like the Implementer).
 
 pub mod adversary;
 pub mod implementer;
+pub mod merger;
