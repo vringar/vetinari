@@ -44,55 +44,8 @@ use orchestrator::spawn::{
 use orchestrator::state::{Phase, WorkerRole};
 use orchestrator::workspace::{PreparedWorkspace, WorkspaceManager, WorkspaceName};
 use vetinari_error::SpawnError;
-use vetinari_zellij_host::{session_ensure, SessionHandle};
 
-use common::{build_fixture, fake_implementer, Fixture};
-
-/// Serializes every zellij-hosted test in this binary. The `zellij` CLI in this
-/// env shares one background server + socket across all sessions; running
-/// `new-pane` / `list-panes` / `kill-session` from several test threads at once
-/// races (a concurrent `list-panes --json` can momentarily return empty during
-/// another test's teardown). Cargo runs integration tests multithreaded, so a
-/// process-wide lock — held for the whole test, released after cleanup — keeps
-/// each zellij-touching test's view of the server consistent.
-static ZELLIJ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Kills the test's zellij session on drop, so a failed assertion still cleans
-/// up, then releases the shared [`ZELLIJ_LOCK`] (dropped after the kill because
-/// `_zellij` is declared after `name` — fields drop in declaration order).
-/// Mirrors `zellij_host/tests/spawn.rs`.
-struct SessionGuard {
-    name: String,
-    _zellij: std::sync::MutexGuard<'static, ()>,
-}
-
-impl Drop for SessionGuard {
-    fn drop(&mut self) {
-        let _ = Command::new("zellij")
-            .args(["kill-session", &self.name])
-            .output();
-    }
-}
-
-/// Create a unique headless zellij session, taking the shared [`ZELLIJ_LOCK`]
-/// for the lifetime of the returned guard so this test is the sole driver of
-/// the zellij server while it runs. The name mixes the pid with a monotonic
-/// counter so sessions never alias across tests.
-fn unique_session(tag: &str) -> (SessionHandle, SessionGuard) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let held = ZELLIJ_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = format!("vetinari-{tag}-{}-{n}", std::process::id());
-    let guard = SessionGuard {
-        name: name.clone(),
-        _zellij: held,
-    };
-    let session = session_ensure(&name).expect("ensure headless session");
-    (session, guard)
-}
+use common::{build_fixture, fake_implementer, unique_session, Fixture};
 
 /// Write an executable shim script at `dir/name` and return `dir` so the caller
 /// can prepend it to PATH.

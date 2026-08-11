@@ -9,22 +9,58 @@
 
 #![allow(dead_code)] // not every test binary uses every helper
 
+use std::fs::{File, OpenOptions};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
 use vetinari_zellij_host::{session_ensure, SessionHandle};
 
-/// Serializes zellij-touching tests: the `zellij` CLI shares one background
-/// server + socket, and cargo runs integration tests multithreaded. Shared by
-/// every integration test binary that spawns workers through a headless session.
-static ZELLIJ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Fixed path of the cross-process zellij test lockfile, under the system temp
+/// dir so every test binary for this user resolves the same file.
+fn zellij_lockfile() -> PathBuf {
+    std::env::temp_dir().join("vetinari-zellij-test.lock")
+}
 
-/// Holds the process-wide zellij lock for a test and kills the ensured session
+/// Take the cross-process zellij lock, blocking until every other test process
+/// releases it. The returned open [`File`] IS the lock: an advisory `flock(2)`
+/// `LOCK_EX` is held for as long as the fd stays open and released when it is
+/// dropped (closed). A per-process `Mutex` cannot do this — the `zellij` CLI
+/// shares ONE per-user background server + socket, and cargo runs the test
+/// BINARIES concurrently, so serialization has to be a real cross-process
+/// mutex. `flock` on separate open file descriptions also blocks between
+/// threads of the same process, so this alone serializes both.
+fn acquire_zellij_lock() -> File {
+    let path = zellij_lockfile();
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open zellij test lockfile {}: {e}", path.display()));
+    // SAFETY: `flock` only needs a valid open fd, which `file` owns for the
+    // duration of the call and beyond (the caller keeps `file` alive to hold
+    // the lock). `LOCK_EX` blocks until the lock is free.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert!(
+        rc == 0,
+        "flock({}) LOCK_EX failed: {}",
+        path.display(),
+        std::io::Error::last_os_error(),
+    );
+    file
+}
+
+/// Holds the cross-process zellij lock for a test and kills the ensured session
 /// on drop. Hold it for the lifetime of the test alongside the [`Fixture`].
 pub struct SessionGuard {
     name: String,
-    _zellij: std::sync::MutexGuard<'static, ()>,
+    // The open, flock-held lockfile. Fields drop in declaration order, so the
+    // session is killed (below) BEFORE this fd closes and releases the lock —
+    // the next process never sees this session mid-teardown.
+    _lock: File,
 }
 
 impl Drop for SessionGuard {
@@ -36,19 +72,18 @@ impl Drop for SessionGuard {
 }
 
 /// Ensure a uniquely-named headless zellij session (serialized against every
-/// other zellij-touching test via [`ZELLIJ_LOCK`]), returning the session handle
-/// and a guard that releases the lock + kills the session on drop.
+/// other zellij-touching test PROCESS via an flock on [`zellij_lockfile`]),
+/// returning the session handle and a guard that releases the lock + kills the
+/// session on drop.
 pub fn unique_session(tag: &str) -> (SessionHandle, SessionGuard) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let held = ZELLIJ_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lock = acquire_zellij_lock();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = format!("vetinari-{tag}-{}-{n}", std::process::id());
     let guard = SessionGuard {
         name: name.clone(),
-        _zellij: held,
+        _lock: lock,
     };
     let session = session_ensure(&name).expect("ensure headless session");
     (session, guard)

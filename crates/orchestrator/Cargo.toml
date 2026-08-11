@@ -58,6 +58,12 @@ tempfile = { workspace = true }
 # freedom, filesystem-safety) and idempotent-cleanup observational equivalence.
 # `kani` is unavailable in the dev shell, so proptest is the proof tool.
 proptest = "1"
+# Cross-process advisory `flock(2)` for the shared zellij test lockfile
+# (tests/common/mod.rs): the `zellij` CLI shares one per-user server across
+# concurrently-run test binaries, so a per-process Mutex cannot serialize them.
+# Already resolved in the lockfile transitively; no new download. Pinned to 0.2
+# to unify with the existing `libc 0.2.x` in the dependency graph.
+libc = "0.2"
 
 [[bin]]
 name = "orchestrator"

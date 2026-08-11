@@ -18,7 +18,7 @@ use std::process::Command;
 
 use common::{
     build_fixture, fake_adversary_clean, fake_implementer, fake_implementer_empty,
-    fake_implementer_qa_fail,
+    fake_implementer_qa_fail, unique_session,
 };
 use orchestrator::config::{OrchestratorConfig, WorkerConfig};
 use orchestrator::pump::{BuildPump, IssueOutcome, MAX_QA_RETRIES};
@@ -26,41 +26,6 @@ use orchestrator::spawn::{SandboxPin, Spawner};
 use orchestrator::state::{IssueRow, Phase, StateDb};
 use orchestrator::workspace::WorkspaceManager;
 use vetinari_crosslink_api::CrosslinkRepo;
-use vetinari_zellij_host::{session_ensure, SessionHandle};
-
-/// Serializes zellij-touching tests: the `zellij` CLI shares one background
-/// server + socket, and cargo runs integration tests multithreaded. Mirrors
-/// `dogfood.rs` / `spawn_dispatch.rs`.
-static ZELLIJ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct SessionGuard {
-    name: String,
-    _zellij: std::sync::MutexGuard<'static, ()>,
-}
-
-impl Drop for SessionGuard {
-    fn drop(&mut self) {
-        let _ = Command::new("zellij")
-            .args(["kill-session", &self.name])
-            .output();
-    }
-}
-
-fn unique_session(tag: &str) -> (SessionHandle, SessionGuard) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let held = ZELLIJ_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = format!("vetinari-{tag}-{}-{n}", std::process::id());
-    let guard = SessionGuard {
-        name: name.clone(),
-        _zellij: held,
-    };
-    let session = session_ensure(&name).expect("ensure headless session");
-    (session, guard)
-}
 
 fn main_commit(cwd: &Path) -> String {
     let out = Command::new("jj")
