@@ -15,7 +15,7 @@ graphed → implementing → qa-gate → adversary-review → converged → land
 - **qa-gate** — the orchestrator runs `.orchestrator/static_qa.sh` against the worker's tree. The verdict is **owned by exit code**, never by the worker: exit 0 advances; non-zero is captured as a `--kind blocker` comment and the Implementer is re-spawned fresh with that blocker as input.
 - **adversary-review** — a fresh Adversary worker reads a pre-rendered diff and prior findings and emits `findings.jsonl`. Non-empty findings send the issue back to `implementing`; empty findings count toward convergence.
 - **converged** — reached when the convergence detector observes **N consecutive clean adversary rounds** (default `n_rounds = 2`) on the issue's fixed change. Convergence is computed by the orchestrator, never declared by a worker. (Static QA runs once per *implement* round in the `qa-gate` phase, before adversary review — not per adversary round. The `last_diff_hash` column is reserved for a future concurrent/async model and is not part of today's convergence signal.)
-- **landing** — the orchestrator lands the change from **outside any sandbox**. In local mode it rebases the issue's change onto `main` and fast-forwards the `main` bookmark; the fast-forward guard means landing can never clobber `main`. On conflict it spawns a Merger worker (see Status).
+- **landing** — the orchestrator lands the change from **outside any sandbox**. In local mode (crosslink's `tracker_remote` unset) it rebases the issue's change onto `main` and fast-forwards the `main` bookmark; the fast-forward guard means landing can never clobber `main`. On a rebase conflict it moves the issue to a crash-safe `merging` substate, spawns a Merger worker to resolve the conflict, re-runs static QA on the merged tree, and retries the fast-forward once; if that fails the issue parks at `phase:awaiting-human-merge`. In remote mode (`tracker_remote` set) it instead pushes a `vdd/<id>-<slug>` branch and opens a GitHub PR → `phase:pr-open`.
 - **merged** — terminal.
 
 Two ideas hold the whole thing together:
@@ -31,7 +31,7 @@ A cargo workspace of six crates:
 
 | Crate | Role |
 |-------|------|
-| `crates/orchestrator` | The main binary. Modules: `pump` (poll → pick → dispatch), `spawn` (per-role `bwrap` worker + zellij hosting), `qa` (static-QA runner), `artifacts` (worker artifact contract + DONE sentinel), `landing` (rebase / fast-forward), `recovery` (deterministic crash-recovery table), `roles` (Implementer / Adversary allowlists + prompts), `events` (append-only `events.jsonl`), `state` (SQLite `state.db`), `workspace`, `config`. |
+| `crates/orchestrator` | The main binary. Modules: `pump` (poll → pick → dispatch), `spawn` (per-role `bwrap` worker + zellij hosting), `qa` (static-QA runner), `artifacts` (worker artifact contract + DONE sentinel), `landing` (local rebase / fast-forward, Merger-retry on conflict, and remote branch-push + `octocrab` PR open), `recovery` (deterministic crash-recovery table), `roles` (Implementer / Adversary / Merger allowlists + prompts), `events` (append-only `events.jsonl`), `state` (SQLite `state.db`), `workspace`, `config`. |
 | `crates/crosslink_api` | Insulation crate wrapping the crosslink library behind a stable adapter surface (issue read, signed comment write, labels). Absorbs crosslink API churn so the rest of the orchestrator does not move. |
 | `crates/jj_api` | Insulation crate wrapping `jj-lib` — workspace add/forget, status, diff, log, rebase, bookmark, git push — behind a synchronous adapter surface. |
 | `crates/zellij_host` | Wraps the `zellij` CLI to host each worker in a named pane inside a long-lived headless `vdd-orchestrator` session, so a human can `zellij attach` and inspect a stuck worker live. |
@@ -49,10 +49,13 @@ The core loop works, is crash-safe, and self-hosts:
 - **Self-hosting demonstrated.** A real `claude` Implementer, orchestrator-driven, landed a change end-to-end on this repo's substrate (AC-11b). This test is `#[ignore]`d and gated behind `VETINARI_LIVE_CLAUDE=1` because a live agent is slow, nondeterministic, and spends API budget.
 - **Iteration-2 adversary loop landed.** The Adversary role, the `adversary-review` phase in the pump, and the N-consecutive-clean-rounds convergence detector are all in.
 
+Landing conflict-resolution and remote mode are in:
+
+- **Merger role.** On a local-mode rebase conflict the orchestrator moves the issue to a crash-safe `merging` substate, spawns a Merger worker (a jj-resolve-focused allowlist with a `.jj/`+`.git/` RW mount) to resolve the conflict, re-runs static QA on the merged tree, and retries the fast-forward landing **once**. If the Merger fails, QA fails, or the tree still conflicts, the issue parks at `phase:awaiting-human-merge`.
+- **Remote-mode landing.** When crosslink's `tracker_remote` is set, landing pushes a `vdd/<id>-<slug>` branch and opens a GitHub PR via the `octocrab` library (not a `gh` subprocess) → `phase:pr-open`. A crash-safe substate machine (`push_started → push_done_pr_pending → pr_created`) is wired into recovery, so a crash mid-landing resumes rather than quarantining, and PR creation is idempotent (a resume adopts an existing head PR instead of double-opening). The local fast-forward path remains the default, selected when `tracker_remote` is unset. PR creation is exercised in tests through a seam — deterministic runs push to a local bare origin with a fake PR-opener — so the live GitHub path, while real, is not covered by a live CI test.
+
 Known / remaining:
 
-- **Merger role** for rebase/push conflicts (spawn a conflict-resolver worker, re-run QA on the merged tree, retry landing once, else stop at `phase:awaiting-human-merge`) is specified but not yet built.
-- **Remote-mode landing** (`jj git push` + `gh pr create` → `phase:pr-open`) is designed but the local fast-forward path is what ships today.
 - **Worker isolation is accept-trust today.** A live worker has network access and credentials; the sandbox mount matrix is a guardrail, not a containment boundary. Protection for `main` is orchestrator-side: static QA + adversary review + a fast-forward-guarded landing that runs entirely outside any sandbox.
 
 ## Build & run
