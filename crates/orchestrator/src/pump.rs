@@ -121,7 +121,7 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use miette::Diagnostic;
@@ -139,10 +139,10 @@ use crate::landing::{
     branch_name, land_local, land_remote, retry_land_after_merge, LandingOutcome, OctocrabPrOpener,
     RemoteLanding, MAIN_BOOKMARK,
 };
-use crate::qa::{QaGate, QaOutcome};
+use crate::qa::{QaGate, QaOutcome, QaSandbox};
 use crate::roles::adversary::{render_inputs, RenderParams, RenderedAdversaryInputs};
 use crate::roles::merger::{render_conflict_input, ConflictContext};
-use crate::spawn::{SpawnOutcome, Spawner, WorkerCommand};
+use crate::spawn::{SandboxHost, SpawnOutcome, Spawner, WorkerCommand};
 use crate::state::{ActiveWorkerRow, EventKind, IssueRow, Phase, StateDb, WorkerRole};
 use crate::workspace::{WorkspaceManager, WorkspaceName};
 
@@ -364,6 +364,33 @@ impl BuildPump {
     /// The poll interval between ticks (REQ-13).
     pub fn poll_interval(&self) -> Duration {
         self.config.poll_interval()
+    }
+
+    /// Build the **sandboxed** static QA gate for `workspace` (P0: closes T1).
+    ///
+    /// The gate runs the worker's `static_qa.sh` — which compiles and runs
+    /// worker-authored `build.rs`/test code — inside a hermetic, network-denied
+    /// bwrap namespace, never bare on the host. The sandbox reuses the exact
+    /// machinery the pump's [`Spawner`] already owns: the spawner's verified
+    /// [`crate::spawn::SandboxPin`] and a [`SandboxHost`] resolved from it. The
+    /// host is resolved here (once, at gate construction) rather than deep inside
+    /// [`QaGate::run`]; the store-path pin is re-verified fail-closed inside
+    /// `run` immediately before the child spawns.
+    ///
+    /// Resolving the host can fail on a misconfigured environment (`$HOME` unset)
+    /// — that is a host/orchestrator error, surfaced as [`PumpError::Spawn`],
+    /// never a silent unsandboxed fallback. QA uses
+    /// [`SandboxHost::resolve_for_qa`], which resolves only the fields
+    /// [`SandboxHost::qa_mounts`] consumes (no `nix-shell`, no creds overlay), so
+    /// the gate does not inherit the worker path's `nix-shell` dependency for a
+    /// binary QA never invokes.
+    fn qa_gate(&self, workspace: &Path) -> Result<QaGate, PumpError> {
+        let pin = self.spawner.pin().clone();
+        let host = SandboxHost::resolve_for_qa(&pin)?;
+        Ok(
+            QaGate::new(workspace, QaSandbox::new(host, pin))
+                .with_timeout(self.config.qa_timeout()),
+        )
     }
 
     /// One pump tick: **ingest** new graphed work into `state.db` (the only
@@ -689,7 +716,7 @@ impl BuildPump {
             Phase::QaGate,
             "worker committed; running QA",
         )?;
-        let qa = QaGate::new(prepared.path()).with_timeout(self.config.qa_timeout());
+        let qa = self.qa_gate(prepared.path())?;
         match qa.run() {
             Ok(QaOutcome::Pass) => {
                 emit(
@@ -1394,7 +1421,7 @@ impl BuildPump {
 
         // (5) Re-run static QA on the merged tree (REQ-19, AC-21). A fail/poison
         // is a Merger failure — no retry, park.
-        let qa = QaGate::new(prepared.path()).with_timeout(self.config.qa_timeout());
+        let qa = self.qa_gate(prepared.path())?;
         match qa.run() {
             Ok(QaOutcome::Pass) => {
                 emit(

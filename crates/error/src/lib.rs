@@ -335,6 +335,28 @@ pub enum QaError {
         message: String,
     },
 
+    /// The QA gate could not stand up its bwrap sandbox: the store-path pin
+    /// failed to verify — `bwrap` is missing from `PATH`, the pin is unset, or the
+    /// resolved `bwrap` is not the pinned store path (the same [`SpawnError`] the
+    /// worker spawn path raises) — or the sandbox host descriptor could not be
+    /// resolved (e.g. `$HOME` unset). The QA gate runs the worker's
+    /// `static_qa.sh` (which compiles and runs worker-authored
+    /// `build.rs`/proc-macro/test code) **inside** a hermetic, network-denied
+    /// bwrap sandbox; if that sandbox cannot be assembled the gate refuses to run
+    /// the script rather than fall back to executing it unsandboxed on the host.
+    /// That is an environment/host misconfiguration, not a QA tool saying no, so
+    /// it is poison → `phase:orchestrator-error`, never a blocker.
+    #[error("QA sandbox unavailable: {reason}")]
+    #[diagnostic(
+        code(vetinari::qa::sandbox_unavailable),
+        help("The QA gate refuses to run worker code outside the sandbox. Ensure `bwrap` is on PATH and matches VDD_BWRAP_PIN, and that HOME is set. This is a host/environment misconfiguration, not a failed check.")
+    )]
+    SandboxUnavailable {
+        /// Why the sandbox could not be stood up (the underlying spawn error,
+        /// rendered), for the human who inspects the poison state.
+        reason: String,
+    },
+
     /// The QA script did not finish within the gate's timeout. A wedged script
     /// (a hung `cargo`, a deadlocked test) must not brick the headless pump —
     /// no heartbeat watchdog covers the orchestrator-run gate — so the gate

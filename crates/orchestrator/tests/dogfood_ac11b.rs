@@ -36,7 +36,7 @@ use common::{build_target_fixture, fake_adversary_clean, fake_implementer, uniqu
 use orchestrator::config::{OrchestratorConfig, WorkerConfig, WorkerKind};
 use orchestrator::events::{read_all, EventLog, ORCHESTRATOR_DIR};
 use orchestrator::pump::{BuildPump, IssueOutcome};
-use orchestrator::spawn::{SandboxPin, Spawner};
+use orchestrator::spawn::Spawner;
 use orchestrator::state::{EventKind, Phase, StateDb};
 use orchestrator::workspace::WorkspaceManager;
 use vetinari_crosslink_api::CrosslinkRepo;
@@ -194,8 +194,10 @@ fn ac11b_direct_dogfood_lands_on_shell_nix_target() {
     let crosslink = CrosslinkRepo::open(&fx.root).expect("open crosslink repo");
 
     let (session, _guard) = unique_session("ac11b-direct");
-    // The Direct worker path skips the pin guard, so the pin value is unused.
-    let spawner = Spawner::new(session, &fx.root, SandboxPin::new("unused-direct"));
+    // The Direct worker path skips the spawn pin guard, but the pump's sandboxed
+    // static QA gate verifies this pin before running the fixture's
+    // `static_qa.sh` inside bwrap (P0), so it must be a real, verifiable pin.
+    let spawner = Spawner::new(session, &fx.root, common::bwrap_pin());
 
     let config = OrchestratorConfig {
         worker: WorkerConfig {

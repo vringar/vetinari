@@ -35,7 +35,7 @@ use orchestrator::events::{EventLog, ORCHESTRATOR_DIR};
 use orchestrator::landing::LandingOutcome;
 use orchestrator::pump::{BuildPump, IssueOutcome};
 use orchestrator::recovery::{recover, RecoveryAction};
-use orchestrator::spawn::{SandboxPin, Spawner};
+use orchestrator::spawn::Spawner;
 use orchestrator::state::{
     ActiveWorkerRow, IssueRow, Phase, PhaseSubstate, PostedArtifact, StateDb, WorkerRole,
 };
@@ -116,7 +116,7 @@ fn build_pump(
 ) -> (BuildPump, SessionGuard) {
     let crosslink = CrosslinkRepo::open(&fx.root).expect("open crosslink");
     let (session, guard) = unique_session("recovery");
-    let spawner = Spawner::new(session, &fx.root, SandboxPin::new("unused-direct"));
+    let spawner = Spawner::new(session, &fx.root, common::bwrap_pin());
     let config = OrchestratorConfig {
         worker: WorkerConfig {
             argv: vec![

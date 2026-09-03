@@ -14,8 +14,36 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use orchestrator::spawn::SandboxPin;
 use tempfile::TempDir;
 use vetinari_zellij_host::{session_ensure, SessionHandle};
+
+/// The `bwrap` store-path pin the pump's **sandboxed** static QA gate verifies
+/// before running a fixture's `static_qa.sh` (P0: QA runs worker code inside a
+/// bwrap sandbox, never bare on the host). The pump-driving harnesses seed their
+/// [`orchestrator::spawn::Spawner`] with this so QA can stand up its sandbox —
+/// the old `SandboxPin::new("unused-direct")` was fine when the Direct spawn path
+/// skipped pin verification, but QA now needs a *real* pin.
+///
+/// Uses the dev shell's `VDD_BWRAP_PIN` when set, else the first `bwrap` on
+/// `PATH`. Like the `spawn_dispatch.rs` isolation tests, these fixture-driving
+/// tests require a live `bwrap` (run them from the nix dev shell); without one,
+/// QA reports `SandboxUnavailable` poison and the harness's expectations fail.
+pub fn bwrap_pin() -> SandboxPin {
+    if let Some(pin) = std::env::var("VDD_BWRAP_PIN")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        return SandboxPin::new(pin);
+    }
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let found = std::env::split_paths(&path_env)
+        .map(|d| d.join("bwrap"))
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "bwrap".to_owned());
+    SandboxPin::new(found)
+}
 
 /// Fixed path of the cross-process zellij test lockfile, under the system temp
 /// dir so every test binary for this user resolves the same file.

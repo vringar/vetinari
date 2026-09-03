@@ -22,7 +22,7 @@ use common::{
 };
 use orchestrator::config::{OrchestratorConfig, WorkerConfig};
 use orchestrator::pump::{BuildPump, IssueOutcome, MAX_QA_RETRIES};
-use orchestrator::spawn::{SandboxPin, Spawner};
+use orchestrator::spawn::Spawner;
 use orchestrator::state::{IssueRow, Phase, StateDb};
 use orchestrator::workspace::WorkspaceManager;
 use vetinari_crosslink_api::CrosslinkRepo;
@@ -79,7 +79,7 @@ fn qa_failure_is_redriven_and_poisons_at_bound() {
     let crosslink = CrosslinkRepo::open(&fx.root).expect("open crosslink");
 
     let (session, _guard) = unique_session("qa-retry");
-    let spawner = Spawner::new(session, &fx.root, SandboxPin::new("unused-direct"));
+    let spawner = Spawner::new(session, &fx.root, common::bwrap_pin());
 
     let pump = BuildPump::new(
         config_for(&fake_implementer_qa_fail()),
@@ -139,7 +139,7 @@ fn empty_commit_is_refused_and_does_not_merge() {
     let crosslink = CrosslinkRepo::open(&fx.root).expect("open crosslink");
 
     let (session, _guard) = unique_session("empty-commit");
-    let spawner = Spawner::new(session, &fx.root, SandboxPin::new("unused-direct"));
+    let spawner = Spawner::new(session, &fx.root, common::bwrap_pin());
 
     let pump = BuildPump::new(
         config_for(&fake_implementer_empty()),
@@ -215,7 +215,7 @@ fn state_db_implementing_is_driven_without_graphed_label() {
     let crosslink = CrosslinkRepo::open(&fx.root).expect("open crosslink");
 
     let (session, _guard) = unique_session("authority");
-    let spawner = Spawner::new(session, &fx.root, SandboxPin::new("unused-direct"));
+    let spawner = Spawner::new(session, &fx.root, common::bwrap_pin());
 
     let pump = BuildPump::new(
         config_for(&fake_implementer()),

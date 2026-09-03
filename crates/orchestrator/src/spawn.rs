@@ -516,7 +516,13 @@ impl MountMatrix {
 /// The returned vector is `["env", "-i", "K=V", …]`, to be prepended to the
 /// worker's own argv. An allowlisted name that is unset in our environment is
 /// simply omitted (nothing to forward).
-fn scrub_env_prefix(extra: &[(String, String)]) -> Vec<String> {
+///
+/// `pub(crate)` so the static QA gate ([`crate::qa`]) reuses the exact same
+/// env-scrub the worker spawn path uses — the QA child is wrapped in the same
+/// `env -i <allowlist>` prefix, so `GH_TOKEN`/the pin/API keys never reach
+/// worker-authored `build.rs`/test code under grading. The logic lives here and
+/// is shared, never duplicated.
+pub(crate) fn scrub_env_prefix(extra: &[(String, String)]) -> Vec<String> {
     let mut prefix = vec!["env".to_owned(), "-i".to_owned()];
     for &name in WORKER_ENV_ALLOWLIST {
         if let Ok(value) = std::env::var(name) {
@@ -938,12 +944,7 @@ impl SandboxHost {
     /// cannot be located.
     pub fn resolve(pin: &SandboxPin) -> Result<Self, SpawnError> {
         let path_env = std::env::var("PATH").unwrap_or_default();
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|h| !h.as_os_str().is_empty())
-            .ok_or_else(|| SpawnError::BwrapMissing {
-                searched: "HOME".to_owned(),
-            })?;
+        let (home, sh, ro_binds) = Self::resolve_home_sh_ro(&path_env)?;
 
         let nix_shell = match std::env::var_os(NIX_SHELL_PIN_ENV) {
             Some(v) if !v.is_empty() => PathBuf::from(v),
@@ -953,23 +954,6 @@ impl SandboxHost {
                 }
             })?,
         };
-
-        // `/bin/sh` backing shell: prefer the profile's bash, else any bash on
-        // PATH, else fall back to the literal name (bwrap will error clearly if
-        // it truly cannot be resolved).
-        let sh = home
-            .join(".nix-profile/bin/bash")
-            .canonicalize()
-            .ok()
-            .or_else(|| resolve_on_path("bash", &path_env))
-            .unwrap_or_else(|| PathBuf::from("bash"));
-
-        let ro_candidates = [
-            home.join(".nix-profile"),
-            home.join(".local/state/nix"),
-            home.join(".config/git"),
-            home.join(".config/jj"),
-        ];
 
         // Derive the claude config-dir exposure + forward from CLAUDE_CONFIG_DIR
         // (finding #2/#3): the forwarded var and the overlaid dir come from the
@@ -981,10 +965,76 @@ impl SandboxHost {
             nix_shell,
             sh,
             home,
-            ro_binds: ro_candidates.into_iter().filter(|p| p.exists()).collect(),
+            ro_binds,
             config_overlays,
             forwarded_config_dir,
         })
+    }
+
+    /// Resolve a host descriptor for the **static QA gate only** — the subset
+    /// [`qa_mounts`](SandboxHost::qa_mounts) actually consumes (`home`, `sh`,
+    /// `ro_binds`) plus the `bwrap` pin, and NOTHING ELSE.
+    ///
+    /// [`resolve`](SandboxHost::resolve) additionally locates `nix-shell` (failing
+    /// closed if it is absent) and stats the operator's `claude` config dirs to
+    /// build the write-discarding creds overlay. `qa_mounts` uses *neither*: QA
+    /// never enters the dev shell and deliberately drops the creds overlay (it
+    /// grades worker-authored code and must not expose operator credentials to
+    /// it). Requiring `nix-shell` and resolving the claude config on the QA path
+    /// would be an irrelevant hard dependency — a host with a working pinned
+    /// `bwrap` but no `nix-shell` on PATH would poison every issue at gate
+    /// construction for a binary QA never invokes. So this constructor resolves
+    /// only the QA-relevant fields; `nix_shell`/`config_overlays`/
+    /// `forwarded_config_dir` are left empty because `qa_mounts` never reads them.
+    pub fn resolve_for_qa(pin: &SandboxPin) -> Result<Self, SpawnError> {
+        let path_env = std::env::var("PATH").unwrap_or_default();
+        let (home, sh, ro_binds) = Self::resolve_home_sh_ro(&path_env)?;
+
+        Ok(SandboxHost {
+            bwrap: PathBuf::from(pin.expected()),
+            // Unused by `qa_mounts` (QA never enters the dev shell). Empty rather
+            // than resolved so the QA path carries no `nix-shell` dependency.
+            nix_shell: PathBuf::new(),
+            sh,
+            home,
+            ro_binds,
+            // Dropped on purpose (`qa_mounts` point 2): no operator creds overlay.
+            config_overlays: Vec::new(),
+            forwarded_config_dir: None,
+        })
+    }
+
+    /// Resolve the fields shared by [`resolve`](SandboxHost::resolve) and
+    /// [`resolve_for_qa`](SandboxHost::resolve_for_qa): the host `$HOME` (failing
+    /// closed if unset — the sandbox cannot be assembled without a home to
+    /// shadow), the `/bin/sh` backing shell, and the existing RO config binds.
+    fn resolve_home_sh_ro(path_env: &str) -> Result<(PathBuf, PathBuf, Vec<PathBuf>), SpawnError> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| !h.as_os_str().is_empty())
+            .ok_or_else(|| SpawnError::BwrapMissing {
+                searched: "HOME".to_owned(),
+            })?;
+
+        // `/bin/sh` backing shell: prefer the profile's bash, else any bash on
+        // PATH, else fall back to the literal name (bwrap will error clearly if
+        // it truly cannot be resolved).
+        let sh = home
+            .join(".nix-profile/bin/bash")
+            .canonicalize()
+            .ok()
+            .or_else(|| resolve_on_path("bash", path_env))
+            .unwrap_or_else(|| PathBuf::from("bash"));
+
+        let ro_candidates = [
+            home.join(".nix-profile"),
+            home.join(".local/state/nix"),
+            home.join(".config/git"),
+            home.join(".config/jj"),
+        ];
+        let ro_binds = ro_candidates.into_iter().filter(|p| p.exists()).collect();
+
+        Ok((home, sh, ro_binds))
     }
 
     /// The base bwrap mount policy — the essential subset of `claude-sandbox`'s
@@ -1079,6 +1129,102 @@ impl SandboxHost {
             sh,
             "--share-net".to_owned(),
             "--unshare-pid".to_owned(),
+            "--chdir".to_owned(),
+            workspace.to_string_lossy().into_owned(),
+        ]);
+        args
+    }
+
+    /// The **hermetic** bwrap mount policy for the static QA gate (P0 threat-model
+    /// fix, closes T1). Rendered as argv tokens, exactly like [`base_mounts`], but
+    /// deliberately diverging on the three points that make QA a *grading* sandbox
+    /// rather than a live-`claude` sandbox:
+    ///
+    /// 1. **Network denied — `--unshare-net`, never `--share-net`.** bwrap shares
+    ///    the host network namespace unless it is explicitly unshared; the worker
+    ///    path never unshares net (a live `claude` needs the Anthropic API), so QA
+    ///    must *actively* add `--unshare-net`. The QA script is `cargo test
+    ///    --locked --offline` — already hermetic — so denying egress removes the
+    ///    exfiltration channel worker-authored `build.rs`/test code would
+    ///    otherwise have.
+    /// 2. **No Claude-creds overlay.** [`base_mounts`] exposes the operator's
+    ///    `claude` config dirs write-discarding so a live worker can authenticate;
+    ///    QA never runs `claude`, so exposing operator credentials to the
+    ///    worker-authored code *under test* is exactly the leak this gate closes.
+    ///    The `config_overlays` are omitted here.
+    /// 3. **Workspace bound RW here.** The worker path appends the workspace via
+    ///    the per-role [`MountMatrix`]; QA does not use the matrix (it needs no
+    ///    repository `.jj/`/`.git/`/`.crosslink/`), so it binds *only* the
+    ///    workspace RW — `cargo` must write `target/` — and nothing else of the
+    ///    repository.
+    ///
+    /// Everything else matches [`base_mounts`] and shares the same constants: the
+    /// tmpfs HOME, `/nix` RO, `/etc` RO, `/proc`, `/dev`, `/run`+`/tmp` tmpfs, the
+    /// `/bin/sh` symlink, the RO config binds ([`ro_binds`] — kept: the nix-profile
+    /// bind is load-bearing so `PATH` resolves `bash`/`cargo` inside the namespace,
+    /// and the git/jj config binds are harmless RO), `--setenv SHELL`,
+    /// `--unshare-pid`, and `--chdir <workspace>`.
+    ///
+    /// [`base_mounts`]: SandboxHost::base_mounts
+    /// [`ro_binds`]: SandboxHost#structfield.ro_binds
+    pub fn qa_mounts(&self, workspace: &Path) -> Vec<String> {
+        let home = self.home.to_string_lossy().into_owned();
+        let sh = self.sh.to_string_lossy().into_owned();
+        let mut args = vec![
+            "--tmpfs".to_owned(),
+            home,
+            "--ro-bind".to_owned(),
+            "/nix".to_owned(),
+            "/nix".to_owned(),
+            "--ro-bind".to_owned(),
+            "/etc".to_owned(),
+            "/etc".to_owned(),
+            "--proc".to_owned(),
+            "/proc".to_owned(),
+            "--dev".to_owned(),
+            "/dev".to_owned(),
+            "--tmpfs".to_owned(),
+            "/run".to_owned(),
+            "--tmpfs".to_owned(),
+            "/tmp".to_owned(),
+            "--symlink".to_owned(),
+            sh.clone(),
+            "/bin/sh".to_owned(),
+        ];
+        for ro in &self.ro_binds {
+            Mount {
+                source: ro.clone(),
+                mode: MountMode::ReadOnly,
+            }
+            .render_into(&mut args);
+        }
+        // NO `config_overlays` here (point 2): QA must not expose operator Claude
+        // credentials to the worker-authored code it grades.
+        //
+        // The workspace, bound RW so `cargo` can write `target/` (point 3). This
+        // is the ONLY repository path QA sees — no `<root>/.jj`, `.git`, or
+        // `.crosslink` (QA needs none of them).
+        Mount {
+            source: workspace.to_path_buf(),
+            mode: MountMode::ReadWrite,
+        }
+        .render_into(&mut args);
+        args.extend([
+            "--setenv".to_owned(),
+            "SHELL".to_owned(),
+            sh,
+            // Hermetic: deny host network entirely (point 1). The fixture QA is
+            // `--offline`, so this severs egress without breaking the check.
+            "--unshare-net".to_owned(),
+            "--unshare-pid".to_owned(),
+            // Reap the whole sandbox if the orchestrator dies without running the
+            // explicit kill path: bwrap sends SIGKILL to the sandbox (and its
+            // pid-ns, tearing down `cargo`/`rustc`) when its parent exits. This
+            // COMPLEMENTS — does not replace — the timeout-kill in `QaGate::run`,
+            // which is still what reaps a *running* gate on a hang; this only
+            // covers the orchestrator-crashed-mid-run case that the kill path
+            // never reaches.
+            "--die-with-parent".to_owned(),
             "--chdir".to_owned(),
             workspace.to_string_lossy().into_owned(),
         ]);

@@ -26,7 +26,7 @@ use common::{build_fixture, fake_adversary_clean, fake_implementer, unique_sessi
 use orchestrator::config::{OrchestratorConfig, WorkerConfig};
 use orchestrator::events::{read_all, EventLog, ORCHESTRATOR_DIR};
 use orchestrator::pump::{BuildPump, IssueOutcome};
-use orchestrator::spawn::{SandboxPin, Spawner};
+use orchestrator::spawn::Spawner;
 use orchestrator::state::{EventKind, Phase, StateDb};
 use orchestrator::workspace::WorkspaceManager;
 use vetinari_crosslink_api::CrosslinkRepo;
@@ -75,7 +75,7 @@ fn ac11a_dogfood_drives_graphed_to_merged_headless() {
 
     let (session, _guard) = unique_session("dogfood");
     // The Direct worker path skips the pin guard, so the pin value is unused.
-    let spawner = Spawner::new(session, &fx.root, SandboxPin::new("unused-direct"));
+    let spawner = Spawner::new(session, &fx.root, common::bwrap_pin());
 
     // Config: dispatch the committed fake implementer as the Direct worker. Its
     // absolute path passes through `worker_argv` untouched (the default relative

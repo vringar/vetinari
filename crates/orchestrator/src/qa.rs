@@ -8,6 +8,60 @@
 //! [`QaOutcome::Fail`] into a `--kind blocker` comment and re-spawning the
 //! Implementer is the pump's job (S3), not this module's.
 //!
+//! # The script runs INSIDE a hermetic bwrap sandbox (P0 threat-model fix)
+//!
+//! `static_qa.sh` is *worker-controlled*: it is a committed file in the worker's
+//! read-write workspace, and its canonical body (`cargo test --locked --offline`)
+//! compiles and runs worker-authored `build.rs`, proc-macros, and `#[test]`
+//! code. Running it directly on the host would be arbitrary code execution on
+//! the control plane, with the orchestrator's full environment (incl.
+//! `GH_TOKEN`) and network — the single most dangerous gap in the threat model
+//! (T1). So the gate runs the script **inside the same bwrap sandbox machinery
+//! the worker spawn path uses** ([`SandboxHost::qa_mounts`]), wrapped in the
+//! identical `env -i <allowlist>` scrub ([`crate::spawn::scrub_env_prefix`]):
+//!
+//! - **env scrubbed** — the child starts from `env -i PATH/HOME/TERM`, so
+//!   `GH_TOKEN`, API keys, and the `bwrap` pin are never visible to the code
+//!   under grading.
+//! - **network denied** — `qa_mounts` adds `--unshare-net` (the worker path
+//!   shares net for the Anthropic API; QA does not), so a malicious `build.rs`
+//!   cannot exfiltrate. The canonical script is `--offline`, so this is
+//!   legitimately hermetic.
+//! - **host FS denied** — only `/nix` (RO), `/etc` (RO), the RO nix/git/jj
+//!   config binds, and the workspace (RW, for `target/`) are mounted; the
+//!   operator's HOME is a fresh tmpfs and the operator's Claude credentials are
+//!   *not* overlaid (unlike the worker sandbox).
+//!
+//! The store-path `bwrap` pin ([`SandboxPin::verify`]) is checked fail-closed
+//! *before* the child spawns. If it fails the gate refuses to run the script at
+//! all (returning [`QaError::SandboxUnavailable`] poison) rather than fall back
+//! to executing worker code unsandboxed on the host.
+//!
+//! ## What this closes — and the one axis it does NOT (scope honesty)
+//!
+//! Two *different* axes meet at `static_qa.sh`, and this P0 addresses exactly one:
+//!
+//! - **Execution axis (RCE / T1) — CLOSED here.** The concern is worker-authored
+//!   `build.rs`/proc-macro/test code executing on the control plane with the
+//!   orchestrator's env, network, and creds. Running that code in the box above
+//!   is strictly *safer* than the status quo: the QA sandbox is **more**
+//!   restrictive than the worker's own spawn sandbox (net denied, no creds
+//!   overlay, no repo `.jj`/`.git`), so executing the worker's script inside it
+//!   grants an attacker nothing they did not already have during implementation.
+//!   That is the RCE gap, and it is shut.
+//! - **Verdict-integrity axis — a KNOWN RESIDUAL, explicitly OUT of scope.**
+//!   `static_qa.sh` is worker-authored and lives in the worker's RW workspace, so
+//!   a malicious or lazy worker can rewrite it to `exit 0` and its QA gate passes
+//!   unconditionally — the quality gate is neutered. The hermetic box does
+//!   nothing about this and *cannot*: sandboxing execution is orthogonal to
+//!   trusting the grader. Do **not** read "the script runs in a box now" as
+//!   closing the grader-rewrite vector; it does not. The fix for that axis is to
+//!   grade the committed tree with an **orchestrator-owned** script rather than
+//!   the worker's copy (tracked as a P1), which this P0 deliberately does not
+//!   attempt. Naming it here so the two axes are never conflated.
+//!
+//! [`SandboxPin::verify`]: crate::spawn::SandboxPin::verify
+//!
 //! # Verdict vs. poison — the load-bearing distinction
 //!
 //! There are two failure axes, and conflating them is a correctness bug:
@@ -42,6 +96,48 @@
 //! | any other non-zero    | `Ok(Fail { exit_code, .. })` — blocker     |
 //! | killed by signal      | `Err(Killed)` — poison                     |
 //! | exceeded the timeout  | `Err(TimedOut)` — poison                   |
+//! | sandbox unavailable   | `Err(SandboxUnavailable)` — poison         |
+//!
+//! The `SandboxUnavailable` row is raised in **two** places: *before* the child
+//! spawns, when the `bwrap` store-path pin fails to verify (misconfigured
+//! host/environment); and *after* the run, when the sandbox-handoff sentinel is
+//! missing (see below). Both are anomalies the Implementer cannot fix, so they
+//! are poison like every other `Err`.
+//!
+//! ### The exit-code channel is muxed — the sentinel handshake de-muxes it
+//!
+//! Wrapping the child as `env -i … bwrap … -- bash -c '…' <script>` does **not**
+//! leave the exit code an untouched passthrough, and pretending it does is a
+//! correctness bug. `bwrap` reports its *own* setup/exec failures — a missing
+//! bind source, an unavailable net/user namespace on a hardened or nested host,
+//! an unresolvable `bash` — as **exit 1**, the *same* code a faithful child
+//! `exit 1` produces. Classifying that muxed 1 blindly would turn "the sandbox
+//! never stood up" into a phantom `Fail { exit_code: 1 }` blocker, looping the
+//! worker forever on a test failure that never happened. (The pin check does not
+//! save us: it verifies `bwrap`'s binary *identity*, not this host's runtime
+//! ability to create the namespaces `qa_mounts` demands.)
+//!
+//! So the gate de-muxes the channel with a **handshake sentinel**. The inner
+//! command is `bash -c 'printf "%s\n" "<SENTINEL>"; exec bash "$0"' <script>`:
+//! `bash` prints a fixed sentinel line to stdout *first*, then `exec`s
+//! `bash <script>`. Because `exec` replaces the shell in place, the child's exit
+//! code is **still the script's** — so once the sentinel is present, exit-code
+//! classification is genuinely identical to the pre-sandbox behavior. After the
+//! run, [`QaGate::run`] checks the *physical first line* of stdout:
+//!
+//! - **sentinel absent** ⇒ `bwrap` never handed off to `bash` (its own
+//!   setup/exec failure) ⇒ [`QaError::SandboxUnavailable`] poison, naming the
+//!   likely cause. The muxed exit 1 is never mistaken for a verdict.
+//! - **sentinel present** ⇒ the sandbox handed off; strip that first line, then
+//!   classify the exit code EXACTLY as below (`0`→Pass / `101`→Fail /
+//!   `126`/`127`→poison / signal→Killed / timeout→TimedOut).
+//!
+//! This is **infrastructure detection, not verdict parsing**: it answers only
+//! "did the sandbox hand off to bash", never "did QA pass". The module invariant
+//! is preserved — the *verdict* is still derived purely from the exit code, never
+//! from scanning output for a magic string. Printing the sentinel *before*
+//! `exec` makes it always line 1, so a script that itself emits the sentinel text
+//! can only do so on a later line and can never be confused for the handshake.
 //!
 //! `126` is bash's "found but cannot execute" and `127` is "command not found"
 //! *inside* the script (e.g. `cargo` off PATH) — both mean the gate never ran
@@ -54,7 +150,10 @@
 //! stdout/stderr is captured *only* to fill a [`Fail`]'s [`OutputTail`] for the
 //! blocker body (and a poison variant's inspection message) — it is never
 //! scanned for a magic pass/fail string (REQ-9: the orchestrator does not trust
-//! self-assessments).
+//! self-assessments). The one stdout inspection — the first-line handshake
+//! sentinel — is *infrastructure* detection ("did bwrap hand off to bash"), not
+//! verdict parsing: it can only turn a broken sandbox into poison, never a
+//! script's output into a Pass/Fail.
 //!
 //! [`Fail`]: QaOutcome::Fail
 //!
@@ -62,22 +161,30 @@
 //!
 //! Running `.orchestrator/static_qa.sh` is the *sanctioned* AC-24 exception
 //! (REQ-1a exception (b)): a user-supplied script is a shell contract, so it is
-//! run via `bash <path>`. This is the one place the orchestrator executes a
-//! user script; it is **not** a forbidden shell-out. No `jj`/`git`/`gh`/
-//! `crosslink`/`zellij` subprocess is constructed here — the no-shell-out lint
-//! bans exactly those names, and `bash` is not among them.
+//! run via `bash <path>` — now `env -i … bwrap … -- bash -c '<handshake>; exec
+//! bash "$0"' <path>` (the handshake prints the sandbox sentinel, then `exec`s
+//! the script; see "The exit-code channel is muxed"). This is the one place the
+//! orchestrator executes a user script; it is **not** a forbidden shell-out. No
+//! `jj`/`git`/`gh`/`crosslink`/`zellij` subprocess is constructed here — the
+//! no-shell-out lint bans exactly those names, and neither `bwrap` nor `bash` is
+//! among them.
 //!
 //! # Known limitation: grandchild processes survive a kill
 //!
 //! On timeout the gate calls [`std::process::Child::kill`], which sends
-//! `SIGKILL` to the direct `bash` child only. Any grandchildren the script
-//! spawned (a `cargo` subprocess, its `rustc` invocations) are *not* reaped —
-//! killing a whole process group needs a `setpgid` via `pre_exec`, which is
-//! `unsafe` and this crate is `#![forbid(unsafe_code)]`. For the MVP this is
-//! acceptable: the orchestrator surfaces the hang as poison and stops
-//! advancing the issue regardless. Follow-up: adopt a small no-unsafe
-//! process-group helper (or the `wait-timeout` + `nix`/`command-group` crates)
-//! to reap the tree.
+//! `SIGKILL` to the direct child only. Any grandchildren the script spawned (a
+//! `cargo` subprocess, its `rustc` invocations) are *not* reaped by the signal
+//! itself — killing a whole process group needs a `setpgid` via `pre_exec`,
+//! which is `unsafe` and this crate is `#![forbid(unsafe_code)]`.
+//!
+//! Sandboxing **blunts** this: the direct child is now `bwrap`, and
+//! [`SandboxHost::qa_mounts`] runs it under `--unshare-pid`, so `bash`, `cargo`,
+//! and `rustc` all live in a fresh PID namespace whose init is that `bwrap`.
+//! When bwrap (PID 1 of that namespace) dies to our `SIGKILL`, the kernel tears
+//! down the entire namespace — the grandchildren cannot survive their pid-ns
+//! init. This improves the pre-sandbox "grandchildren survive" limitation for
+//! free; the existing kill/reap loop is retained unchanged (it is still correct
+//! and still what reaps the direct child).
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -87,10 +194,24 @@ use std::time::{Duration, Instant};
 
 use vetinari_error::QaError;
 
+use crate::spawn::{scrub_env_prefix, SandboxHost, SandboxPin};
+
 /// The script the gate runs, relative to the workspace root (REQ-9). Committed
 /// and whitelisted in the project's `.gitignore` (see the fixture). Kept as a
 /// constant so the layout in `.design/vdd-orchestrator.md` and the code agree.
 pub const STATIC_QA_SCRIPT: &str = ".orchestrator/static_qa.sh";
+
+/// The **sandbox-handoff sentinel** the inner `bash` prints to stdout *before*
+/// `exec`ing the QA script. Its presence as the physical first line of the
+/// child's stdout is the proof that `bwrap` actually stood the sandbox up and
+/// handed control to `bash` — see [`QaGate::run`] and the module's
+/// "Exit-code classification" docs for why this is load-bearing.
+///
+/// A fixed, deliberately unlikely constant: a real `static_qa.sh` never prints
+/// this, and even if it tried, our `printf` runs *first* (before `exec`), so the
+/// sentinel is always line 1 and a script's own output can only ever appear on a
+/// later line.
+const SANDBOX_HANDOFF_SENTINEL: &str = "__VDD_QA_SANDBOX_HANDOFF_OK__";
 
 /// How many trailing lines of combined QA output a [`QaOutcome::Fail`] retains
 /// for the blocker body (REQ-9 / AC-7: "last ~50 lines"). A named budget rather
@@ -255,13 +376,38 @@ impl QaOutcome {
 // QaGate
 // ============================================================================
 
+/// The bwrap sandbox a [`QaGate`] runs its script inside: the resolved host
+/// descriptor (mount policy) plus the store-path pin verified before every run.
+///
+/// Bundling the two keeps [`QaGate::run`] from resolving a fresh host deep in
+/// its body — the pump, which already owns a [`SandboxPin`] via its spawner,
+/// resolves the [`SandboxHost`] once and threads it in at construction.
+#[derive(Debug, Clone)]
+pub struct QaSandbox {
+    /// The resolved sandbox host — supplies [`SandboxHost::qa_mounts`] and the
+    /// pinned `bwrap` store path.
+    host: SandboxHost,
+    /// The store-path pin, verified fail-closed before each spawn.
+    pin: SandboxPin,
+}
+
+impl QaSandbox {
+    /// Bundle a resolved host with its pin.
+    pub fn new(host: SandboxHost, pin: SandboxPin) -> Self {
+        QaSandbox { host, pin }
+    }
+}
+
 /// Runs the project's static QA script against a worker's workspace and returns
 /// the orchestrator-owned verdict (REQ-9).
 ///
-/// Holds the workspace root and a timeout; [`run`](QaGate::run) resolves the
+/// Holds the workspace root, a timeout, and (in production) the bwrap
+/// [`QaSandbox`] the script is executed inside. [`run`](QaGate::run) resolves the
 /// script relative to the root and executes it with that root as the working
-/// directory, so the QA tools see exactly the tree the Implementer just
-/// committed, and kills the child if it exceeds the timeout.
+/// directory — inside the hermetic, network-denied sandbox — so the QA tools see
+/// exactly the tree the Implementer just committed while worker-authored
+/// `build.rs`/test code cannot reach the host, and kills the child if it exceeds
+/// the timeout.
 #[derive(Debug, Clone)]
 pub struct QaGate {
     /// The worker's workspace root — both the script's parent-of-parent and its
@@ -269,16 +415,43 @@ pub struct QaGate {
     workspace: PathBuf,
     /// Wall-clock budget before the gate kills the child (poison, not a Fail).
     timeout: Duration,
+    /// The bwrap sandbox the script runs inside. `Some` on the production path
+    /// ([`QaGate::new`]); `None` only on the in-crate unit-test seam
+    /// ([`QaGate::new_unsandboxed`]), which runs bare `bash` to exercise the
+    /// exit-code classification without requiring a live `bwrap`.
+    sandbox: Option<QaSandbox>,
 }
 
 impl QaGate {
-    /// A gate over the worker's workspace root `workspace`, using
+    /// A **sandboxed** gate over the worker's workspace root `workspace`, using
     /// [`DEFAULT_QA_TIMEOUT`]. The script is expected at
-    /// `<workspace>/.orchestrator/static_qa.sh`.
-    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+    /// `<workspace>/.orchestrator/static_qa.sh` and is executed inside `sandbox`
+    /// (a hermetic, network-denied bwrap namespace — see the module docs). The
+    /// production constructor: worker-authored QA code never runs on the host.
+    pub fn new(workspace: impl Into<PathBuf>, sandbox: QaSandbox) -> Self {
         QaGate {
             workspace: workspace.into(),
             timeout: DEFAULT_QA_TIMEOUT,
+            sandbox: Some(sandbox),
+        }
+    }
+
+    /// An **unsandboxed** gate that runs bare `bash <script>` on the host — the
+    /// in-crate test seam only.
+    ///
+    /// `pub(crate)` so it is unreachable from production callers (they must go
+    /// through [`QaGate::new`] and get the sandbox): the exit-code-classification
+    /// unit tests in this module test the *verdict* axis (Pass/Fail/poison from
+    /// exit codes, tail capture, timeout), which is orthogonal to sandboxing, so
+    /// they run on this bare path without needing a live `bwrap`. The security
+    /// property (env/net/FS isolation surviving the wrapping) is proved
+    /// separately by the bwrap-gated integration test in `tests/qa_gate.rs`.
+    #[cfg(test)]
+    pub(crate) fn new_unsandboxed(workspace: impl Into<PathBuf>) -> Self {
+        QaGate {
+            workspace: workspace.into(),
+            timeout: DEFAULT_QA_TIMEOUT,
+            sandbox: None,
         }
     }
 
@@ -297,11 +470,18 @@ impl QaGate {
 
     /// Run the static QA gate.
     ///
-    /// Executes `bash <workspace>/.orchestrator/static_qa.sh` with `<workspace>`
-    /// as the working directory, draining combined stdout+stderr into a
-    /// byte-bounded buffer (at most [`MAX_CAPTURE_BYTES`], tail kept), and
-    /// derives the verdict from the exit status per the classification table in
-    /// the module docs:
+    /// Executes the worker's `<workspace>/.orchestrator/static_qa.sh` **inside a
+    /// hermetic bwrap sandbox** — `env -i <allowlist> <pinned-bwrap>
+    /// <qa_mounts…> -- bash <script>` — with `<workspace>` as the (in-sandbox)
+    /// working directory, draining combined stdout+stderr into a byte-bounded
+    /// buffer (at most [`MAX_CAPTURE_BYTES`], tail kept). On the sandboxed path it
+    /// then checks the **sandbox-handoff sentinel** (module docs, "The exit-code
+    /// channel is muxed"): if the inner `bash` never printed it, `bwrap`'s own
+    /// setup/exec failure muxed into exit 1 rather than a script verdict, so the
+    /// run is [`QaError::SandboxUnavailable`] poison. Once the sentinel is present
+    /// (stripped from the captured stdout), the verdict is derived from the exit
+    /// status per the classification table — the `exec` in the handshake means the
+    /// child's exit code is the inner `bash <script>`'s, identical to pre-sandbox:
     ///
     /// - exit 0 → `Ok(`[`QaOutcome::Pass`]`)`,
     /// - exit 126/127 → [`QaError::ScriptItselfErrored`] (broken gate, poison),
@@ -312,8 +492,13 @@ impl QaGate {
     /// A broken gate is an `Err`, never a `Fail`:
     ///
     /// - the script does not exist → [`QaError::ScriptNotFound`],
-    /// - `bash` is missing or the path is unreachable so the child cannot even
-    ///   be spawned → [`QaError::ScriptUnspawnable`].
+    /// - `bash`/`bwrap` is missing or the path is unreachable so the child cannot
+    ///   even be spawned → [`QaError::ScriptUnspawnable`],
+    /// - the `bwrap` store-path pin fails to verify (missing/mismatched `bwrap`),
+    ///   or `bwrap` could not stand the sandbox up (handshake sentinel absent) →
+    ///   [`QaError::SandboxUnavailable`] (the pin is checked before spawning and
+    ///   the handshake after; either way the gate refuses to route a sandbox
+    ///   failure to a phantom `Fail`).
     ///
     /// All `Err` variants are poison → `phase:orchestrator-error` (the design's
     /// error-handling section), never a blocker.
@@ -327,13 +512,60 @@ impl QaGate {
             return Err(QaError::ScriptNotFound { path: script });
         }
 
+        // Assemble the child argv. On the production path this is the sandboxed
+        // form `env -i <allowlist> <bwrap> <qa_mounts…> -- bash <script>`: the
+        // `env -i` scrub and the hermetic bwrap namespace mean the
+        // worker-authored code the script compiles/runs (`build.rs`, tests) can
+        // reach neither the orchestrator's env (no `GH_TOKEN`) nor the network nor
+        // the host FS (P0, closes T1). The `bwrap` binary is the *pinned* store
+        // path (verified fail-closed just below), never a bare `bwrap`. The
+        // in-crate test seam (`new_unsandboxed`) runs bare `bash <script>` — the
+        // pre-sandbox behavior — to exercise exit-code classification without a
+        // live bwrap.
+        let argv = match &self.sandbox {
+            Some(sb) => {
+                // Store-path pin guard (REQ-4a / AC-19), BEFORE spawning: refuse
+                // to run worker code if the `bwrap` on PATH is not the exact
+                // pinned build. A pin failure is a host/environment misconfig, so
+                // it is POISON (SandboxUnavailable) — never a fallback to running
+                // the script unsandboxed on the host.
+                sb.pin
+                    .verify()
+                    .map_err(|source| QaError::SandboxUnavailable {
+                        reason: source.to_string(),
+                    })?;
+                let mut argv = scrub_env_prefix(&[]);
+                argv.push(sb.pin.expected().to_owned());
+                argv.extend(sb.host.qa_mounts(&self.workspace));
+                argv.push("--".to_owned());
+                // The sandbox-handoff handshake (see the module's "Exit-code
+                // classification" docs). The inner `bash -c` prints the sentinel
+                // to stdout FIRST, then `exec`s `bash <script>` — `exec` replaces
+                // the shell, so the child's exit code is STILL the script's
+                // (classification is genuinely preserved). The script path rides
+                // as `$0` so it stays a real argv entry, not string-interpolated.
+                // If bwrap's own setup/exec fails, the sentinel is never printed
+                // and `run` returns `SandboxUnavailable` instead of misreading
+                // bwrap's exit 1 as a QA `Fail`.
+                argv.push("bash".to_owned());
+                argv.push("-c".to_owned());
+                argv.push(format!(
+                    "printf '%s\\n' '{SANDBOX_HANDOFF_SENTINEL}'; exec bash \"$0\""
+                ));
+                argv.push(script.to_string_lossy().into_owned());
+                argv
+            }
+            None => vec!["bash".to_owned(), script.to_string_lossy().into_owned()],
+        };
+
         // The AC-24-sanctioned shell-out: a user-supplied script is a shell
         // contract (REQ-1a exception (b)). stdout and stderr are piped and
         // drained concurrently (below) so a runaway script can't deadlock on a
-        // full pipe buffer. Run with the workspace as cwd so QA tools see the
-        // tree the Implementer committed.
-        let mut child = Command::new("bash")
-            .arg(&script)
+        // full pipe buffer. `.current_dir` sets the *outer* cwd; inside the
+        // sandbox `--chdir <workspace>` (from `qa_mounts`) governs, so QA tools
+        // see the tree the Implementer committed either way.
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
             .current_dir(&self.workspace)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -401,7 +633,62 @@ impl QaGate {
             .and_then(|h| h.join().ok())
             .unwrap_or_default();
 
+        // Sandbox-handoff detection (infrastructure, NOT verdict parsing). On the
+        // production path bwrap muxes its OWN setup/exec failures (missing bind
+        // source, unavailable netns/userns, unresolvable `bash`) into exit 1 —
+        // the SAME channel a faithful child `exit 1` uses. So before classifying,
+        // require the handshake sentinel the inner `bash` prints *before* `exec`:
+        // if it is the physical first line of stdout, the sandbox handed off to
+        // bash and the exit code is genuinely the script's (strip the sentinel,
+        // then classify EXACTLY as the unsandboxed path). If it is absent, bwrap
+        // never stood the sandbox up — that is `SandboxUnavailable` poison, not a
+        // phantom QA `Fail`. This detects "did the sandbox hand off to bash",
+        // never "did QA pass" — the verdict still comes purely from the exit code.
+        let stdout = if self.sandbox.is_some() {
+            match strip_handoff_sentinel(&stdout) {
+                Some(script_stdout) => script_stdout,
+                None => {
+                    return Err(QaError::SandboxUnavailable {
+                        reason: format!(
+                            "bwrap did not hand off to bash: the sandbox setup/exec \
+                             failed before the handshake sentinel was printed (bwrap \
+                             muxes this into the same exit code as a script failure). \
+                             Likely the host cannot create the required namespaces \
+                             (--unshare-net/--unshare-pid/--proc/--dev) under an \
+                             unprivileged user, or a bind source is missing at spawn \
+                             time. bwrap stderr tail:\n{}",
+                            OutputTail::from_output(&String::from_utf8_lossy(&stderr)).0
+                        ),
+                    });
+                }
+            }
+        } else {
+            stdout
+        };
+
         classify(&status, stdout, stderr)
+    }
+}
+
+/// If `stdout`'s physical first line is exactly the [`SANDBOX_HANDOFF_SENTINEL`],
+/// return the remaining stdout with that first line removed; otherwise `None`.
+///
+/// The sentinel is printed by the inner `bash` *before* it `exec`s the script, so
+/// a successful sandbox handoff always makes it byte-for-byte the start of the
+/// stream followed by a newline. Requiring the very next byte to be `\n` means a
+/// script that itself emits a line merely *beginning* with the sentinel text
+/// cannot be mistaken for the handshake — and since our `printf` runs first, the
+/// script's own output can only ever land on a later line anyway.
+fn strip_handoff_sentinel(stdout: &[u8]) -> Option<Vec<u8>> {
+    let rest = stdout.strip_prefix(SANDBOX_HANDOFF_SENTINEL.as_bytes())?;
+    match rest.first() {
+        // Sentinel followed by its newline: the script's stdout is everything
+        // after that newline.
+        Some(b'\n') => Some(rest[1..].to_vec()),
+        // Sentinel is the entire stdout (script produced nothing on stdout).
+        None => Some(Vec::new()),
+        // First line is `<sentinel><something-else>` — not our handshake line.
+        Some(_) => None,
     }
 }
 
@@ -540,7 +827,7 @@ mod tests {
     #[test]
     fn exit_zero_is_pass() {
         let (_tmp, root) = workspace_with_script("#!/usr/bin/env bash\nexit 0\n");
-        let outcome = QaGate::new(&root).run().expect("gate runs");
+        let outcome = QaGate::new_unsandboxed(&root).run().expect("gate runs");
         assert_eq!(outcome, QaOutcome::Pass);
         assert!(outcome.is_pass());
     }
@@ -554,7 +841,7 @@ mod tests {
         let (_tmp, root) = workspace_with_script(
             "#!/usr/bin/env bash\necho 'error: something broke' >&2\nexit 17\n",
         );
-        let outcome = QaGate::new(&root)
+        let outcome = QaGate::new_unsandboxed(&root)
             .run()
             .expect("gate runs (fail is Ok, not Err)");
         match outcome {
@@ -580,12 +867,15 @@ mod tests {
     fn verdict_is_exit_code_not_stdout_string() {
         let (_t1, r1) = workspace_with_script("#!/usr/bin/env bash\necho PASS\nexit 1\n");
         assert!(matches!(
-            QaGate::new(&r1).run().expect("runs"),
+            QaGate::new_unsandboxed(&r1).run().expect("runs"),
             QaOutcome::Fail { .. }
         ));
 
         let (_t2, r2) = workspace_with_script("#!/usr/bin/env bash\necho FAIL\nexit 0\n");
-        assert_eq!(QaGate::new(&r2).run().expect("runs"), QaOutcome::Pass);
+        assert_eq!(
+            QaGate::new_unsandboxed(&r2).run().expect("runs"),
+            QaOutcome::Pass
+        );
     }
 
     /// A real QA-tool exit code like `101` (cargo test) stays a `Fail`, not
@@ -593,7 +883,9 @@ mod tests {
     #[test]
     fn tool_exit_101_is_fail_not_poison() {
         let (_tmp, root) = workspace_with_script("#!/usr/bin/env bash\nexit 101\n");
-        let outcome = QaGate::new(&root).run().expect("101 is a routine Fail");
+        let outcome = QaGate::new_unsandboxed(&root)
+            .run()
+            .expect("101 is a routine Fail");
         assert!(matches!(outcome, QaOutcome::Fail { exit_code: 101, .. }));
     }
 
@@ -605,7 +897,7 @@ mod tests {
     fn exit_127_command_not_found_is_poison() {
         let (_tmp, root) =
             workspace_with_script("#!/usr/bin/env bash\ndefinitely-not-a-real-command-xyzzy\n");
-        let err = QaGate::new(&root).run().unwrap_err();
+        let err = QaGate::new_unsandboxed(&root).run().unwrap_err();
         match err {
             QaError::ScriptItselfErrored { exit_code, .. } => assert_eq!(exit_code, 127),
             other => panic!("expected ScriptItselfErrored(127), got {other:?}"),
@@ -618,7 +910,7 @@ mod tests {
     fn exit_126_not_executable_is_poison() {
         // Run a directory as a program: bash reports 126 (cannot execute).
         let (_tmp, root) = workspace_with_script("#!/usr/bin/env bash\nmkdir -p adir\n./adir\n");
-        let err = QaGate::new(&root).run().unwrap_err();
+        let err = QaGate::new_unsandboxed(&root).run().unwrap_err();
         match err {
             QaError::ScriptItselfErrored { exit_code, .. } => assert_eq!(exit_code, 126),
             other => panic!("expected ScriptItselfErrored(126), got {other:?}"),
@@ -633,7 +925,7 @@ mod tests {
     #[test]
     fn signal_death_is_poison_not_fail() {
         let (_tmp, root) = workspace_with_script("#!/usr/bin/env bash\nkill -9 $$\n");
-        let err = QaGate::new(&root).run().unwrap_err();
+        let err = QaGate::new_unsandboxed(&root).run().unwrap_err();
         match err {
             QaError::Killed { signal, .. } => {
                 // SIGKILL is 9 where the platform exposes the signal.
@@ -651,7 +943,7 @@ mod tests {
     fn slow_script_times_out_as_poison() {
         let (_tmp, root) = workspace_with_script("#!/usr/bin/env bash\nsleep 30\n");
         let start = Instant::now();
-        let err = QaGate::new(&root)
+        let err = QaGate::new_unsandboxed(&root)
             .with_timeout(Duration::from_secs(1))
             .run()
             .unwrap_err();
@@ -678,7 +970,7 @@ mod tests {
         let body =
             "#!/usr/bin/env bash\nfor i in $(seq 1 200); do echo \"line-$i\"; done\nexit 3\n";
         let (_tmp, root) = workspace_with_script(body);
-        let outcome = QaGate::new(&root).run().expect("runs");
+        let outcome = QaGate::new_unsandboxed(&root).run().expect("runs");
         let QaOutcome::Fail { output_tail, .. } = outcome else {
             panic!("expected Fail");
         };
@@ -708,7 +1000,9 @@ mod tests {
             for i in $(seq 1 200); do printf 'progress-%d\\r' \"$i\"; done\n\
             printf '\\ndone\\n'\nexit 5\n";
         let (_tmp, root) = workspace_with_script(body);
-        let QaOutcome::Fail { output_tail, .. } = QaGate::new(&root).run().expect("runs") else {
+        let QaOutcome::Fail { output_tail, .. } =
+            QaGate::new_unsandboxed(&root).run().expect("runs")
+        else {
             panic!("expected Fail");
         };
         // Without \r-splitting the whole spinner stream is one line and the cap
@@ -734,7 +1028,9 @@ mod tests {
     fn short_output_is_returned_whole() {
         let (_tmp, root) =
             workspace_with_script("#!/usr/bin/env bash\necho one\necho two\nexit 1\n");
-        let QaOutcome::Fail { output_tail, .. } = QaGate::new(&root).run().expect("runs") else {
+        let QaOutcome::Fail { output_tail, .. } =
+            QaGate::new_unsandboxed(&root).run().expect("runs")
+        else {
             panic!("expected Fail");
         };
         assert_eq!(output_tail.line_count(), 2);
@@ -752,7 +1048,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().to_path_buf();
         // No .orchestrator/ dir at all.
-        let err = QaGate::new(&root).run().unwrap_err();
+        let err = QaGate::new_unsandboxed(&root).run().unwrap_err();
         assert!(
             matches!(err, QaError::ScriptNotFound { .. }),
             "a missing script must be ScriptNotFound poison, got {err:?}"
@@ -789,7 +1085,7 @@ mod tests {
         // the poison scenario cannot be constructed, so skip.
         let perms_enforced = !script.exists();
 
-        let result = QaGate::new(&root).run();
+        let result = QaGate::new_unsandboxed(&root).run();
 
         // Restore perms so the tempdir can be cleaned up on drop.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("restore");
@@ -837,6 +1133,39 @@ mod tests {
         assert_eq!(split_lines("a\n\nb"), vec!["a", "", "b"]);
         // Bare CR spinner frames split into distinct lines.
         assert_eq!(split_lines("x\ry\rz"), vec!["x", "y", "z"]);
+    }
+
+    // --- Sandbox-handoff sentinel -------------------------------------------
+
+    /// The sentinel is stripped only when it is the exact physical first line;
+    /// its absence (a bwrap setup/exec failure) is signalled by `None`, which
+    /// `run` maps to `SandboxUnavailable` poison.
+    #[test]
+    fn strip_handoff_sentinel_distinguishes_handoff_from_failure() {
+        let s = SANDBOX_HANDOFF_SENTINEL;
+
+        // Sentinel line then the script's real stdout: stripped to just the rest.
+        let stdout = format!("{s}\nreal script output\nmore\n").into_bytes();
+        assert_eq!(
+            strip_handoff_sentinel(&stdout),
+            Some(b"real script output\nmore\n".to_vec())
+        );
+
+        // Sentinel is the whole stdout (script printed nothing): empty rest.
+        let only = format!("{s}\n").into_bytes();
+        assert_eq!(strip_handoff_sentinel(&only), Some(Vec::new()));
+
+        // Sentinel with no trailing newline and nothing else: still a handoff.
+        assert_eq!(strip_handoff_sentinel(s.as_bytes()), Some(Vec::new()));
+
+        // bwrap setup/exec failure: stdout empty or missing the sentinel → None.
+        assert_eq!(strip_handoff_sentinel(b""), None);
+        assert_eq!(strip_handoff_sentinel(b"bwrap: something failed\n"), None);
+
+        // A first line that merely BEGINS with the sentinel text is NOT the
+        // handshake (our printf always makes it a whole line on its own).
+        let impostor = format!("{s}-not-really\n").into_bytes();
+        assert_eq!(strip_handoff_sentinel(&impostor), None);
     }
 
     /// The byte cap keeps the *tail*: a buffer over `MAX_CAPTURE_BYTES` retains

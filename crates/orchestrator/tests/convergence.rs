@@ -33,7 +33,7 @@ use common::{
 use orchestrator::config::{ConvergenceConfig, OrchestratorConfig, WorkerConfig};
 use orchestrator::events::{read_all, EventLog, ORCHESTRATOR_DIR};
 use orchestrator::pump::{BuildPump, IssueOutcome, MAX_ADVERSARY_ROUNDS};
-use orchestrator::spawn::{SandboxPin, Spawner};
+use orchestrator::spawn::Spawner;
 use orchestrator::state::{EventKind, EventRow, Phase, StateDb};
 use orchestrator::workspace::WorkspaceManager;
 use vetinari_crosslink_api::CrosslinkRepo;
@@ -94,7 +94,7 @@ fn pump_over(
     let manager = WorkspaceManager::load(&fx.root).expect("load workspace manager");
     let crosslink = CrosslinkRepo::open(&fx.root).expect("open crosslink repo");
     let (session, guard) = unique_session(tag);
-    let spawner = Spawner::new(session, &fx.root, SandboxPin::new("unused-direct"));
+    let spawner = Spawner::new(session, &fx.root, common::bwrap_pin());
     let pump = BuildPump::new(
         config_for(implementer, adversary, n_rounds),
         state,

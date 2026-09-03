@@ -27,7 +27,7 @@ use common::{build_fixture, fake_implementer, fake_merger, fake_merger_unresolve
 use orchestrator::config::{OrchestratorConfig, WorkerConfig};
 use orchestrator::events::{EventLog, ORCHESTRATOR_DIR};
 use orchestrator::pump::{BuildPump, IssueOutcome};
-use orchestrator::spawn::{SandboxPin, Spawner};
+use orchestrator::spawn::Spawner;
 use orchestrator::state::{IssueRow, Phase, StateDb};
 use orchestrator::workspace::WorkspaceManager;
 use vetinari_crosslink_api::CrosslinkRepo;
@@ -137,7 +137,7 @@ fn pump_over(tag: &str, merger: &Path) -> (Fixture, BuildPump, SessionGuard) {
     let manager = WorkspaceManager::load(&fx.root).expect("load workspace manager");
     let crosslink = CrosslinkRepo::open(&fx.root).expect("open crosslink repo");
     let (session, guard) = unique_session(tag);
-    let spawner = Spawner::new(session, &fx.root, SandboxPin::new("unused-direct"));
+    let spawner = Spawner::new(session, &fx.root, common::bwrap_pin());
     let pump = BuildPump::new(config_for(merger), state, log, manager, spawner, crosslink);
     (fx, pump, guard)
 }
