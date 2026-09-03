@@ -9,9 +9,9 @@
       },
       "branch": "develop",
       "submodules": false,
-      "revision": "571343ba8e0ef5b26b943612f635c42cc8953c8f",
-      "url": "https://github.com/forecast-bio/crosslink/archive/571343ba8e0ef5b26b943612f635c42cc8953c8f.tar.gz",
-      "hash": "sha256-8rsZEJTfEY85cP7RCSLSL7zvZhbkYlG90izsArxCkSs="
+      "revision": "dbbe2ed34748e55eea41dfc843137b1863738b27",
+      "url": "https://github.com/forecast-bio/crosslink/archive/dbbe2ed34748e55eea41dfc843137b1863738b27.tar.gz",
+      "hash": "sha256-j4UxCRCUm7b4BgtptlbuR4REnW1nE4mEHfJYPCWVqsI="
     },
     "nixpkgs": {
       "type": "Git",
