@@ -338,6 +338,13 @@ pub struct OrchestratorConfig {
     /// diff-stable clean Adversary rounds required to land.
     #[serde(default)]
     pub convergence: ConvergenceConfig,
+    /// The embedded crossbridge federation server (spec §1.2, §1.4). Default
+    /// [`CrossbridgeConfig::default`] — **disabled**. An absent `[crossbridge]`
+    /// section parses exactly as before and yields `enabled = false`, so a node
+    /// that never opts in behaves byte-identically to a crossbridge-unaware
+    /// orchestrator (the load-bearing off-by-default safety property).
+    #[serde(default)]
+    pub crossbridge: CrossbridgeConfig,
 }
 
 impl Default for OrchestratorConfig {
@@ -349,8 +356,64 @@ impl Default for OrchestratorConfig {
             worker_timeout_secs: DEFAULT_WORKER_TIMEOUT_SECS,
             worker: WorkerConfig::default(),
             convergence: ConvergenceConfig::default(),
+            crossbridge: CrossbridgeConfig::default(),
         }
     }
+}
+
+/// The embedded crossbridge federation server's configuration (spec §1.2, §1.4).
+///
+/// **OFF by default and OFF unless explicitly opted in.** This is the first
+/// config surface that can start a network-facing server inside the
+/// orchestrator, so safety-by-default is paramount: the [`Default`] (and thus an
+/// absent `[crossbridge]` section) is `enabled = false`, and when disabled the
+/// orchestrator starts no server, opens no socket, and behaves exactly as a
+/// crossbridge-unaware build. The only behavioral change relative to today
+/// happens when a node's operator writes `enabled = true` in
+/// `.orchestrator/config.toml`.
+///
+/// ```toml
+/// [crossbridge]
+/// enabled     = true
+/// group       = "reversing"
+/// slug        = "firmware"          # optional; None → crossbridge derivation
+/// socket_root = "/run/user/1000/crossbridge"  # optional; None → crossbridge default
+/// ```
+///
+/// Inbound issues the embedded server creates carry `xb:inbound` and **no**
+/// `phase:*` label, so the strict pump pickup (`pump.rs:463-494` — graphed +
+/// open + unblocked) ignores them until a human graphs them (spec §1.2). This
+/// step only makes the server *run*; ingesting inbound work into the pump is
+/// deliberately deferred to a later step (the approval gate).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrossbridgeConfig {
+    /// Whether to start the embedded crossbridge server (spec §1.4). Default
+    /// **`false`** — the orchestrator runs exactly as today, with no server,
+    /// no socket, and no inbound issues. This is the load-bearing safety flag.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The crossbridge peer group this node registers into (e.g. `"reversing"`).
+    /// Only meaningful when [`enabled`](Self::enabled) is `true`.
+    #[serde(default)]
+    pub group: String,
+    /// This node's crossbridge slug override. `None` → derive it via
+    /// [`crossbridge_api::own_slug`] (crossbridge's own precedence:
+    /// override → `$CROSSBRIDGE_OWN_SLUG` → `origin` remote), so a client and
+    /// its peer server never disagree on what to call the repo (review N7).
+    ///
+    /// [`crossbridge_api::own_slug`]: vetinari_crossbridge_api::own_slug
+    #[serde(default)]
+    pub slug: Option<String>,
+    /// Where the crossbridge sockets live (the supervisor register socket and
+    /// per-peer listener sockets). `None` → the crossbridge default
+    /// ([`crossbridge_api::default_socket_root`]: `$CROSSBRIDGE_SOCKET_ROOT` >
+    /// `$XDG_RUNTIME_DIR/crossbridge` > compiled-in `/run/crossbridge`), so the
+    /// orchestrator never has to name crossbridge's socket-layout policy itself.
+    ///
+    /// [`crossbridge_api::default_socket_root`]: vetinari_crossbridge_api::default_socket_root
+    #[serde(default)]
+    pub socket_root: Option<PathBuf>,
 }
 
 /// How the orchestrator decides an issue's review loop has converged (REQ-10).
@@ -846,6 +909,79 @@ mod tests {
         for c in codes {
             assert!(seen.insert(c), "duplicate diagnostic code: {c}");
         }
+    }
+
+    #[test]
+    fn crossbridge_absent_section_is_disabled() {
+        // The load-bearing safety default: an absent `[crossbridge]` section
+        // yields `enabled = false`, and the whole config equals the all-defaults
+        // config (so a crossbridge-unaware node is byte-identical to today).
+        let cfg = OrchestratorConfig::default();
+        assert!(!cfg.crossbridge.enabled);
+        assert_eq!(cfg.crossbridge, CrossbridgeConfig::default());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(CONFIG_FILE), "poll_interval_ms = 250\n")
+            .expect("write config");
+        let loaded = OrchestratorConfig::load(dir.path()).expect("parse without [crossbridge]");
+        assert!(
+            !loaded.crossbridge.enabled,
+            "no [crossbridge] section must disable the server"
+        );
+        assert_eq!(loaded.crossbridge, CrossbridgeConfig::default());
+    }
+
+    #[test]
+    fn crossbridge_full_section_parses_all_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[crossbridge]\n\
+             enabled = true\n\
+             group = \"reversing\"\n\
+             slug = \"firmware\"\n\
+             socket_root = \"/run/user/1000/crossbridge\"\n",
+        )
+        .expect("write config");
+        let cfg = OrchestratorConfig::load(dir.path()).expect("parse full [crossbridge]");
+        assert!(cfg.crossbridge.enabled);
+        assert_eq!(cfg.crossbridge.group, "reversing");
+        assert_eq!(cfg.crossbridge.slug.as_deref(), Some("firmware"));
+        assert_eq!(
+            cfg.crossbridge.socket_root,
+            Some(PathBuf::from("/run/user/1000/crossbridge"))
+        );
+    }
+
+    #[test]
+    fn crossbridge_enabled_alone_defaults_slug_and_socket_root_to_none() {
+        // Minimal opt-in: only `enabled` + `group` set. `slug`/`socket_root`
+        // fall back to None so the orchestrator resolves the crossbridge
+        // derivation / default at startup (spec §1.2 pilot config shape).
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[crossbridge]\nenabled = true\ngroup = \"reversing\"\n",
+        )
+        .expect("write config");
+        let cfg = OrchestratorConfig::load(dir.path()).expect("parse minimal [crossbridge]");
+        assert!(cfg.crossbridge.enabled);
+        assert_eq!(cfg.crossbridge.group, "reversing");
+        assert_eq!(cfg.crossbridge.slug, None);
+        assert_eq!(cfg.crossbridge.socket_root, None);
+    }
+
+    #[test]
+    fn crossbridge_rejects_unknown_field() {
+        // `deny_unknown_fields` discipline holds on the new table too.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[crossbridge]\nenabled = true\nbogus = 1\n",
+        )
+        .expect("write config");
+        let err = OrchestratorConfig::load(dir.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }));
     }
 
     #[test]

@@ -292,6 +292,21 @@ pub fn serve(cfg: ServeCfg) -> Result<ServerHandle> {
     })
 }
 
+/// The crossbridge default socket root, for when the orchestrator config leaves
+/// [`ServeCfg::socket_root`] unset.
+///
+/// Resolves crossbridge's own precedence — `$CROSSBRIDGE_SOCKET_ROOT` >
+/// `$XDG_RUNTIME_DIR/crossbridge` > the compiled-in `/run/crossbridge` — via
+/// `crossbridge_protocol::default_socket_root`, returning a plain [`PathBuf`] so
+/// the orchestrator never has to name crossbridge's socket-layout policy itself
+/// (a divergent reimplementation would desync us from our peers, the same
+/// hazard [`crate::own_slug`] guards against, review N7). This is exactly what
+/// the crossbridge binaries do when no `--runtime-root` flag is passed.
+#[must_use]
+pub fn default_socket_root() -> PathBuf {
+    crossbridge_protocol::default_socket_root(|key| std::env::var_os(key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +413,27 @@ mod tests {
             "bounded join must not block on the wedged thread (took {elapsed:?})"
         );
         // The detached thread is intentionally leaked; the test process exits.
+    }
+
+    /// The default-socket-root wrapper returns a non-empty path whose final
+    /// component reflects crossbridge's precedence (`…/crossbridge` when derived
+    /// from an env root, or the compiled-in fallback). The precedence itself is
+    /// exhaustively tested upstream in `crossbridge_protocol`; this only guards
+    /// that our thin wrapper wires the real global env lookup through.
+    #[test]
+    fn default_socket_root_is_a_nonempty_path() {
+        let root = default_socket_root();
+        assert!(
+            !root.as_os_str().is_empty(),
+            "default socket root must never be empty, got {root:?}"
+        );
+        // Either the compiled-in fallback, or an env-derived `<root>/crossbridge`.
+        assert!(
+            root.as_path() == std::path::Path::new("/run/crossbridge")
+                || root.file_name().is_some_and(|c| c == "crossbridge")
+                || std::env::var_os("CROSSBRIDGE_SOCKET_ROOT").is_some(),
+            "unexpected default socket root shape: {root:?}"
+        );
     }
 
     /// The fast path: a thread that finishes on its own is joined promptly and

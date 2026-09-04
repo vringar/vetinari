@@ -11,6 +11,14 @@ vetinari-error.workspace = true
 vetinari-crosslink-api.workspace = true
 vetinari-jj-api.workspace = true
 vetinari-zellij-host.workspace = true
+# The first orchestrator → crossbridge_api dependency (spec §1.2, §1.4, step 4):
+# the embedded crossbridge server is started from `main.rs` through this
+# insulation crate's plain-typed `serve`/`own_slug` surface, so the orchestrator
+# core stays synchronous and tokio-free and never links a `crossbridge-*` crate
+# directly (the sync/async + trust membrane lives entirely in `crossbridge_api`).
+# The server is OFF unless `[crossbridge] enabled = true`; a default build starts
+# nothing.
+vetinari-crossbridge-api.workspace = true
 miette = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

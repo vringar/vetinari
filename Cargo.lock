@@ -3450,6 +3450,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "vetinari-crossbridge-api",
  "vetinari-crosslink-api",
  "vetinari-error",
  "vetinari-jj-api",

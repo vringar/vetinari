@@ -8,14 +8,16 @@
 //! pump; this binary is deliberately thin (the dogfood integration test is the
 //! authoritative proof of the loop).
 
+use std::path::Path;
 use std::time::Duration;
 
 use miette::IntoDiagnostic;
 use tracing_subscriber::EnvFilter;
+use vetinari_crossbridge_api::{ServeCfg, ServerHandle};
 use vetinari_crosslink_api::CrosslinkRepo;
 use vetinari_error::SpawnError;
 
-use orchestrator::config::OrchestratorConfig;
+use orchestrator::config::{CrossbridgeConfig, OrchestratorConfig};
 use orchestrator::events::{EventLog, ORCHESTRATOR_DIR};
 use orchestrator::pump::BuildPump;
 use orchestrator::spawn::Spawner;
@@ -115,10 +117,99 @@ fn main() -> miette::Result<()> {
         "crash recovery complete — entering the pump loop"
     );
 
+    // Spec §1.2 / §1.4: the embedded crossbridge federation server. OFF by
+    // default — see [`start_crossbridge`]. Started here, strictly AFTER
+    // `recover()` above and BEFORE the pump loop below, so the server can never
+    // create an `xb:inbound` issue mid recovery-scan (review N4). The handle is
+    // bound to a variable that lives across `run_loop`, holding the server for
+    // the whole process lifetime; when disabled it is simply `None`.
+    let _crossbridge = start_crossbridge(&config.crossbridge, &root)?;
+
     let pump = BuildPump::new(config, state, log, manager, spawner, crosslink);
 
     tracing::info!("build pump ready — entering tick loop (Ctrl-C to stop)");
     run_loop(&pump)
+}
+
+/// Start the embedded crossbridge federation server iff `[crossbridge] enabled`
+/// is `true`; otherwise a strict no-op (spec §1.2, §1.4, step 4).
+///
+/// # Off by default — the load-bearing safety property
+///
+/// When `cfg.enabled` is `false` (the default, and the state of any node that
+/// never writes a `[crossbridge]` section) this returns `Ok(None)` and does
+/// **nothing**: no `serve()`, no socket opened, no server thread, no inbound
+/// issues, no behavior change whatsoever. This is the first code that can start
+/// a network-facing server inside the orchestrator, so safety-by-default is the
+/// contract: a default build is byte-identical to a crossbridge-unaware one.
+///
+/// # Sequencing (spec §1.4)
+///
+/// The caller invokes this **strictly after** `recover()` and **before** the
+/// pump loop. That ordering matters: the embedded server is a sanctioned second
+/// writer to `.crosslink/issues.db`, and starting it before the recovery scan
+/// completes would let a peer's `SubmitIssue` create an `xb:inbound` issue mid
+/// scan (review N4). After recovery, a newly created inbound issue is just
+/// another issue the next pump tick observes.
+///
+/// # Inbound work stays pump-ignored (spec §1.2, step 4 scope)
+///
+/// The server creates inbound issues with `xb:inbound` and **no** `phase:*`
+/// label. The pump's strict pickup (`pump.rs:463-494` — graphed + open +
+/// unblocked) ignores unphased issues, so inbound work is *not* driven by this
+/// step. Picking it up is deliberately deferred to the later approval-gate step;
+/// this step only makes the server *run*.
+///
+/// # Lifetime & shutdown
+///
+/// The returned [`ServerHandle`] must be held for the process lifetime (the
+/// caller binds it across `run_loop`): dropping it asks the server thread to
+/// stop, bounded. The MVP has **no** clean-shutdown path — the process is
+/// killed and re-recovers on restart (`run_loop` docs) — so we neither install
+/// signal handling here (out of scope for this step) nor call `shutdown()`; when
+/// the process dies, the detached server thread dies with it. If a clean-
+/// shutdown path is ever added, call `handle.shutdown()` there (it is already
+/// bounded, detach-on-timeout) — never in a way that blocks `run_loop`.
+///
+/// # Errors
+///
+/// A failed slug derivation or `serve()` is a **fatal startup error** and
+/// bubbles like the other startup `?`s: the orchestrator must not silently
+/// continue with a dead server when the operator asked for one.
+fn start_crossbridge(cfg: &CrossbridgeConfig, root: &Path) -> miette::Result<Option<ServerHandle>> {
+    if !cfg.enabled {
+        // Default path: NOTHING happens. No server, no socket, no inbound
+        // issues — the pump is byte-identical to a crossbridge-unaware build.
+        return Ok(None);
+    }
+
+    // Derive our slug via crossbridge's own precedence (config override →
+    // `$CROSSBRIDGE_OWN_SLUG` → `origin` remote). Reusing crossbridge's
+    // derivation is the point: a divergent reimplementation would desync us
+    // from our peers (review N7).
+    let slug = vetinari_crossbridge_api::own_slug(root, cfg.slug.as_deref())?;
+    // An unset socket_root falls back to the crossbridge default, resolved by
+    // the membrane crate so the orchestrator never names crossbridge's
+    // socket-layout policy itself.
+    let socket_root = cfg
+        .socket_root
+        .clone()
+        .unwrap_or_else(vetinari_crossbridge_api::default_socket_root);
+
+    let serve_cfg = ServeCfg {
+        slug: slug.clone(),
+        group: cfg.group.clone(),
+        repo_root: root.to_path_buf(),
+        socket_root: socket_root.clone(),
+    };
+    let handle = vetinari_crossbridge_api::serve(serve_cfg)?;
+    tracing::info!(
+        slug = %slug,
+        group = %cfg.group,
+        socket_root = %socket_root.display(),
+        "embedded crossbridge server started — inbound issues stay unphased and pump-ignored until a human graphs them"
+    );
+    Ok(Some(handle))
 }
 
 /// The headless tick loop: poll, drive ready issues, sleep, repeat.

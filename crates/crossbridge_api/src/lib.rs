@@ -33,6 +33,8 @@
 //! # Surface
 //!
 //! - [`serve`] / [`ServeCfg`] / [`ServerHandle`] — the embedded server.
+//! - [`default_socket_root`] — the crossbridge default socket root for an
+//!   unset [`ServeCfg::socket_root`].
 //! - [`answer`] / [`AnswerReq`] / [`AnswerComment`] / [`AnswerOutcome`] — one
 //!   `SubmitAnswer` wire round-trip.
 //! - [`own_slug`] — crossbridge's own slug derivation.
@@ -50,5 +52,5 @@ mod slug;
 
 pub use answer::{answer, AnswerComment, AnswerOutcome, AnswerReq};
 pub use error::{CrossbridgeError, Result};
-pub use serve::{serve, ServeCfg, ServerHandle};
+pub use serve::{default_socket_root, serve, ServeCfg, ServerHandle};
 pub use slug::own_slug;
