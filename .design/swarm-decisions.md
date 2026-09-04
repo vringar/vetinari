@@ -7,7 +7,7 @@ Legend — **Your call**: genuinely needs you (domain / commitment / trust). **P
 | # | Decision | My pick | Blocks | Kind |
 |---|----------|---------|--------|------|
 | D1 | First RE target + can a *verifiable gate* be written for it | (needs you — a narrow round-trippable subsystem) | **live kickoff** | Your call |
-| D2 | Does vetinari carry a pinned crossbridge fork | Yes, pin a fork aligned to crosslink `dbbe2ed3`; file upstream in parallel | step 3 | Your call |
+| D2 | Unify crossbridge's crosslink onto vetinari's rev | **RESOLVED** — unify in vetinari (`[patch]` first, fork only if the spike shows real API drift) **and keep them in sync** going forward | step 3 | ✓ decided |
 | D3 | `vetinari` as a second bin vs. `orchestrator` subcommand | Second bin | step 1 | Proceeding |
 | D4 | Worker follow-up work: propose-don't-commit vs. direct write | Propose-don't-commit (read-only crosslink + `followup` proposal channel) | step 4–5 | Your call (sanction) |
 | D5 | Who authors the issue graph from a directive | Chief drafts the DAG; **human** applies `phase:graphed` | seeding workflow | Proceeding |
@@ -25,8 +25,12 @@ Vetinari can only autonomously drive a sub-task reducible to a deterministic `st
 
 **What I need from you:** one concrete target subsystem + which gate pattern fits (or "none fits — it's exploration"). If none fits, the pilot shrinks to the gate-able fraction and the rest stays chief/human work. *Defining the gate is itself the reversing insight — it can't be automated.*
 
-## D2 — Pinned crossbridge fork  *(Your call — it's a maintenance commitment)*
-crossbridge must compile against the **same** crosslink rev vetinari pins (`dbbe2ed3`), or the two crosslink copies in the graph conflict (review B2, AC-28a). Practically that means vetinari carries a **pinned crossbridge fork** realigned to that rev. **Recommendation:** yes — pin the fork now, and file the upstream shutdown-channel fix (D8) in parallel so we can drop the fork delta later. The commitment: you own a small crossbridge fork pin until upstream catches up. Say no and step 3+ stalls until upstream aligns.
+## D2 — Unify crossbridge's crosslink onto vetinari's rev  *(RESOLVED 2026-09-03: unify + keep in sync)*
+There must be exactly **one** `crosslink` in the graph: `crosslink` pulls `libsqlite3-sys` (`links = "sqlite3"`, see `orchestrator/Cargo.toml:25`), and cargo hard-errors on two packages sharing a `links` value — so two crosslink revs cannot coexist. (Correction to an earlier overstatement here: this is *not* "not a `[patch]` away" — a `[patch]` is exactly how you collapse crossbridge's `crosslink` onto vetinari's one `dbbe2ed3` path copy. Whether that suffices depends only on whether crossbridge's source compiles against `dbbe2ed3`.)
+
+**Decision (user):** *"unify them in vetinari, but also make an effort to keep them in sync."*
+- **Unify:** add crossbridge as a dep; `[patch]` its `crosslink` onto vetinari's `.crosslink-src/crosslink` (`dbbe2ed3`). Fork crossbridge **only if** a compat spike shows real crosslink-API drift (or the D8 shutdown edit forces a source change). A spike is running to determine patch-suffices vs fork-needed with evidence.
+- **Keep in sync (ongoing discipline):** ship the `AC-28a` single-crosslink `cargo metadata` guard so a divergence fails the build loudly; when vetinari bumps `crosslink`, re-verify (and, if forked, rebase the fork + realign its crosslink rev in the same change); file the upstream shutdown-channel fix (D8) so any fork delta shrinks toward zero. Do not let a fork silently rot behind upstream.
 
 ## D3 — Second bin `vetinari`  *(Proceeding)*
 A thin second binary `vetinari` in the orchestrator crate reads cleaner for the skill and the zellij pane title than an `orchestrator status` subcommand. Reversible (it's just packaging). **Building on this.**
