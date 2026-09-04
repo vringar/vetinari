@@ -440,14 +440,11 @@
       "priority": "critical",
       "created_by": "0wAy",
       "created_at": "2026-05-14T15:58:51.160753564Z",
-      "updated_at": "2026-09-04T12:39:15.239058922Z",
+      "updated_at": "2026-09-04T12:40:30.555807458Z",
       "closed_at": "2026-05-15T20:30:58.635670723Z",
       "labels": [
         "area:foundation",
         "iteration:0"
-      ],
-      "blockers": [
-        "9aec5962-bca7-41ca-8991-2c0fa3d2bf64"
       ],
       "comments": {
         "bcae22c7-943d-4c06-8485-a62680db73e5": {
@@ -661,11 +658,16 @@
       "agent_id": "anon-0c971b5d",
       "agent_seq": 2,
       "timestamp": "2026-09-04T12:39:19.764976583Z"
+    },
+    {
+      "agent_id": "anon-0c971b5d",
+      "agent_seq": 3,
+      "timestamp": "2026-09-04T12:40:30.555807458Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-09-04T12:39:19.764976583Z",
+    "timestamp": "2026-09-04T12:40:30.555807458Z",
     "agent_id": "anon-0c971b5d",
-    "agent_seq": 2
+    "agent_seq": 3
   }
 }
