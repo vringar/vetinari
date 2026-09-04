@@ -395,11 +395,12 @@
       "priority": "critical",
       "created_by": "0wAy",
       "created_at": "2026-05-14T15:58:51.419462990Z",
-      "updated_at": "2026-05-17T13:27:59.797746555Z",
+      "updated_at": "2026-09-04T12:39:19.764976583Z",
       "closed_at": "2026-05-17T13:27:59.797746555Z",
       "labels": [
         "area:foundation",
-        "iteration:0"
+        "iteration:0",
+        "phase:graphed"
       ],
       "blockers": [
         "afae6546-3b57-4fe3-a175-5a2efcebcd4f"
@@ -655,11 +656,16 @@
       "agent_id": "anon-0c971b5d",
       "agent_seq": 1,
       "timestamp": "2026-09-04T12:39:15.239058922Z"
+    },
+    {
+      "agent_id": "anon-0c971b5d",
+      "agent_seq": 2,
+      "timestamp": "2026-09-04T12:39:19.764976583Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-09-04T12:39:15.239058922Z",
+    "timestamp": "2026-09-04T12:39:19.764976583Z",
     "agent_id": "anon-0c971b5d",
-    "agent_seq": 1
+    "agent_seq": 2
   }
 }
