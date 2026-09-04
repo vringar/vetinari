@@ -54,6 +54,14 @@ in
       # `crosslink_api` insulation crate can path-depend on the `crosslink`
       # library crate (REQ-1, REQ-3a). Bump with `npins update crosslink`.
       CROSSLINK_SRC = "${sources.crosslink}";
+      # Source tree of the npins-pinned crossbridge (vringar/crossbridge,
+      # `main`). `just bootstrap` copies this to `.crossbridge-src` so the
+      # `crossbridge_api` insulation crate can path-depend on the
+      # `crossbridge-server` / `crossbridge-protocol` library crates (REQ-20b).
+      # crossbridge's own crosslink git-dependency is collapsed onto vetinari's
+      # single crosslink copy by the workspace `[patch]` (AC-28a). Bump with
+      # `npins update crossbridge`.
+      CROSSBRIDGE_SRC = "${sources.crossbridge}";
     };
 
     # `bwrap` and `nix-shell` are resolved at shell-entry time so the realpath

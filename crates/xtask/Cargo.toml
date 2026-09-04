@@ -15,6 +15,10 @@ publish = false
 [dependencies]
 syn = { version = "2.0", features = ["full", "visit"] }
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
+# `check-crosslink` (AC-28a) parses `cargo metadata` JSON to assert exactly one
+# crosslink resolves in the graph. xtask is exempt from the AC-24 no-shell-out
+# audit, so it may invoke `cargo` directly.
+serde_json = { workspace = true }
 
 [[bin]]
 name = "xtask"

@@ -1,0 +1,51 @@
+[package]
+name = "vetinari-crossbridge-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Insulation layer between the synchronous orchestrator core and crossbridge's
+# async, tokio-based library crates (REQ-20b). This is the ONLY workspace crate
+# permitted to depend on `tokio`/`tokio-util` or on any `crossbridge-*` crate:
+# it is the sync/async membrane. All crossbridge API churn and the entire async
+# runtime are quarantined here; the orchestrator core stays synchronous and
+# tokio-free and depends only on this crate's plain-typed adapter surface.
+#
+# Its public signatures carry only vetinari-owned plain types (issue id `i64`,
+# slug `String`, comment text `String`, `PathBuf`) and the self-contained
+# `CrossbridgeError` — never a `crosslink` or `crossbridge` type. `crosslink_api`
+# remains the sole namer of crosslink types.
+
+[dependencies]
+miette = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# The async runtime — quarantined to this crate. `serve()` drives
+# `crossbridge_server::run` on a dedicated OS thread with a `new_current_thread`
+# runtime (the `rt` feature), so the orchestrator core never blocks on async.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# `CancellationToken` — how `crossbridge_server::run` is asked to shut down.
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+
+# The crossbridge library crates, path-depended through the `.crossbridge-src`
+# tree that `just bootstrap` copies from the npins-pinned crossbridge source
+# (see the workspace justfile and shell.nix). Bump via `npins update
+# crossbridge`. crossbridge's own crosslink git-dependency is collapsed onto
+# vetinari's single crosslink copy by the workspace `[patch]` (AC-28a).
+crossbridge-server = { path = "../../.crossbridge-src/crossbridge-server" }
+crossbridge-protocol = { path = "../../.crossbridge-src/crossbridge-protocol" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The `serve()` shutdown-lifecycle test builds a throwaway crosslink DB so
+# `crossbridge_server::run` gets past its DB-existence check and into its
+# select loop, where the shutdown token is then exercised. crosslink is already
+# in this crate's dependency graph (via crossbridge-server, patched onto the one
+# copy); depending on it in tests names no new source.
+crosslink = { path = "../../.crosslink-src/crosslink" }
+# Drift guard for the re-exported marker labels: `labels::tests` asserts our
+# vetinari-owned consts equal crossbridge's own `xb*` label strings.
+crossbridge-client = { path = "../../.crossbridge-src/crossbridge-client" }

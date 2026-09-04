@@ -1,5 +1,18 @@
 {
   "pins": {
+    "crossbridge": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "vringar",
+        "repo": "crossbridge"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "479d468bc999e4d52d13fcbd74283f9baf8235e8",
+      "url": "https://github.com/vringar/crossbridge/archive/479d468bc999e4d52d13fcbd74283f9baf8235e8.tar.gz",
+      "hash": "sha256-fK8klaFy+vJslU5mfcOgBmlPyvd7lrytZAmTfH/F3xE="
+    },
     "crosslink": {
       "type": "Git",
       "repository": {

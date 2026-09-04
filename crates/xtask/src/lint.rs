@@ -20,7 +20,6 @@
 //! deliberate evasion.
 
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::Visit;
@@ -49,17 +48,17 @@ struct Violation {
     target: String,
 }
 
-/// Run the no-shell-out audit. Returns [`ExitCode::SUCCESS`] when the workspace
-/// is clean and [`ExitCode::FAILURE`] when any violation is found or the scan
-/// itself cannot complete.
-pub fn run() -> ExitCode {
+/// Run the no-shell-out audit. Returns `true` when the workspace is clean and
+/// `false` when any violation is found or the scan itself cannot complete. The
+/// caller maps this to a process exit code.
+pub fn run() -> bool {
     let root = workspace_root();
     let crates_dir = root.join("crates");
 
     let mut files = Vec::new();
     if let Err(e) = collect_scan_targets(&crates_dir, &mut files) {
         eprintln!("xtask lint: cannot enumerate {}: {e}", crates_dir.display());
-        return ExitCode::FAILURE;
+        return false;
     }
     files.sort();
 
@@ -72,7 +71,7 @@ pub fn run() -> ExitCode {
                 // clippy` runs before this in `just lint` and would already
                 // have rejected a genuine syntax error, so treat this as fatal.
                 eprintln!("xtask lint: cannot parse {}: {e}", file.display());
-                return ExitCode::FAILURE;
+                return false;
             }
         }
     }
@@ -147,11 +146,11 @@ fn scan_file(path: &Path) -> Result<Vec<Violation>, syn::Error> {
     Ok(scanner.violations)
 }
 
-/// Print the result and pick the process exit code.
-fn report(root: &Path, violations: &[Violation], scanned: usize) -> ExitCode {
+/// Print the result and report whether the audit is clean (`true`) or not.
+fn report(root: &Path, violations: &[Violation], scanned: usize) -> bool {
     if violations.is_empty() {
         println!("xtask lint: clean — no forbidden shell-out calls ({scanned} file(s) scanned)");
-        return ExitCode::SUCCESS;
+        return true;
     }
 
     eprintln!(
@@ -174,7 +173,7 @@ fn report(root: &Path, violations: &[Violation], scanned: usize) -> ExitCode {
          zellij crates instead of subprocesses. If a flagged call is genuine\n\
          test-harness code, move it under a `#[cfg(test)]` item."
     );
-    ExitCode::FAILURE
+    false
 }
 
 /// `syn` visitor that records banned `Command::new` call sites and prunes

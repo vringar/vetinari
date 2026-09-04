@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/orchestrator",
     "crates/crosslink_api",
+    "crates/crossbridge_api",
     "crates/jj_api",
     "crates/zellij_host",
     "crates/error",
@@ -13,10 +14,17 @@ members = [
 # this exclude cargo would adopt the `crosslink` path dependency as an implicit
 # workspace member — building and linting crosslink's own code. It must stay a
 # plain dependency.
+# `.crossbridge-src` is the bootstrap-managed copy of the pinned crossbridge
+# source (github.com/vringar/crossbridge; see `just bootstrap`). The
+# `crossbridge_api` insulation crate path-depends on its `crossbridge-server`
+# and `crossbridge-protocol` crates; excluding it keeps cargo from adopting
+# crossbridge's own workspace as vetinari workspace members. Its crosslink
+# git-dependency is collapsed onto vetinari's single crosslink copy by the
+# `[patch]` below (the `links = "sqlite3"` single-copy constraint, AC-28a).
 # `tests/fixtures/hello` is the dogfood fixture crate (AC-11a). It is copied
 # into a temp dir and built there by the build_fixture() test helper; excluding
 # it keeps `cargo build --workspace` from adopting it as a member.
-exclude = [".crosslink-src", "tests/fixtures/hello"]
+exclude = [".crosslink-src", ".crossbridge-src", "tests/fixtures/hello"]
 
 [workspace.package]
 version = "0.1.0"
@@ -61,6 +69,7 @@ jj-lib = "0.41.0"
 # Internal crates
 vetinari-error = { path = "crates/error" }
 vetinari-crosslink-api = { path = "crates/crosslink_api" }
+vetinari-crossbridge-api = { path = "crates/crossbridge_api" }
 vetinari-jj-api = { path = "crates/jj_api" }
 vetinari-zellij-host = { path = "crates/zellij_host" }
 
@@ -71,3 +80,23 @@ strip = "symbols"
 
 [profile.dev]
 debug = 1
+
+# Collapse crossbridge's crosslink onto vetinari's single pinned crosslink copy
+# (REQ-20b, AC-28a). crossbridge's own `Cargo.toml` git-depends on crosslink at
+# `Corvidae-Coding-Projects/crosslink@e7b6ad8` (crosslink 0.9.0-beta.1); this
+# `[patch]` redirects that git source to the same `.crosslink-src/crosslink`
+# tree that `crosslink_api` path-depends on and that `just bootstrap` populates
+# from the npins pin (currently dbbe2ed3, also crosslink 0.9.0-beta.1).
+#
+# Why a patch and not coexistence: crosslink pulls `libsqlite3-sys`
+# (`links = "sqlite3"`), and cargo forbids two packages sharing a `links` value
+# — so the whole dependency graph must resolve to exactly ONE crosslink. This
+# patch is what makes that true; the `xtask check-crosslink` guard (AC-28a)
+# fails the build if a future crosslink-rev divergence ever reintroduces a
+# second copy.
+#
+# Placement: this git-source patch lives in the workspace `Cargo.toml` (not the
+# bootstrap-generated `.cargo/config.toml`, which only manages the crates.io
+# `jj-lib` patch). The path is relative to the workspace root.
+[patch."https://github.com/Corvidae-Coding-Projects/crosslink.git"]
+crosslink = { path = ".crosslink-src/crosslink" }
