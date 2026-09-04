@@ -173,6 +173,13 @@ pub fn fake_implementer_empty() -> PathBuf {
     fixtures_path("fake-implementer-empty.sh")
 }
 
+/// Path to the fake implementer that implements `say_hi` AND writes two
+/// follow-up PROPOSALS to `_orchestrator/followups.jsonl` (REQ-SWARM-2). Drives
+/// the propose-don't-commit channel end to end.
+pub fn fake_implementer_followups() -> PathBuf {
+    fixtures_path("fake-implementer-followups.sh")
+}
+
 /// Path to the committed fake-adversary worker script: reads the pre-rendered
 /// `_orchestrator/diff.patch` and writes a canned `findings.jsonl` + DONE (A1).
 pub fn fake_adversary() -> PathBuf {

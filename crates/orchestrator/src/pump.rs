@@ -172,6 +172,23 @@ pub const GRAPHED_LABEL: &str = "phase:graphed";
 /// them.
 pub const INBOUND_APPROVED_LABEL: &str = "inbound-approved:land";
 
+/// The label the pump applies to an issue for which a worker surfaced ≥1
+/// follow-up **proposal** (REQ-SWARM-2, spec §1.6), so the chief can find issues
+/// with pending proposals via `crosslink issue list -l followup:proposed`.
+///
+/// This label is the **only** graph-side effect a worker's `followups.jsonl` can
+/// have (besides the follow-up comments themselves, posted under the neutral
+/// `note` wire kind). It is the durable, findable marker of a pending proposal —
+/// labels are freeform, so it survives where a bespoke comment kind would be
+/// rejected by crosslink's allowlist. It is emphatically
+/// **not** a `phase:*` label and carries no scheduling meaning: the pump's work
+/// queue is `phase:graphed` ([`GRAPHED_LABEL`]) and nothing keys off
+/// `followup:proposed`, so an issue can never be *driven* by a worker proposal.
+/// Promotion of a proposal into a real graphed issue is the trusted single
+/// writer's job (a human/chief via the `vetinari` skill), never the
+/// orchestrator's — see [`crate::artifacts::FOLLOWUPS_FILE`].
+pub const FOLLOWUP_PROPOSED_LABEL: &str = "followup:proposed";
+
 /// The role attribution recorded on translated crosslink comments (AC-16). The
 /// worker is the fake/real Implementer; the pump posts on its behalf.
 pub const WORKER_ROLE_TAG: &str = "implementer";
@@ -2227,7 +2244,14 @@ impl BuildPump {
         let issue_key = issue_id.to_string();
         let set = ArtifactSet { done: done.clone() };
         let plan = crate::artifacts::translation_plan(worker_uuid, &set)?;
+        // Whether this artifact set carried ≥1 follow-up proposal (REQ-SWARM-2).
+        // Recorded off the *plan*, independent of ledger dedup, so a replay that
+        // re-posts nothing still (idempotently) re-asserts the label.
+        let mut has_followup = false;
         for item in plan {
+            if item.kind == CommentKind::Followup {
+                has_followup = true;
+            }
             if self.state.is_posted(
                 &issue_key,
                 &item.artifact_path,
@@ -2251,6 +2275,15 @@ impl BuildPump {
                 comment_id: comment_id.to_string(),
                 posted_at: now_unix(),
             })?;
+        }
+        // Propose-don't-commit (REQ-SWARM-2): the ONLY graph-side effect of a
+        // worker's follow-up proposals is this one named label, so the chief can
+        // find issues with pending proposals. It is NOT a `phase:*` label and
+        // nothing in the pump keys off it — promotion into a real graphed issue
+        // is the trusted single writer's job. `label_add` is idempotent.
+        if has_followup {
+            self.crosslink
+                .label_add(issue_id, FOLLOWUP_PROPOSED_LABEL)?;
         }
         Ok(())
     }

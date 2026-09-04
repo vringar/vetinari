@@ -77,8 +77,92 @@ pub const RESULT_FILE: &str = "result.md";
 /// The Adversary findings artifact (one JSON finding per line).
 pub const FINDINGS_FILE: &str = "findings.jsonl";
 
+/// Max number of [`Finding`]s a single `findings.jsonl` may carry. An Adversary
+/// driving an inbound issue is UNTRUSTED (spec §1.6): without a count cap it can
+/// write a huge `findings.jsonl` whose translation posts hundreds of thousands
+/// of `blocker` comments + ledger rows onto one issue (resource exhaustion /
+/// issue-poisoning). The cap is deliberately GENEROUS — a real adversary round
+/// posts well under ~20 findings, so no legitimate round is ever affected — yet
+/// still bounds the DoS. An over-cap artifact is a misbehaving worker, so it is
+/// REJECTED whole (a typed [`ArtifactError::SchemaViolation`]), never partially
+/// accepted (a partial accept would silently hide the misbehavior).
+const FINDINGS_MAX: usize = 256;
+
+/// Max byte length of a `findings.jsonl` artifact, checked BEFORE the per-line
+/// parse so a multi-MB file can't DoS parsing itself before the [`FINDINGS_MAX`]
+/// count check runs. Generous enough for [`FINDINGS_MAX`] real findings; an
+/// over-size file is a typed [`ArtifactError::SchemaViolation`]. See
+/// [`FINDINGS_MAX`] for the untrusted-worker rationale.
+const FINDINGS_ARTIFACT_MAX_BYTES: usize = 1024 * 1024;
+
 /// The optional progress-breadcrumb artifact.
 pub const PROGRESS_FILE: &str = "progress.jsonl";
+
+/// The optional Implementer / Merger follow-up-proposal artifact (REQ-SWARM-2,
+/// swarm-kickoff-spec §1.6): one JSON [`FollowupProposal`] per line.
+///
+/// # Propose, never commit — the load-bearing invariant
+///
+/// This artifact is the *only* channel by which a worker surfaces follow-up work
+/// it discovered while driving an issue. A worker holds crosslink **read-only**
+/// and MUST NEVER write the issue graph. This file is therefore deliberately
+/// impotent: everything it can cause is confined to
+///
+/// 1. one **`--kind followup`** comment per proposal (through the same
+///    idempotency ledger as every other artifact), and
+/// 2. the single named [`crate::pump::FOLLOWUP_PROPOSED_LABEL`] applied to the
+///    issue so the chief can find proposals awaiting review.
+///
+/// It is **impossible** for a proposal to create a crosslink issue, apply
+/// `phase:graphed` (or any `phase:*`), wire a real blocker edge, or apply
+/// `inbound-approved:land` — [`translation_plan`] maps a followups artifact to
+/// nothing but [`CommentKind::Followup`] items, and the pump's translation loop
+/// does nothing with those but post a comment and add that one label.
+/// `suggested_blockers` is rendered as **TEXT INSIDE THE COMMENT BODY** — a
+/// suggestion for the human — and is never fed to a `crosslink issue block`
+/// call. Promotion of a proposal into a real graphed issue is a human/chief
+/// action via the `vetinari` skill (the trusted single writer), out of scope for
+/// the worker→orchestrator path this module implements.
+pub const FOLLOWUPS_FILE: &str = "followups.jsonl";
+
+/// Max byte length of a [`FollowupProposal`] title. A proposal is UNTRUSTED
+/// worker output (a worker driving an inbound issue is untrusted, spec §1.6), so
+/// every field is length-capped at parse time; an over-cap title is a
+/// schema violation, never a truncation.
+const FOLLOWUP_TITLE_MAX: usize = 200;
+
+/// Max byte length of a [`FollowupProposal`] rationale (untrusted; see
+/// [`FOLLOWUP_TITLE_MAX`]).
+const FOLLOWUP_RATIONALE_MAX: usize = 4_000;
+
+/// Max byte length of a [`FollowupProposal`] gate sketch (untrusted; see
+/// [`FOLLOWUP_TITLE_MAX`]).
+const FOLLOWUP_GATE_SKETCH_MAX: usize = 2_000;
+
+/// Max number of `suggested_blockers` a single [`FollowupProposal`] may carry.
+/// These are advisory issue numbers rendered into the comment TEXT for a human;
+/// bounding the count keeps a hostile proposal from ballooning a comment body.
+const FOLLOWUP_MAX_SUGGESTED_BLOCKERS: usize = 32;
+
+/// Max number of [`FollowupProposal`]s a single `followups.jsonl` may carry. A
+/// worker driving an inbound issue is UNTRUSTED (spec §1.6): the per-proposal
+/// caps above bound each proposal's SIZE, but without a count cap a hostile
+/// worker can write a multi-MB `followups.jsonl` whose translation posts
+/// hundreds of thousands of `note` comments + ledger rows onto one issue
+/// (resource exhaustion / issue-poisoning). This is not an escalation — still
+/// only `note` comments plus the one `followup:proposed` label — but a real DoS
+/// against the modeled hostile actor. An over-cap artifact is a misbehaving
+/// worker, so it is REJECTED whole (a typed
+/// [`ArtifactError::SchemaViolation`]), never partially accepted (a partial
+/// accept would silently hide the misbehavior).
+const FOLLOWUP_MAX_PROPOSALS: usize = 32;
+
+/// Max byte length of a `followups.jsonl` artifact, checked BEFORE the per-line
+/// parse so a multi-MB file can't DoS parsing itself before the
+/// [`FOLLOWUP_MAX_PROPOSALS`] count check runs. Comfortably fits
+/// [`FOLLOWUP_MAX_PROPOSALS`] max-size proposals (each ~6.5 KB of capped
+/// fields); an over-size file is a typed [`ArtifactError::SchemaViolation`].
+const FOLLOWUP_ARTIFACT_MAX_BYTES: usize = 512 * 1024;
 
 /// Sentinel finding index for a whole-file artifact (e.g. `result.md`), per the
 /// `posted_artifacts` schema in [`crate::state`]. Per-finding artifacts use the
@@ -160,15 +244,31 @@ pub enum CommentKind {
     Blocker,
     /// A summarized progress breadcrumb cluster → `--kind observation`.
     Observation,
+    /// A worker-proposed unit of follow-up work (REQ-SWARM-2). Propose-only:
+    /// this comment records a *suggestion* for a human/chief to promote; it
+    /// never authors the graph. See [`FOLLOWUPS_FILE`].
+    ///
+    /// **Wire kind is `note`, not `followup`.** crosslink's
+    /// `KNOWN_COMMENT_KINDS` allowlist does not include `followup`, so posting
+    /// under that kind is rejected with `InvalidCommentKind`. The durable,
+    /// findable marker of a proposal is instead the freeform
+    /// [`FOLLOWUP_PROPOSED_LABEL`] plus the `**Follow-up proposal**` body
+    /// header — see [`FollowupProposal::comment_body`]. The enum variant keeps
+    /// its descriptive name as an in-code marker; only the wire token is `note`.
+    Followup,
 }
 
 impl CommentKind {
-    /// The crosslink `--kind` token.
+    /// The crosslink `--kind` token. Every value here must be in crosslink's
+    /// `KNOWN_COMMENT_KINDS` allowlist, or `comment_write` fails with
+    /// `InvalidCommentKind`. In particular [`CommentKind::Followup`] maps to
+    /// the neutral, always-allowed `note` (see its doc comment).
     pub fn as_str(self) -> &'static str {
         match self {
             CommentKind::Result => "result",
             CommentKind::Blocker => "blocker",
             CommentKind::Observation => "observation",
+            CommentKind::Followup => "note",
         }
     }
 }
@@ -364,11 +464,9 @@ impl Findings {
     /// requires an explicitly DONE-attested `findings.jsonl`.
     pub fn read(artifact_dir: &Path) -> Result<Self, ArtifactError> {
         let path = artifact_dir.join(FINDINGS_FILE);
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(source) => return Err(ArtifactError::ReadFailed { path, source }),
-        };
+        // Bounded read (untrusted worker): never slurp more than the byte cap
+        // (+1, so `parse` can see the overflow and reject) into memory.
+        let content = read_bounded(&path, FINDINGS_ARTIFACT_MAX_BYTES)?;
         Self::parse(&path, &content)
     }
 
@@ -413,14 +511,35 @@ impl Findings {
     /// Parse already-read `findings.jsonl` content. Split out from [`read`] so
     /// tests and callers can validate an in-memory buffer.
     ///
+    /// Whole-artifact bounds (untrusted Adversary, spec §1.6): total size ≤
+    /// [`FINDINGS_ARTIFACT_MAX_BYTES`] (checked first) and at most
+    /// [`FINDINGS_MAX`] findings; an over-cap file is rejected WHOLE with a
+    /// typed [`ArtifactError::SchemaViolation`], never partially accepted.
+    ///
     /// [`read`]: Findings::read
     pub fn parse(path: &Path, content: &str) -> Result<Self, ArtifactError> {
+        // Untrusted worker (spec §1.6): bound the artifact BYTE size before the
+        // per-line loop so a multi-MB file can't DoS parsing itself, then cap
+        // the COUNT so a huge file can't post hundreds of thousands of blocker
+        // comments + ledger rows onto one issue. Both are whole-artifact
+        // rejections, never partial accepts (see FINDINGS_MAX).
+        if content.len() > FINDINGS_ARTIFACT_MAX_BYTES {
+            return Err(reject_oversized(path, content, FINDINGS_ARTIFACT_MAX_BYTES));
+        }
         let mut findings = Vec::new();
         for (idx, line) in content.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
             let line_no = idx + 1;
+            if findings.len() >= FINDINGS_MAX {
+                return Err(schema_violation(
+                    path,
+                    content,
+                    line_no,
+                    format!("more than {FINDINGS_MAX} findings — refusing to parse").into(),
+                ));
+            }
             let raw: RawFinding = serde_json::from_str(line)
                 .map_err(|e| schema_violation(path, content, line_no, Box::new(e)))?;
             let location = Location::parse(&raw.location).ok_or_else(|| {
@@ -449,6 +568,209 @@ impl Findings {
     /// Whether the Adversary produced no findings (a clean round).
     pub fn is_empty(&self) -> bool {
         self.findings.is_empty()
+    }
+}
+
+// ============================================================================
+// Followups (followups.jsonl) — REQ-SWARM-2, propose-don't-commit
+// ============================================================================
+
+/// Intermediate shape a `followups.jsonl` line deserializes into before its
+/// fields are length- and content-validated into a [`FollowupProposal`]. Kept
+/// private so no unvalidated proposal escapes this module. `deny_unknown_fields`
+/// so a worker cannot smuggle an extra key (e.g. a fabricated `label` or
+/// `phase`) past the parser in the hope some future code path honors it — the
+/// schema is exactly these four fields, nothing more.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFollowup {
+    title: String,
+    rationale: String,
+    #[serde(default)]
+    suggested_blockers: Vec<i64>,
+    #[serde(default)]
+    gate_sketch: Option<String>,
+}
+
+/// One worker-proposed unit of follow-up work — a single line of
+/// `followups.jsonl` (REQ-SWARM-2, spec §1.6). Each proposal translates to
+/// exactly one comment, posted under the neutral `note` wire kind and marked
+/// as a proposal by its body header + the `followup:proposed` label.
+///
+/// **This is a proposal, not a commitment.** Nothing a worker writes here can
+/// author the issue graph; see [`FOLLOWUPS_FILE`] for the full invariant. In
+/// particular [`suggested_blockers`](FollowupProposal::suggested_blockers) is
+/// advisory text for a human — it is rendered into the comment body and is NEVER
+/// wired as a real `crosslink issue block` edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowupProposal {
+    /// One-line title of the proposed work (required, non-empty, single line).
+    pub title: String,
+    /// Why the worker believes this follow-up is needed (required).
+    pub rationale: String,
+    /// Issue numbers the worker *suggests* the follow-up might depend on.
+    /// **Advisory only** — rendered as comment text for a human to weigh, never
+    /// turned into an actual blocker edge (the propose-don't-commit invariant).
+    pub suggested_blockers: Vec<i64>,
+    /// An optional sketch of the verifiable gate the follow-up would need — a
+    /// hint for the chief who eventually graphs it, not a machine contract.
+    pub gate_sketch: Option<String>,
+}
+
+impl FollowupProposal {
+    /// Render this proposal as the body of its comment. Pure and
+    /// deterministic: [`translation_plan`] relies on identical proposals
+    /// yielding identical bodies so a replayed plan is byte-for-byte stable.
+    ///
+    /// The body opens with a greppable **`**Follow-up proposal**`** header.
+    /// This matters because the comment is posted under the generic `note`
+    /// wire kind (crosslink's allowlist has no `followup` kind); the header —
+    /// together with the [`FOLLOWUP_PROPOSED_LABEL`] — is what tells a human or
+    /// the chief that the note is a proposal rather than an ordinary note.
+    ///
+    /// The rendered body is plainly framed as a **proposal** and states, in
+    /// text, that `suggested_blockers` are advisory — so a human reading the
+    /// comment is never misled into thinking an edge was actually wired.
+    pub fn comment_body(&self) -> String {
+        let mut body = format!(
+            "**Follow-up proposal** — {}\n\n{}",
+            self.title, self.rationale
+        );
+        if !self.suggested_blockers.is_empty() {
+            body.push_str("\n\nsuggested blockers (advisory — NOT wired; a human decides):");
+            for id in &self.suggested_blockers {
+                let _ = write!(body, "\n- #{id}");
+            }
+        }
+        if let Some(sketch) = &self.gate_sketch {
+            body.push_str("\n\ngate sketch:\n");
+            body.push_str(sketch);
+        }
+        body
+    }
+}
+
+/// The parsed `followups.jsonl` artifact — zero or more [`FollowupProposal`]s in
+/// file order. An empty or absent file is valid (the common case: most workers
+/// discover no follow-up work).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Followups {
+    proposals: Vec<FollowupProposal>,
+}
+
+impl Followups {
+    /// Read and parse `followups.jsonl` from a worker's `_orchestrator/`
+    /// directory. One JSON object per line; blank lines are skipped. A malformed
+    /// line — invalid JSON, an unknown field, a missing/empty title, or an
+    /// over-cap field — is rejected with a line-numbered
+    /// [`ArtifactError::SchemaViolation`] (AC-23: never post a half-written or
+    /// hostile line as a comment). A **missing file is treated as an empty set**
+    /// — the overwhelmingly common case; a worker with no follow-ups need not
+    /// write the file at all.
+    pub fn read(artifact_dir: &Path) -> Result<Self, ArtifactError> {
+        let path = artifact_dir.join(FOLLOWUPS_FILE);
+        // Bounded read (untrusted worker): never slurp more than the byte cap
+        // (+1, so `parse` can see the overflow and reject) into memory.
+        let content = read_bounded(&path, FOLLOWUP_ARTIFACT_MAX_BYTES)?;
+        Self::parse(&path, &content)
+    }
+
+    /// Parse already-read `followups.jsonl` content. Split out from [`read`] so
+    /// tests and [`translation_plan`] can validate an in-memory buffer (the
+    /// latter parses the DONE-verified bytes, never a re-read).
+    ///
+    /// Validation (untrusted worker output, spec §1.6):
+    /// - `title` non-empty after trimming, single line (no `\r`/`\n`), ≤
+    ///   [`FOLLOWUP_TITLE_MAX`] bytes,
+    /// - `rationale` ≤ [`FOLLOWUP_RATIONALE_MAX`] bytes,
+    /// - `gate_sketch` (if present) ≤ [`FOLLOWUP_GATE_SKETCH_MAX`] bytes,
+    /// - at most [`FOLLOWUP_MAX_SUGGESTED_BLOCKERS`] `suggested_blockers`.
+    ///
+    /// Whole-artifact bounds (untrusted-worker DoS, spec §1.6), checked so a
+    /// misbehaving worker can neither DoS the parse loop nor poison an issue:
+    /// - total size ≤ [`FOLLOWUP_ARTIFACT_MAX_BYTES`] (checked first, before any
+    ///   line is parsed),
+    /// - at most [`FOLLOWUP_MAX_PROPOSALS`] proposals; an over-cap file is
+    ///   rejected WHOLE, never partially accepted.
+    ///
+    /// [`read`]: Followups::read
+    pub fn parse(path: &Path, content: &str) -> Result<Self, ArtifactError> {
+        // Untrusted worker (spec §1.6): bound the artifact BYTE size before the
+        // per-line loop so a multi-MB file can't DoS parsing itself, then cap
+        // the COUNT so a huge file can't post hundreds of thousands of note
+        // comments + ledger rows onto one issue. Both are whole-artifact
+        // rejections, never partial accepts (see FOLLOWUP_MAX_PROPOSALS).
+        if content.len() > FOLLOWUP_ARTIFACT_MAX_BYTES {
+            return Err(reject_oversized(path, content, FOLLOWUP_ARTIFACT_MAX_BYTES));
+        }
+        let mut proposals = Vec::new();
+        for (idx, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let line_no = idx + 1;
+
+            let reject = |msg: String| schema_violation(path, content, line_no, msg.into());
+
+            if proposals.len() >= FOLLOWUP_MAX_PROPOSALS {
+                return Err(reject(format!(
+                    "more than {FOLLOWUP_MAX_PROPOSALS} follow-up proposals"
+                )));
+            }
+
+            let raw: RawFollowup = serde_json::from_str(line)
+                .map_err(|e| schema_violation(path, content, line_no, Box::new(e)))?;
+
+            if raw.title.trim().is_empty() {
+                return Err(reject("`title` must be non-empty".to_owned()));
+            }
+            // A title with an embedded newline would break the single-line
+            // comment header (and could smuggle a fake second "field" past a
+            // human skimming the comment). Reject rather than strip.
+            if raw.title.contains(['\r', '\n']) {
+                return Err(reject("`title` must be a single line".to_owned()));
+            }
+            if raw.title.len() > FOLLOWUP_TITLE_MAX {
+                return Err(reject(format!(
+                    "`title` exceeds {FOLLOWUP_TITLE_MAX} bytes"
+                )));
+            }
+            if raw.rationale.len() > FOLLOWUP_RATIONALE_MAX {
+                return Err(reject(format!(
+                    "`rationale` exceeds {FOLLOWUP_RATIONALE_MAX} bytes"
+                )));
+            }
+            if let Some(sketch) = &raw.gate_sketch {
+                if sketch.len() > FOLLOWUP_GATE_SKETCH_MAX {
+                    return Err(reject(format!(
+                        "`gate_sketch` exceeds {FOLLOWUP_GATE_SKETCH_MAX} bytes"
+                    )));
+                }
+            }
+            if raw.suggested_blockers.len() > FOLLOWUP_MAX_SUGGESTED_BLOCKERS {
+                return Err(reject(format!(
+                    "`suggested_blockers` exceeds {FOLLOWUP_MAX_SUGGESTED_BLOCKERS} entries"
+                )));
+            }
+
+            proposals.push(FollowupProposal {
+                title: raw.title,
+                rationale: raw.rationale,
+                suggested_blockers: raw.suggested_blockers,
+                gate_sketch: raw.gate_sketch,
+            });
+        }
+        Ok(Followups { proposals })
+    }
+
+    /// The proposals in file order.
+    pub fn proposals(&self) -> &[FollowupProposal] {
+        &self.proposals
+    }
+
+    /// Whether the worker proposed no follow-up work (the common case).
+    pub fn is_empty(&self) -> bool {
+        self.proposals.is_empty()
     }
 }
 
@@ -780,6 +1102,15 @@ pub struct TranslationItem {
 /// - **`findings.jsonl`** → one `blocker` comment per finding, keyed by the
 ///   finding's 0-based line index. Parsing the verified bytes can fail (a
 ///   malformed line), surfacing an [`ArtifactError::SchemaViolation`].
+/// - **`followups.jsonl`** → one follow-up comment per proposal, keyed by the
+///   proposal's 0-based line index (REQ-SWARM-2). The comment posts under the
+///   neutral `note` wire kind (crosslink's allowlist has no `followup` kind);
+///   [`CommentKind::Followup`] is the in-code marker for these items. Propose-
+///   only: a followups artifact can produce *nothing* but
+///   [`CommentKind::Followup`] items — it can never mint a `result` (a "work is
+///   done" signal) or a `blocker`, and the pump translates these items into a
+///   comment plus the single `followup:proposed` label and nothing else. See
+///   [`FOLLOWUPS_FILE`].
 /// - any other declared artifact (`DONE`, `progress.jsonl`, …) is not
 ///   translated to a comment and is skipped.
 ///
@@ -831,6 +1162,27 @@ pub fn translation_plan(
                     });
                 }
             }
+            FOLLOWUPS_FILE => {
+                // Propose-don't-commit (REQ-SWARM-2): a followups artifact maps
+                // to follow-up comments ONLY (wire kind `note`; the enum marks
+                // them CommentKind::Followup). It can never emit a
+                // `result`/`blocker`, and the pump does nothing with these items
+                // but post a comment + add the `followup:proposed` label. Parse
+                // the *verified* bytes, exactly like findings, so key and body
+                // agree. `suggested_blockers` stays TEXT in the body — never an
+                // edge.
+                let content = String::from_utf8_lossy(artifact.bytes());
+                let followups = Followups::parse(Path::new(artifact.path()), &content)?;
+                for (idx, proposal) in followups.proposals().iter().enumerate() {
+                    items.push(TranslationItem {
+                        artifact_path: artifact.path().to_owned(),
+                        content_sha: artifact.sha256().to_owned(),
+                        finding_index: idx as i64,
+                        kind: CommentKind::Followup,
+                        body: proposal.comment_body(),
+                    });
+                }
+            }
             // DONE itself, progress.jsonl, and anything else declared but not
             // comment-translated.
             _ => {}
@@ -851,6 +1203,35 @@ fn read_file(path: &Path) -> Result<String, ArtifactError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Read an *untrusted* artifact to a `String`, reading at most `max_bytes + 1`
+/// bytes so a hostile multi-GB file can never be slurped whole into memory
+/// before the caller's `parse` runs its size check. A missing file yields an
+/// empty string (both `findings.jsonl` and `followups.jsonl` treat absent as an
+/// empty set). The `+ 1` is deliberate: it is exactly enough for `parse` to
+/// observe an over-`max_bytes` length and reject with a
+/// [`ArtifactError::SchemaViolation`], never enough to be a memory DoS.
+fn read_bounded(path: &Path, max_bytes: usize) -> Result<String, ArtifactError> {
+    use std::io::Read as _;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(source) => {
+            return Err(ArtifactError::ReadFailed {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut buf = String::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_string(&mut buf)
+        .map_err(|source| ArtifactError::ReadFailed {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(buf)
 }
 
 /// Whether `path` is safe to resolve against the workspace root: relative, and
@@ -876,6 +1257,33 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// Reject an over-size artifact with a typed [`ArtifactError::SchemaViolation`].
+///
+/// Both [`Findings::parse`] and [`Followups::parse`] call this BEFORE their
+/// per-line loop: a worker driving an inbound issue is untrusted (spec §1.6),
+/// and an unbounded artifact would let the parse loop itself be DoS'd (a
+/// multi-MB file is millions of lines) before the per-artifact count cap can
+/// fire. The offending condition is the *total* length, not any single line, so
+/// the diagnostic labels line 1 and embeds only a bounded preview of the body
+/// (rendering a multi-MB source just to point at line 1 would be wasteful, and
+/// on the DONE-verified path the verified bytes can be larger than the cap).
+fn reject_oversized(path: &Path, content: &str, max_bytes: usize) -> ArtifactError {
+    let mut preview_end = content.len().min(4096);
+    while !content.is_char_boundary(preview_end) {
+        preview_end -= 1;
+    }
+    schema_violation(
+        path,
+        &content[..preview_end],
+        1,
+        format!(
+            "artifact is {} bytes, exceeding the {max_bytes}-byte cap — refusing to parse",
+            content.len()
+        )
+        .into(),
+    )
 }
 
 /// Build a line-numbered [`ArtifactError::SchemaViolation`] pointing at
@@ -931,6 +1339,7 @@ mod tests {
     /// hardcoded full path; the tests still write realistic DONE entries.
     const RESULT_PATH: &str = "_orchestrator/result.md";
     const FINDINGS_PATH: &str = "_orchestrator/findings.jsonl";
+    const FOLLOWUPS_PATH: &str = "_orchestrator/followups.jsonl";
 
     /// SHA-256 of `bytes` as lowercase hex, computed the same way production
     /// does — the tests assert this equals what the worker's `sha256sum` writes.
@@ -1212,6 +1621,47 @@ mod tests {
     }
 
     #[test]
+    fn findings_over_count_cap_rejected_whole() {
+        // Untrusted Adversary DoS: > FINDINGS_MAX valid findings is rejected
+        // WHOLE (never partially accepted). The cap is GENEROUS — a real round
+        // posts well under it — so no legitimate multi-finding round is affected.
+        let path = Path::new("findings.jsonl");
+        let line = r#"{"severity":"low","location":"a:1","claim":"x"}"#;
+        let over = std::iter::repeat_n(line, FINDINGS_MAX + 1)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Stays well under the byte cap, so it is the COUNT cap that fires.
+        assert!(over.len() < FINDINGS_ARTIFACT_MAX_BYTES);
+        assert!(matches!(
+            Findings::parse(path, &over).unwrap_err(),
+            ArtifactError::SchemaViolation { line_no, .. } if line_no == FINDINGS_MAX + 1
+        ));
+        // Exactly at the cap is accepted.
+        let at_cap = std::iter::repeat_n(line, FINDINGS_MAX)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            Findings::parse(path, &at_cap)
+                .expect("cap is inclusive")
+                .findings()
+                .len(),
+            FINDINGS_MAX
+        );
+    }
+
+    #[test]
+    fn findings_oversized_artifact_rejected_before_parse() {
+        // A blob over the byte cap is rejected by the size check BEFORE any line
+        // is parsed — parsing itself can't be DoS'd.
+        let path = Path::new("findings.jsonl");
+        let content = "a".repeat(FINDINGS_ARTIFACT_MAX_BYTES + 1);
+        assert!(matches!(
+            Findings::parse(path, &content).unwrap_err(),
+            ArtifactError::SchemaViolation { line_no: 1, .. }
+        ));
+    }
+
+    #[test]
     fn finding_to_jsonl_line_round_trips_through_parse() {
         // A finding serialized to a jsonl line re-parses back into the same
         // finding — the pump delivers prior findings to a re-implement round's
@@ -1347,6 +1797,287 @@ mod tests {
         let set = ArtifactSet { done };
         drop(tmp);
         assert!(translation_plan("w", &set).expect("plan").is_empty());
+    }
+
+    // --- followups.jsonl (REQ-SWARM-2, propose-don't-commit) ----------------
+
+    fn valid_followups_content() -> String {
+        [
+            r#"{"title":"Add say_bye()","rationale":"symmetry with say_hi","suggested_blockers":[1,2],"gate_sketch":"test say_bye() == \"bye\""}"#,
+            r#"{"title":"Localize greetings","rationale":"english is hard-coded"}"#,
+        ]
+        .join("\n")
+    }
+
+    /// Build a realistic Implementer artifact set that ALSO declares
+    /// `followups.jsonl` (result.md + followups.jsonl + DONE), for the followup
+    /// translation tests.
+    fn followups_set(followups_body: &str) -> (TempDir, ArtifactSet) {
+        let (tmp, root) = workspace();
+        let result_body = "Implemented the thing; proposed follow-ups.\n";
+        write_artifact(&root, RESULT_FILE, result_body);
+        write_artifact(&root, FOLLOWUPS_FILE, followups_body);
+        write_done(
+            &root,
+            "success",
+            &[
+                (RESULT_PATH, &sha(result_body.as_bytes())),
+                (FOLLOWUPS_PATH, &sha(followups_body.as_bytes())),
+            ],
+        );
+        let done = DoneSentinel::verify(&root).expect("verify");
+        (tmp, ArtifactSet { done })
+    }
+
+    #[test]
+    fn followups_parse_required_and_optional_fields() {
+        let path = Path::new("followups.jsonl");
+        let f = Followups::parse(path, &valid_followups_content()).expect("parse");
+        assert_eq!(f.proposals().len(), 2);
+        assert_eq!(f.proposals()[0].title, "Add say_bye()");
+        assert_eq!(f.proposals()[0].rationale, "symmetry with say_hi");
+        assert_eq!(f.proposals()[0].suggested_blockers, vec![1, 2]);
+        assert_eq!(
+            f.proposals()[0].gate_sketch.as_deref(),
+            Some("test say_bye() == \"bye\"")
+        );
+        // Second proposal omits the optionals.
+        assert!(f.proposals()[1].suggested_blockers.is_empty());
+        assert!(f.proposals()[1].gate_sketch.is_none());
+    }
+
+    #[test]
+    fn missing_followups_file_is_empty() {
+        let (_tmp, root) = workspace();
+        let f = Followups::read(&root.join(ARTIFACT_DIR)).expect("missing = empty");
+        assert!(
+            f.is_empty(),
+            "an absent followups.jsonl is the common no-op case"
+        );
+    }
+
+    #[test]
+    fn empty_followups_is_valid() {
+        let path = Path::new("followups.jsonl");
+        assert!(Followups::parse(path, "").expect("empty").is_empty());
+        assert!(Followups::parse(path, "\n  \n").expect("blank").is_empty());
+    }
+
+    #[test]
+    fn followups_missing_title_rejected() {
+        let path = Path::new("followups.jsonl");
+        let content = r#"{"rationale":"no title here"}"#;
+        assert!(matches!(
+            Followups::parse(path, content).unwrap_err(),
+            ArtifactError::SchemaViolation { line_no: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn followups_empty_title_rejected() {
+        let path = Path::new("followups.jsonl");
+        let content = r#"{"title":"   ","rationale":"blank title"}"#;
+        assert!(matches!(
+            Followups::parse(path, content).unwrap_err(),
+            ArtifactError::SchemaViolation { line_no: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn followups_oversized_title_rejected() {
+        let path = Path::new("followups.jsonl");
+        let big = "x".repeat(FOLLOWUP_TITLE_MAX + 1);
+        let content = format!(r#"{{"title":"{big}","rationale":"ok"}}"#);
+        assert!(matches!(
+            Followups::parse(path, &content).unwrap_err(),
+            ArtifactError::SchemaViolation { line_no: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn followups_title_with_newline_rejected() {
+        // A newline in the title could smuggle a fake field past a human skimming
+        // the comment; reject rather than render it into the header.
+        let path = Path::new("followups.jsonl");
+        let content = r#"{"title":"line one\nline two","rationale":"ok"}"#;
+        assert!(matches!(
+            Followups::parse(path, content).unwrap_err(),
+            ArtifactError::SchemaViolation { line_no: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn followups_unknown_field_rejected() {
+        // `deny_unknown_fields`: a worker cannot smuggle an extra key (e.g. a
+        // fabricated label/phase) past the parser.
+        let path = Path::new("followups.jsonl");
+        let content = r#"{"title":"t","rationale":"r","phase":"graphed"}"#;
+        assert!(matches!(
+            Followups::parse(path, content).unwrap_err(),
+            ArtifactError::SchemaViolation { line_no: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn followups_too_many_suggested_blockers_rejected() {
+        let path = Path::new("followups.jsonl");
+        let ids: Vec<String> = (0..=FOLLOWUP_MAX_SUGGESTED_BLOCKERS)
+            .map(|n| n.to_string())
+            .collect();
+        let content = format!(
+            r#"{{"title":"t","rationale":"r","suggested_blockers":[{}]}}"#,
+            ids.join(",")
+        );
+        assert!(matches!(
+            Followups::parse(path, &content).unwrap_err(),
+            ArtifactError::SchemaViolation { line_no: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn followups_over_proposal_cap_rejected_whole() {
+        // Untrusted-worker DoS: > FOLLOWUP_MAX_PROPOSALS valid proposals is a
+        // misbehaving worker. The artifact is rejected WHOLE (no partial accept)
+        // and the rejection points at the first over-cap line.
+        let path = Path::new("followups.jsonl");
+        let line = r#"{"title":"t","rationale":"r"}"#;
+        let over: Vec<&str> = std::iter::repeat_n(line, FOLLOWUP_MAX_PROPOSALS + 1).collect();
+        let content = over.join("\n");
+        // Stays well under the byte cap, so it is the COUNT cap that fires.
+        assert!(content.len() < FOLLOWUP_ARTIFACT_MAX_BYTES);
+        assert!(matches!(
+            Followups::parse(path, &content).unwrap_err(),
+            ArtifactError::SchemaViolation {
+                line_no,
+                ..
+            } if line_no == FOLLOWUP_MAX_PROPOSALS + 1
+        ));
+        // Exactly at the cap is still accepted (the bound is generous, not
+        // hair-trigger).
+        let at_cap = std::iter::repeat_n(line, FOLLOWUP_MAX_PROPOSALS)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            Followups::parse(path, &at_cap)
+                .expect("cap is inclusive")
+                .proposals()
+                .len(),
+            FOLLOWUP_MAX_PROPOSALS
+        );
+    }
+
+    #[test]
+    fn followups_oversized_artifact_rejected_before_parse() {
+        // A multi-KB blob over the byte cap is rejected by the size check BEFORE
+        // any line is parsed (a single over-cap "line" so the count cap can't be
+        // what fires) — parsing itself can't be DoS'd.
+        let path = Path::new("followups.jsonl");
+        let content = "a".repeat(FOLLOWUP_ARTIFACT_MAX_BYTES + 1);
+        assert!(matches!(
+            Followups::parse(path, &content).unwrap_err(),
+            ArtifactError::SchemaViolation { line_no: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn plan_rejects_over_cap_followups_no_items_posted() {
+        // End to end: an over-cap followups.jsonl in a real artifact set fails
+        // the plan at parse, so NO comments (and hence no `followup:proposed`
+        // label) are ever produced for it.
+        let line = r#"{"title":"t","rationale":"r"}"#;
+        let body = std::iter::repeat_n(line, FOLLOWUP_MAX_PROPOSALS + 1)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_tmp, set) = followups_set(&body);
+        assert!(matches!(
+            translation_plan("w", &set).unwrap_err(),
+            ArtifactError::SchemaViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn followup_comment_body_frames_a_proposal_with_advisory_blockers() {
+        let f = Followups::parse(Path::new("f.jsonl"), &valid_followups_content()).expect("parse");
+        let body = f.proposals()[0].comment_body();
+        // Greppable header — the marker that this generic `note` is a proposal.
+        assert!(body.starts_with("**Follow-up proposal** — Add say_bye()"));
+        assert!(body.contains("symmetry with say_hi"));
+        // suggested_blockers rendered as advisory TEXT, explicitly NOT wired.
+        assert!(body.contains("advisory") && body.contains("NOT wired"));
+        assert!(body.contains("#1") && body.contains("#2"));
+        assert!(body.contains("gate sketch:"));
+    }
+
+    #[test]
+    fn plan_for_followups_is_one_followup_item_per_proposal() {
+        let (_tmp, set) = followups_set(&valid_followups_content());
+        let plan = translation_plan("w-f", &set).expect("plan");
+        // The result.md yields a Result item; the two proposals yield two
+        // Followup items. Assert the followup items precisely.
+        let followups: Vec<&TranslationItem> = plan
+            .iter()
+            .filter(|i| i.kind == CommentKind::Followup)
+            .collect();
+        assert_eq!(followups.len(), 2, "one followup item per proposal");
+        for (idx, item) in followups.iter().enumerate() {
+            assert_eq!(item.finding_index, idx as i64);
+            assert_eq!(item.artifact_path, FOLLOWUPS_PATH);
+        }
+        assert!(followups[0].body.contains("Add say_bye()"));
+        assert!(followups[1].body.contains("Localize greetings"));
+    }
+
+    #[test]
+    fn plan_for_followups_emits_only_followup_and_result_never_blocker() {
+        // THE INVARIANT (propose-don't-commit): a followups artifact can produce
+        // ONLY CommentKind::Followup items. It can never mint a `blocker`, and
+        // the result.md (separately) is the only other kind — never a followup
+        // masquerading as one. Assert no Blocker/Observation slipped in.
+        let (_tmp, set) = followups_set(&valid_followups_content());
+        let plan = translation_plan("w-f", &set).expect("plan");
+        for item in &plan {
+            assert!(
+                matches!(item.kind, CommentKind::Followup | CommentKind::Result),
+                "a followups+result set must never emit {:?}",
+                item.kind
+            );
+        }
+        // And every item derived from followups.jsonl is a Followup, never else.
+        for item in &plan {
+            if item.artifact_path == FOLLOWUPS_PATH {
+                assert_eq!(
+                    item.kind,
+                    CommentKind::Followup,
+                    "a followups.jsonl item must be a Followup, got {:?}",
+                    item.kind
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plan_for_followups_is_idempotent_across_replay() {
+        let (_tmp, set) = followups_set(&valid_followups_content());
+        let worker = "w-f42";
+        let plan = translation_plan(worker, &set).expect("plan");
+        let mut ledger = HashSet::new();
+        let first = simulate_post(&mut ledger, worker, &plan);
+        assert_eq!(first, plan.len(), "first pass posts every item once");
+        let replay = translation_plan(worker, &set).expect("plan");
+        assert_eq!(plan, replay, "same inputs, same plan");
+        let second = simulate_post(&mut ledger, worker, &replay);
+        assert_eq!(second, 0, "replay must post nothing (ledger-deduped)");
+    }
+
+    #[test]
+    fn plan_rejects_malformed_followups_line() {
+        // A schema-violating followups line fails the plan at parse — a
+        // half-written or hostile line is never posted (AC-23).
+        let (_tmp, set) = followups_set(r#"{"rationale":"no title"}"#);
+        assert!(matches!(
+            translation_plan("w", &set).unwrap_err(),
+            ArtifactError::SchemaViolation { .. }
+        ));
     }
 
     // --- strict convergence reader (Findings::from_done) --------------------

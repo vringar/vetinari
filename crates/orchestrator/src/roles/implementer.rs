@@ -209,10 +209,21 @@ When the implementation is complete and verified, produce your artifacts under \
 
 1. Write `_orchestrator/result.md` describing what you changed and which task \
    items / prior findings it addressed.
-2. Write `_orchestrator/DONE` as your VERY LAST filesystem operation. Its \
+2. OPTIONAL: if — while doing this task — you discovered follow-up work that is \
+   OUT OF SCOPE for this issue (\"we also need to parse sub-record Y\", \"Z is \
+   blocked on recovering enum W\"), you MAY write `_orchestrator/followups.jsonl`, \
+   one JSON object per line: {\"title\":\"<one line>\",\"rationale\":\"<why>\",\"suggested_blockers\":[<issue numbers>],\"gate_sketch\":\"<how it'd be verified>\"}. \
+   Only `title` and `rationale` are required. These are PROPOSALS a human \
+   reviews and may later graph — they are NOT scheduled automatically, and you \
+   must NOT try to create issues, set labels, or add blockers yourself (you have \
+   read-only access to the tracker, by design). Omit the file entirely if you \
+   found no follow-up work.
+3. Write `_orchestrator/DONE` as your VERY LAST filesystem operation. Its \
    content is JSON: {\"exit_status\":\"success\",\"artifacts\":[{\"path\":\"_orchestrator/result.md\",\"sha256\":\"<sha256 of result.md>\"}]}. \
-   Use `sha256sum` to compute the hash. If you could not complete the task, set \
-   \"exit_status\":\"error\" instead.
+   List EVERY artifact you wrote under `_orchestrator/` (including \
+   `followups.jsonl` if you wrote it) in the `artifacts` array with its \
+   `sha256`. Use `sha256sum` to compute each hash. If you could not complete the \
+   task, set \"exit_status\":\"error\" instead.
 
 Constraints: stay within your workspace directory. Never read or write the \
 orchestrator-private `.orchestrator/` directory (note the leading dot — it is \
