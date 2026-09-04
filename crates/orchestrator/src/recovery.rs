@@ -606,7 +606,26 @@ fn recover_issue(
                 landing::resume_from(state, log, manager, &issue.issue_id, "", substate)
                     .map_err(landing_err)?
             } else {
-                let change = landing_change_revset(manager, &issue.issue_id, issue.round)?;
+                // Resolve the change to complete the landing from. An
+                // approved-inbound resume (`park_for_inbound_approval` →
+                // `resume_approved_inbound` → `land`) persisted the exact
+                // human-reviewed change in `issues.landing_change` at park time,
+                // PRECISELY because its Implementer workspace is already forgotten by
+                // landing time — so the workspace scan below cannot re-derive it and
+                // would quarantine the issue instead of completing it. When that
+                // durable handle is present, complete the landing from THAT stored
+                // change: it lands exactly the change a human approved (a security
+                // property), and `resume_from(RebaseStarted)` is idempotent — a
+                // change already a descendant of `main` is a fast-forward no-op, so a
+                // crash mid-recovery-land re-completes safely.
+                //
+                // A normal (non-inbound) landing leaves `landing_change` null and is
+                // re-derived from the live `implementing` workspace exactly as before
+                // — behavior on that path is UNCHANGED.
+                let change = match &issue.landing_change {
+                    Some(stored) => stored.clone(),
+                    None => landing_change_revset(manager, &issue.issue_id, issue.round)?,
+                };
                 landing::resume_from(state, log, manager, &issue.issue_id, &change, substate)
                     .map_err(landing_err)?
             };

@@ -118,6 +118,15 @@ str_enum! {
         PrOpen => "pr-open",
         /// Landing failed and needs a human merge — terminal until resumed.
         AwaitingHumanMerge => "awaiting-human-merge",
+        /// A converged **`xb:inbound`** (untrusted-origin) issue, parked at the
+        /// human trust-gate: it has passed implement → QA → adversary → converged
+        /// but MUST NOT auto-land (REQ-SWARM-1). It stays here — a parked, terminal,
+        /// non-drivable phase (the `AwaitingHumanMerge` model) — until a human adds
+        /// the explicit `inbound-approved:land` label, which resumes it into
+        /// landing. This is the single structural enforcement of the threat model's
+        /// "untrusted origin ⇒ HARD NO-GO on auto-land", holding regardless of
+        /// `tracker_remote` mode or any `auto_graph` policy.
+        AwaitingInboundApproval => "awaiting-inbound-approval",
         /// An unrecoverable orchestrator-side fault — terminal.
         OrchestratorError => "orchestrator-error",
     }
@@ -156,12 +165,23 @@ impl Phase {
     /// **Step 6** (the human inbound gate) adds the `awaiting-inbound-approval`
     /// terminal here, as a single new arm — this is the one and only place the
     /// terminal set is enumerated, so that change touches exactly this function.
+    ///
+    /// `AwaitingInboundApproval` is a **parked terminal**: like `AwaitingHumanMerge`
+    /// it is not driven and not advanced by the pump's drive step or by
+    /// crash-recovery. Being in the terminal set makes the crossbridge answer-back
+    /// trigger fire when an inbound issue parks here, so the source peer is answered
+    /// once at the park (spec §1.3, "so a peer is never left waiting"); the
+    /// label-gated resume back into landing is driven separately by the pump's
+    /// approval sweep, not by the drive step (so `is_drivable` stays `false`).
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Phase::Merged | Phase::PrOpen | Phase::AwaitingHumanMerge | Phase::OrchestratorError
+            Phase::Merged
+                | Phase::PrOpen
+                | Phase::AwaitingHumanMerge
+                | Phase::AwaitingInboundApproval
+                | Phase::OrchestratorError
         )
-        // Step 6: | Phase::AwaitingInboundApproval
     }
 }
 
@@ -267,7 +287,11 @@ str_enum! {
 /// - v2 — adds `issues.answer_attempts` ([`MIGRATION_V2`]), the durable retry
 ///   counter the crossbridge answer-back state machine bounds against
 ///   (`.design/swarm-kickoff-spec.md` §1.3).
-const SCHEMA_VERSION: u32 = 2;
+/// - v3 — adds `issues.landing_change` ([`MIGRATION_V3`]), the durable
+///   converged-change handle an `xb:inbound` issue parked at
+///   `awaiting-inbound-approval` (REQ-SWARM-1) is landed from once a human
+///   approves it — persisted so the label-gated resume survives a restart.
+const SCHEMA_VERSION: u32 = 3;
 
 /// How long a connection waits out a transient SQLite lock before giving up
 /// (D7). Applied to **both** openers:
@@ -372,6 +396,26 @@ const MIGRATION_V2: &str = r#"
 ALTER TABLE issues ADD COLUMN answer_attempts INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// Schema v3 — the durable converged-change handle for the inbound human-gate
+/// (`.design/swarm-kickoff-spec.md` §1.2, REQ-SWARM-1). Adds one **nullable**
+/// column to `issues`: `landing_change`, the resolved jj change/commit id of the
+/// reviewed change an `xb:inbound` issue converged on.
+///
+/// It is written the moment the approval gate parks a converged inbound issue at
+/// `awaiting-inbound-approval` (the Implementer workspace is already forgotten by
+/// then, so the reviewed change can no longer be re-derived from a workspace) and
+/// read back when a human's `inbound-approved:land` label resumes it — so the pump
+/// lands **exactly the reviewed change the human approved**, never a fresh
+/// re-implementation, and the approval survives an orchestrator restart while
+/// parked. `NULL` for every non-inbound issue and every inbound issue that has not
+/// yet parked for approval.
+///
+/// `ALTER TABLE … ADD COLUMN` with no `NOT NULL`/default is a metadata-only change:
+/// existing rows read back `NULL` with no table rewrite (forward-only, REQ-2).
+const MIGRATION_V3: &str = r#"
+ALTER TABLE issues ADD COLUMN landing_change TEXT;
+"#;
+
 // ============================================================================
 // Row types
 // ============================================================================
@@ -411,6 +455,12 @@ pub struct IssueRow {
     /// and caps the retry so a permanently-offline peer never makes the sweep
     /// spin.
     pub answer_attempts: i64,
+    /// The resolved jj change/commit id an `xb:inbound` issue converged on, stored
+    /// when the approval gate parks it at `awaiting-inbound-approval` (REQ-SWARM-1)
+    /// so the label-gated resume lands **exactly that reviewed change** (never a
+    /// fresh re-implementation) even across an orchestrator restart. `None` for
+    /// every non-inbound issue and every inbound issue not yet parked for approval.
+    pub landing_change: Option<String>,
 }
 
 impl IssueRow {
@@ -428,6 +478,7 @@ impl IssueRow {
             landing_retry_count: 0,
             updated_at: now_unix(),
             answer_attempts: 0,
+            landing_change: None,
         }
     }
 }
@@ -502,7 +553,8 @@ pub struct EventRow {
 // ============================================================================
 
 const ISSUE_COLUMNS: &str = "issue_id, phase, phase_substate, round, convergence_mode, \
-     empty_round_streak, last_diff_hash, landing_retry_count, updated_at, answer_attempts";
+     empty_round_streak, last_diff_hash, landing_retry_count, updated_at, answer_attempts, \
+     landing_change";
 
 const WORKER_COLUMNS: &str = "worker_uuid, issue_id, role, round, workspace_path, pid, \
      spawned_at, last_heartbeat";
@@ -642,6 +694,9 @@ impl StateDb {
         if current < 2 {
             self.apply_migration(2, MIGRATION_V2)?;
         }
+        if current < 3 {
+            self.apply_migration(3, MIGRATION_V3)?;
+        }
         Ok(())
     }
 
@@ -664,8 +719,8 @@ impl StateDb {
                 "INSERT INTO issues
                    (issue_id, phase, phase_substate, round, convergence_mode,
                     empty_round_streak, last_diff_hash, landing_retry_count, updated_at,
-                    answer_attempts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    answer_attempts, landing_change)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(issue_id) DO UPDATE SET
                    phase               = excluded.phase,
                    phase_substate      = excluded.phase_substate,
@@ -675,7 +730,8 @@ impl StateDb {
                    last_diff_hash      = excluded.last_diff_hash,
                    landing_retry_count = excluded.landing_retry_count,
                    updated_at          = excluded.updated_at,
-                   answer_attempts     = excluded.answer_attempts",
+                   answer_attempts     = excluded.answer_attempts,
+                   landing_change      = excluded.landing_change",
                 params![
                     issue.issue_id,
                     issue.phase,
@@ -687,6 +743,7 @@ impl StateDb {
                     issue.landing_retry_count,
                     issue.updated_at,
                     issue.answer_attempts,
+                    issue.landing_change,
                 ],
             )
             .map_err(query_err("upsert issue"))?;
@@ -757,6 +814,25 @@ impl StateDb {
                 params![substate.map(|s| s.as_str()), now_unix(), issue_id],
             )
             .map_err(query_err("set issue phase_substate"))?;
+        Ok(())
+    }
+
+    /// Persist the converged-change handle an `xb:inbound` issue is parked on at
+    /// `awaiting-inbound-approval` (REQ-SWARM-1), stamping `updated_at` to now.
+    ///
+    /// Written the moment the approval gate parks the issue — **before** its phase
+    /// is flipped to `awaiting-inbound-approval` — so the reviewed change is durable
+    /// the instant the issue is observably parked, and the label-gated resume can
+    /// always land exactly it (even after an orchestrator restart). A targeted
+    /// `UPDATE` (not an `upsert_issue`) so it never disturbs the row's other
+    /// columns, and `phase`/`phase_substate` here are intentionally left untouched.
+    pub fn set_landing_change(&self, issue_id: &str, change: &str) -> Result<(), StateError> {
+        self.conn
+            .execute(
+                "UPDATE issues SET landing_change = ?1, updated_at = ?2 WHERE issue_id = ?3",
+                params![change, now_unix(), issue_id],
+            )
+            .map_err(query_err("set landing change"))?;
         Ok(())
     }
 
@@ -1130,6 +1206,7 @@ fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IssueRow> {
         landing_retry_count: row.get(7)?,
         updated_at: row.get(8)?,
         answer_attempts: row.get(9)?,
+        landing_change: row.get(10)?,
     })
 }
 
@@ -1345,6 +1422,34 @@ mod tests {
         assert_eq!(row.phase, Phase::Merged);
         assert_eq!(row.phase_substate.as_deref(), Some("answer_sent"));
         assert_eq!(row.answer_attempts, 2);
+    }
+
+    #[test]
+    fn set_landing_change_persists_the_converged_handle_without_touching_phase() {
+        let (_dir, db) = temp_db();
+        // A converged inbound issue about to park for approval (REQ-SWARM-1).
+        db.upsert_issue(&IssueRow::new("7", Phase::Converged))
+            .unwrap();
+        assert_eq!(db.get_issue("7").unwrap().unwrap().landing_change, None);
+
+        // The gate stores the reviewed change, then (separately) parks the phase.
+        db.set_landing_change("7", "zzqqrr").unwrap();
+        let row = db.get_issue("7").unwrap().unwrap();
+        assert_eq!(row.landing_change.as_deref(), Some("zzqqrr"));
+        assert_eq!(
+            row.phase,
+            Phase::Converged,
+            "the setter must not move phase"
+        );
+
+        // Parking the phase leaves the stored change intact (set_phase is a
+        // targeted UPDATE that never clears landing_change) — so the resume can
+        // still find the reviewed change.
+        db.set_phase("7", Phase::AwaitingInboundApproval, None)
+            .unwrap();
+        let row = db.get_issue("7").unwrap().unwrap();
+        assert_eq!(row.phase, Phase::AwaitingInboundApproval);
+        assert_eq!(row.landing_change.as_deref(), Some("zzqqrr"));
     }
 
     #[test]

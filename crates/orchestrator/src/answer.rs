@@ -302,6 +302,17 @@ pub fn on_issue_terminal(
         return Ok(false);
     }
     // Already in the answer machine — don't reset it (idempotent re-trigger).
+    // This is the "first terminal wins" guard: once an inbound issue has been
+    // armed/answered, a re-trigger on the SAME terminal phase must not reset
+    // `answer_sent`/`answer_unreachable` back to `answer_pending`.
+    //
+    // NOTE (step 6 / REQ-SWARM-1): this guard alone does NOT cover the
+    // `park → approve → merge` sequence, because landing clears `phase_substate`
+    // to `None` on the merge (the SECOND terminal), which would slip past this
+    // check. That double-answer is prevented structurally at the caller: the
+    // pump's inbound-approval resume sweep ([`crate::pump::BuildPump::resume_approved_inbound`])
+    // deliberately does NOT call this trigger after landing an approved inbound
+    // issue, so the peer is answered exactly once, at the park.
     if let Some(sub) = row
         .phase_substate
         .as_deref()
