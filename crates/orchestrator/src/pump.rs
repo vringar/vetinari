@@ -189,6 +189,63 @@ pub const INBOUND_APPROVED_LABEL: &str = "inbound-approved:land";
 /// orchestrator's — see [`crate::artifacts::FOLLOWUPS_FILE`].
 pub const FOLLOWUP_PROPOSED_LABEL: &str = "followup:proposed";
 
+/// The `xb-status:*` lifecycle prefix crossbridge stamps on an inbound issue.
+///
+/// When the embedded server materializes a peer's `SubmitIssue` it stamps
+/// exactly one status, [`XB_STATUS_OPEN_LABEL`], at creation
+/// (`.crossbridge-src/crossbridge-server/src/handler.rs`, `handle_submit`); the
+/// answer machine later mirrors `xb-status:answered` as a courtesy
+/// ([`crate::answer`]). Neither is ever *authority* — the orchestrator drives
+/// entirely off `state.db` (review B5). Any OTHER `xb-status:*` value on a
+/// freshly-adopted inbound issue can therefore only have ridden in on the
+/// peer-controlled `SubmitIssue.labels`, so the inbound sanitize strips it.
+const XB_STATUS_PREFIX: &str = "xb-status:";
+
+/// The single `xb-status:*` value the embedded server itself stamps when it
+/// creates an inbound issue (`handle_submit`). Preserved by the inbound sanitize
+/// as a legitimate server-set audit label; every other `xb-status:*` is stripped.
+const XB_STATUS_OPEN_LABEL: &str = "xb-status:open";
+
+/// True if `label` is one an **untrusted inbound peer must never be able to
+/// set** on the `xb:inbound` issue the embedded crossbridge server creates from
+/// its `SubmitIssue` — the set the inbound sanitize strips on first adoption
+/// ([`BuildPump::sanitize_inbound_labels`]).
+///
+/// # Why this is necessary (the upstream trust gap)
+///
+/// A peer's wire `submit` carries `pub labels: Vec<String>`
+/// (`.crossbridge-src/crossbridge-protocol/src/lib.rs`, `struct SubmitIssue`),
+/// and the server **echoes every one of them** onto the issue it creates,
+/// deduped only against its own five server-derived labels (`type:request`,
+/// `xb:inbound`, `xb-status:open`, `xb-source:<slug>`, `xb-ref:<uuid>`) —
+/// `.crossbridge-src/crossbridge-server/src/handler.rs`, `handle_submit`
+/// ("Include any extra labels the client requested, deduped against ours").
+/// Nothing upstream filters the privileged names below. So absent this gate a
+/// peer could pre-stamp its own [`INBOUND_APPROVED_LABEL`] and the step-6 land
+/// gate ([`BuildPump::land`]) would read it as a human's approval and auto-land
+/// untrusted work — exactly the "untrusted origin ⇒ HARD NO-GO on auto-land"
+/// boundary REQ-SWARM-1 exists to enforce.
+///
+/// The orchestrator therefore never trusts a peer-supplied privileged label; it
+/// strips, on our side, regardless of what crossbridge does:
+///
+/// - [`INBOUND_APPROVED_LABEL`] — the human land-approval; a peer setting it is
+///   the direct step-6 gate bypass. This is the load-bearing one.
+/// - [`FOLLOWUP_PROPOSED_LABEL`] — the pending-proposal marker; only a worker's
+///   `followups.jsonl` (via the pump) may raise it, never a peer.
+/// - Any `phase:*` **except** [`GRAPHED_LABEL`] — a peer must not dictate an
+///   issue's lifecycle phase. `phase:graphed` is preserved because it is the
+///   label the trusted section-chief adds to enqueue the issue and the one this
+///   sanitize's own ingest call site keyed off; the pump's phase mirror owns it
+///   from there.
+/// - Any `xb-status:*` except [`XB_STATUS_OPEN_LABEL`] — see [`XB_STATUS_PREFIX`].
+fn is_peer_forbidden_inbound_label(label: &str) -> bool {
+    label == INBOUND_APPROVED_LABEL
+        || label == FOLLOWUP_PROPOSED_LABEL
+        || (label.starts_with(PHASE_LABEL_PREFIX) && label != GRAPHED_LABEL)
+        || (label.starts_with(XB_STATUS_PREFIX) && label != XB_STATUS_OPEN_LABEL)
+}
+
 /// The role attribution recorded on translated crosslink comments (AC-16). The
 /// worker is the fake/real Implementer; the pump posts on its behalf.
 pub const WORKER_ROLE_TAG: &str = "implementer";
@@ -587,11 +644,83 @@ impl BuildPump {
             }
             let key = issue.id.to_string();
             if self.state.get_issue(&key)?.is_none() {
+                // First adoption of this issue (it has no `state.db` row yet).
+                // If it is `xb:inbound` (untrusted origin), neutralize any
+                // privileged label the peer smuggled in via `SubmitIssue.labels`
+                // BEFORE the row exists and BEFORE any drive/land runs — so the
+                // step-6 land gate (and every phase/status reader) can only ever
+                // see labels the server, the trusted section-chief, or a human
+                // applied. This is the pump's single one-shot: it is inside the
+                // `is_none()` branch, so a later human `inbound-approved:land`
+                // (applied only after the issue parks) is never stripped.
+                if crate::answer::is_inbound(&issue.labels) {
+                    self.sanitize_inbound_labels(issue.id, &issue.labels)?;
+                }
                 self.state
                     .upsert_issue(&IssueRow::new(&key, Phase::Graphed))?;
             }
         }
         Ok(())
+    }
+
+    /// Strip every peer-forbidden privileged label
+    /// ([`is_peer_forbidden_inbound_label`]) from an `xb:inbound` issue, closing
+    /// the upstream label-echo gap (see that predicate's docs for the crossbridge
+    /// `handle_submit` trail). Returns the number of labels removed.
+    ///
+    /// This is the orchestrator's structural guarantee that a peer can never
+    /// pre-approve its own inbound work: the load-bearing case is a
+    /// peer-supplied [`INBOUND_APPROVED_LABEL`], which — left in place — the
+    /// step-6 land gate ([`land`](Self::land)) would misread as a human's
+    /// approval and auto-land untrusted work.
+    ///
+    /// **One-shot is the caller's job, not this method's.** [`ingest`](Self::ingest)
+    /// invokes it exactly once, in the `state.db`-untracked branch, at the moment
+    /// the pump first adopts the issue — so a *human's* later
+    /// `inbound-approved:land` (applied only after the issue parks at
+    /// [`Phase::AwaitingInboundApproval`]) is never touched. This method itself is
+    /// an unconditional stripper (mirroring how [`land_change`](Self::land_change)
+    /// is the seam and [`land`](Self::land) owns the gating), which keeps it a
+    /// pure, directly-testable operation: the caller supplies the labels it
+    /// already holds, and re-poisoning is impossible because a peer's only write
+    /// path — a duplicate `submit` — is idempotent on `xb-ref:<uuid>` and
+    /// re-applies no labels (`handle_submit`).
+    ///
+    /// `labels` is the issue's current label set (the pump passes the snapshot
+    /// [`ingest`](Self::ingest) already listed, avoiding a re-read). Each removal
+    /// goes through `crosslink` `label_remove` only (AC-24: no shell-out) and
+    /// emits a [`EventKind::Transition`] audit row so the trust-boundary action is
+    /// legible in `events.jsonl`. A `crosslink` write fault `?`-propagates as a
+    /// typed [`PumpError`]; because it runs before the seed, a fault leaves the
+    /// issue un-adopted (no `state.db` row) to be retried on a later tick, never
+    /// half-sanitized-then-driven.
+    pub fn sanitize_inbound_labels(
+        &self,
+        issue_id: i64,
+        labels: &[String],
+    ) -> Result<usize, PumpError> {
+        let key = issue_id.to_string();
+        let mut stripped = 0usize;
+        for label in labels {
+            if !is_peer_forbidden_inbound_label(label) {
+                continue;
+            }
+            self.crosslink.label_remove(issue_id, label)?;
+            stripped += 1;
+            emit(
+                &self.state,
+                &self.log,
+                EventKind::Transition,
+                Some(&key),
+                None,
+                &json!({
+                    "inbound_sanitize": "stripped_peer_label",
+                    "label": label,
+                    "reason": "untrusted xb:inbound origin — a peer must not set this privileged label",
+                }),
+            )?;
+        }
+        Ok(stripped)
     }
 
     // --- drive selection (authority = state.db, REQ-2) ----------------------
@@ -2445,6 +2574,43 @@ mod tests {
         assert!(!has_label(&labels, "inbound-approved"));
         assert!(!has_label(&labels, "phase:merged"));
         assert!(!has_label(&[], INBOUND_APPROVED_LABEL));
+    }
+
+    /// The inbound-label trust classifier: a peer must not be able to smuggle a
+    /// privileged label past the sanitize, and legitimate server/section-chief
+    /// labels must survive it (else the sanitize would corrupt honest issues).
+    #[test]
+    fn peer_forbidden_inbound_label_classifies_the_privileged_set() {
+        // Forbidden — a peer must never set these on its inbound issue.
+        assert!(
+            is_peer_forbidden_inbound_label(INBOUND_APPROVED_LABEL),
+            "the human land-approval is the load-bearing bypass; must be stripped"
+        );
+        assert!(is_peer_forbidden_inbound_label(FOLLOWUP_PROPOSED_LABEL));
+        assert!(is_peer_forbidden_inbound_label("phase:merged"));
+        assert!(is_peer_forbidden_inbound_label(
+            "phase:awaiting-inbound-approval"
+        ));
+        assert!(is_peer_forbidden_inbound_label("xb-status:answered"));
+        assert!(is_peer_forbidden_inbound_label("xb-status:approved"));
+
+        // Preserved — the server's own creation-time labels, the section-chief's
+        // enqueue label, and benign routing/peer labels are NOT privileged.
+        assert!(
+            !is_peer_forbidden_inbound_label(GRAPHED_LABEL),
+            "phase:graphed is the trusted enqueue label + the ingest trigger — keep it"
+        );
+        assert!(
+            !is_peer_forbidden_inbound_label(XB_STATUS_OPEN_LABEL),
+            "xb-status:open is stamped by the server itself at creation — keep it"
+        );
+        assert!(!is_peer_forbidden_inbound_label("xb:inbound"));
+        assert!(!is_peer_forbidden_inbound_label("xb-source:firmware"));
+        assert!(!is_peer_forbidden_inbound_label("xb-ref:uuid-abc"));
+        assert!(!is_peer_forbidden_inbound_label("type:request"));
+        // Not a prefix/substring false-positive: only the exact privileged names.
+        assert!(!is_peer_forbidden_inbound_label("inbound-approved"));
+        assert!(!is_peer_forbidden_inbound_label("followup:proposed-later"));
     }
 
     #[test]

@@ -26,6 +26,10 @@
 //!   at the park, then approved and merged, does NOT re-arm a second answer.
 //! - **Crash while parked:** recovery leaves a parked inbound issue parked — never
 //!   re-driven, never auto-landed.
+//! - **Label-echo defense:** an inbound issue arriving with a peer-supplied
+//!   `inbound-approved:land` (the upstream `handle_submit` echoes `SubmitIssue.labels`
+//!   verbatim) has it — and every other privileged peer label — stripped on first
+//!   adoption, so the gate STILL parks it for a real human approval.
 
 mod common;
 
@@ -147,10 +151,65 @@ fn create_inbound(root: &Path) -> i64 {
         .expect("parse created issue id")
 }
 
+/// Create one `xb:inbound` crosslink issue that ALSO carries the privileged
+/// labels a hostile peer would smuggle in via `SubmitIssue.labels` (the upstream
+/// echoes them onto the created issue): a pre-set `inbound-approved:land` (the
+/// step-6 land-gate bypass), plus `phase:graphed` (so the pump's ingest adopts
+/// it), `followup:proposed`, and a bogus `xb-status:*`. Returns its id.
+fn create_preapproved_inbound(root: &Path) -> i64 {
+    let out = Command::new("crosslink")
+        .args([
+            "issue",
+            "create",
+            "inbound work from a HOSTILE peer",
+            "-d",
+            "peer-submitted, untrusted, self-approved",
+            "-l",
+            "xb:inbound",
+            "-l",
+            "xb-source:firmware",
+            "-l",
+            "xb-ref:uuid-hostile",
+            "-l",
+            "xb-status:open",
+            // The privileged labels a peer must NOT be able to set:
+            "-l",
+            "inbound-approved:land",
+            "-l",
+            "phase:graphed",
+            "-l",
+            "followup:proposed",
+            "-l",
+            "xb-status:answered",
+            "--quiet",
+        ])
+        .current_dir(root)
+        .output()
+        .expect("spawn crosslink issue create");
+    assert!(
+        out.status.success(),
+        "crosslink issue create failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .last()
+        .and_then(|l| l.trim().parse().ok())
+        .expect("parse created issue id")
+}
+
 /// Build a pump over a fresh fixture with a default config (no worker is spawned —
 /// these tests only exercise the landing gate + resume sweep). Returns the
 /// fixture, pump, and session guard (hold all three for the test).
 fn pump_over(tag: &str) -> (Fixture, BuildPump, SessionGuard) {
+    pump_with_budget(tag, OrchestratorConfig::default().max_concurrent_agents)
+}
+
+/// Like [`pump_over`], but with an explicit `max_concurrent_agents` budget. A
+/// budget of `0` lets a test run the pump's `tick` **ingest** step (which seeds
+/// and sanitizes newly-adopted issues) while the drive step picks up nothing —
+/// so the real ingest wiring is exercised without standing up a worker pipeline.
+fn pump_with_budget(tag: &str, budget: u32) -> (Fixture, BuildPump, SessionGuard) {
     let fx = build_fixture();
     let orchestrator_dir = fx.root.join(ORCHESTRATOR_DIR);
     let state = StateDb::open(orchestrator_dir.join("state.db")).expect("open state.db");
@@ -161,6 +220,7 @@ fn pump_over(tag: &str) -> (Fixture, BuildPump, SessionGuard) {
     let spawner = Spawner::new(session, &fx.root, common::bwrap_pin());
     let config = OrchestratorConfig {
         worker_timeout_secs: 60,
+        max_concurrent_agents: budget,
         ..OrchestratorConfig::default()
     };
     let pump = BuildPump::new(config, state, log, manager, spawner, crosslink);
@@ -587,5 +647,75 @@ fn recovery_leaves_a_parked_inbound_issue_parked() {
         main_commit(&fx.root),
         main_before,
         "recovery must never auto-land untrusted parked work"
+    );
+}
+
+/// Label-echo defense (the upstream trust gap): the embedded crossbridge server
+/// copies a peer's `SubmitIssue.labels` verbatim onto the issue it creates, so a
+/// hostile peer can pre-stamp its OWN `inbound-approved:land`. Left in place, the
+/// step-6 land gate would misread that peer label as a human's approval and
+/// auto-land untrusted work. The pump's first-adoption sanitize (run in `tick`'s
+/// ingest) must strip it — and every other privileged peer label — so the gate
+/// STILL parks the issue for a real human approval.
+#[test]
+fn ingest_strips_a_peer_preset_approval_so_the_gate_still_parks() {
+    // Budget 0: `tick` runs ingest (seed + sanitize) but drives nothing, so the
+    // REAL adoption wiring is exercised without a worker pipeline.
+    let (fx, pump, _guard) = pump_with_budget("inbound-label-echo", 0);
+    let inbound = create_preapproved_inbound(&fx.root);
+
+    // First adoption: ingest seeds the issue AND sanitizes its peer labels.
+    let outcomes = pump
+        .tick()
+        .expect("tick ingests + sanitizes the inbound issue");
+    assert!(
+        outcomes.is_empty(),
+        "budget 0 must drive nothing; ingest only: {outcomes:?}"
+    );
+
+    // The privileged peer labels are GONE from crosslink...
+    let crosslink = CrosslinkRepo::open(&fx.root).expect("open crosslink");
+    let labels = crosslink.read_issue(inbound).expect("read inbound").labels;
+    assert!(
+        !labels.iter().any(|l| l == INBOUND_APPROVED_LABEL),
+        "the peer's pre-set land-approval MUST be stripped: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l == "followup:proposed"),
+        "a peer must not raise the follow-up marker: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l == "xb-status:answered"),
+        "a peer must not set a bogus xb-status: {labels:?}"
+    );
+    // ...while the server's own + the section-chief's legitimate labels REMAIN.
+    for keep in [
+        "xb:inbound",
+        "xb-source:firmware",
+        "xb-ref:uuid-hostile",
+        "xb-status:open",
+    ] {
+        assert!(
+            labels.iter().any(|l| l == keep),
+            "the sanitize must preserve the legitimate label `{keep}`: {labels:?}"
+        );
+    }
+
+    // The load-bearing consequence: converge + land now PARKS for a human, exactly
+    // as an un-approved inbound issue must — the peer's self-approval bought nothing.
+    let change = stage_converged(&fx, inbound);
+    let main_before = main_commit(&fx.root);
+    let outcome = pump
+        .land_change(inbound, &change)
+        .expect("land is a handled outcome");
+    assert_eq!(
+        outcome,
+        IssueOutcome::AwaitingInboundApproval,
+        "a peer-approved inbound issue must STILL park after sanitize, got {outcome:?}"
+    );
+    assert_eq!(
+        main_commit(&fx.root),
+        main_before,
+        "untrusted work must not auto-land off a peer-supplied approval"
     );
 }
