@@ -226,6 +226,14 @@ pub enum PumpError {
     #[diagnostic(transparent)]
     Landing(#[from] vetinari_error::LandingError),
 
+    /// A crossbridge adapter operation failed — deriving this node's own slug
+    /// when the embedded server is enabled (spec §1.3). A `SubmitAnswer` *wire*
+    /// failure is NOT this: it is handled in-band by the answer state machine
+    /// (`answer_unreachable`), never propagated as a tick-aborting `PumpError`.
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Crossbridge(#[from] vetinari_crossbridge_api::CrossbridgeError),
+
     /// A worker artifact could not be verified or translated.
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -416,9 +424,60 @@ impl BuildPump {
         let mut outcomes = Vec::new();
         for issue_id in self.drivable_issue_ids()?.into_iter().take(budget) {
             let outcome = self.drive_issue(issue_id)?;
+            // Answer-back trigger (spec §1.3): the moment an issue reaches a
+            // terminal phase, if it is `xb:inbound` arm it for answer delivery.
+            // A no-op for every locally-authored issue (the trigger reads the
+            // crosslink labels and leaves non-inbound issues untouched), and only
+            // consulted at all when the embedded crossbridge server is enabled.
+            if self.config.crossbridge.enabled && outcome.is_terminal() {
+                crate::answer::on_issue_terminal(
+                    &self.state,
+                    &self.crosslink,
+                    &self.log,
+                    issue_id,
+                )?;
+            }
             outcomes.push((issue_id, outcome));
         }
+
+        // Step 3 — answer sweep (spec §1.3): deliver any inbound issue awaiting
+        // an answer, and retry the degraded `answer_unreachable` ones (bounded,
+        // rate-limited). Gated on the embedded server being enabled, so a
+        // crossbridge-unaware node does exactly nothing here.
+        if self.config.crossbridge.enabled {
+            self.sweep_answers()?;
+        }
         Ok(outcomes)
+    }
+
+    /// Deliver pending crossbridge answers for terminal inbound issues (spec
+    /// §1.3), resolving this node's slug + socket root from config the same way
+    /// `main::start_crossbridge` does. Errors from the wire round-trip are handled
+    /// in-band by the state machine; only a slug-derivation / state.db / crosslink
+    /// fault surfaces as a `PumpError`.
+    fn sweep_answers(&self) -> Result<(), PumpError> {
+        let own_slug = vetinari_crossbridge_api::own_slug(
+            self.manager.root(),
+            self.config.crossbridge.slug.as_deref(),
+        )?;
+        let socket_root = self
+            .config
+            .crossbridge
+            .socket_root
+            .clone()
+            .unwrap_or_else(vetinari_crossbridge_api::default_socket_root);
+        let retry_interval = self.config.crossbridge.answer_retry_interval_s as i64;
+        crate::answer::deliver_pending(
+            &self.state,
+            &self.crosslink,
+            &self.log,
+            &crate::answer::CrossbridgeTransport,
+            &own_slug,
+            &socket_root,
+            retry_interval,
+            now_unix(),
+        )?;
+        Ok(())
     }
 
     /// Drive [`tick`](Self::tick) repeatedly until no drivable work remains in

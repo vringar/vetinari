@@ -13,7 +13,8 @@
 //!   `Phase`×`PhaseSubstate` combination; an unknown/inconsistent combo yields a
 //!   conservative [`RecoveryError`] rather than a silent mis-recovery.
 //! - [`recover`] — the executor: it iterates `state.db` (every non-terminal
-//!   issue and every `active_workers` row), reads the ground truth each plan
+//!   issue, every `active_workers` row, plus terminal `xb:inbound` issues still
+//!   carrying an answer substate — review #3), reads the ground truth each plan
 //!   needs, and applies the plan through the same primitives the pump uses
 //!   ([`WorkspaceManager`] for `.jj/`, [`landing::resume_from`] for landing
 //!   substates, the `posted_artifacts` ledger for translation). A per-issue
@@ -36,7 +37,9 @@
 //! | `converged` (none)                            | —                               | about-to-land but never entered landing: re-derive the change and run [`landing::land_local`] from the top (idempotent) |
 //! | `adversary-review` (none)                     | —                               | iteration-2+ phase not driven by the MVP pump — conservatively roll to `implementing` so the pump re-drives |
 //! | any phase + a `landing` substate that doesn't match the phase, or a worker phase with a `landing`/`qa` substate that can't be reconciled | —                       | [`RecoveryError::StateDbInconsistent`] → the issue is **quarantined** to `phase:orchestrator-error` and the pass continues with the others |
-//! | `merged` / `pr-open` / `awaiting-human-merge` / `orchestrator-error` (terminal) | — | no action |
+//! | terminal phase + `answer_pending` / `answer_unreachable` (an `xb:inbound` issue mid answer-back, spec §1.3) | — | **re-attempt**: leave the substate in place (NoAction) so the pump's answer sweep re-delivers next tick; crossbridge source-side dedup makes the re-send safe |
+//! | terminal phase + `answer_sent` (answer already delivered) | crosslink issue status | **complete the close**: if the answered issue is still open (a crash landed between the `answer_sent` persist and `close_issue`, review #3), re-apply the `xb-status:answered` label and close it — idempotent, a no-op once closed |
+//! | `merged` / `pr-open` / `awaiting-human-merge` / `orchestrator-error` (terminal, no answer substate) | — | no action |
 //!
 //! Unknown/newer `phase_substate` tokens (a database written by a newer binary)
 //! are rejected up front with [`RecoveryError::UnknownSubstate`].
@@ -59,6 +62,7 @@
 #![allow(clippy::result_large_err)]
 
 use serde_json::json;
+use vetinari_crossbridge_api::labels::XB_STATUS_ANSWERED;
 use vetinari_crosslink_api::CrosslinkRepo;
 use vetinari_error::RecoveryError;
 
@@ -130,6 +134,14 @@ pub enum RecoveryPlan {
     /// substate. Re-derive the change and run [`landing::land_local`] from the
     /// top of the (idempotent) landing machine.
     StartLanding,
+
+    /// An `xb:inbound` issue at a terminal phase with substate `answer_sent` that
+    /// may still be **open**: a crash landed between `record_success`'s
+    /// `answer_sent` persist and its idempotent courtesy-label + `close_issue`
+    /// (review #3). Re-apply the `xb-status:answered` label and close, both
+    /// idempotently, so the answered issue can't dangle open forever. A no-op if
+    /// the close already happened (a second recovery pass finds it closed).
+    CompleteAnswerClose,
 }
 
 /// A single reconciliation [`recover`] applied to one issue, for the caller's
@@ -166,6 +178,14 @@ pub enum RecoveryAction {
         /// The terminal outcome the landing machine reached.
         outcome: landing::LandingOutcome,
     },
+    /// A crash-window zombie was reconciled: an answered (`answer_sent`) inbound
+    /// issue that was still open had its idempotent close completed (review #3).
+    /// Only emitted when the close actually did something (the issue was open); a
+    /// second recovery pass finds it closed and produces nothing (idempotent).
+    CompletedAnswerClose {
+        /// The answered issue whose close was completed.
+        issue_id: String,
+    },
     /// Recovering this issue failed (a state.db inconsistency, an unknown
     /// substate, a jj-op failure resuming its landing, …). Rather than refuse
     /// startup for the whole node, the issue was **quarantined**: parked at
@@ -179,11 +199,30 @@ pub enum RecoveryAction {
     },
 }
 
-/// Whether an issue is in a terminal phase recovery must never touch.
+/// Whether an issue is in a terminal phase recovery must never advance.
+///
+/// Delegates to [`Phase::is_terminal`] — the **single** terminal-set definition
+/// the answer-back trigger ([`crate::answer::phase_delivers_answer`]) also reads,
+/// so recovery and the answer machine can never disagree about "terminal" (and
+/// step 6 extends the set in exactly one place, on `Phase::is_terminal`).
 fn is_terminal(phase: Phase) -> bool {
+    phase.is_terminal()
+}
+
+/// Whether an issue row carries a crossbridge answer-back substate — the terminal
+/// issues recovery must still reconcile (re-deliver, or complete the crash-window
+/// close) rather than short-circuit past (review #3).
+fn carries_answer_substate(issue: &crate::state::IssueRow) -> bool {
     matches!(
-        phase,
-        Phase::Merged | Phase::PrOpen | Phase::AwaitingHumanMerge | Phase::OrchestratorError
+        issue
+            .phase_substate
+            .as_deref()
+            .and_then(PhaseSubstate::from_db_str),
+        Some(
+            PhaseSubstate::AnswerPending
+                | PhaseSubstate::AnswerSent
+                | PhaseSubstate::AnswerUnreachable
+        )
     )
 }
 
@@ -224,6 +263,52 @@ pub fn plan_recovery(
                 }
             })?),
         };
+
+    // Crossbridge answer-back substates (spec §1.3/§1.4) ride a TERMINAL phase:
+    // an `xb:inbound` issue that reached `Merged`/`PrOpen`/`AwaitingHumanMerge`/
+    // `OrchestratorError` carries one of these to track delivery of its result to
+    // the source peer. Recognize them EXPLICITLY here — before the terminal
+    // short-circuit below — so the crash arms are legible.
+    //
+    // The phase-consistency check runs FIRST (review #5): an answer substate on a
+    // NON-terminal phase is a corrupt state.db row (impossible pairing), so it is
+    // `StateDbInconsistent` — NOT `NoAction`. Returning `NoAction` there would let
+    // the answer sweep, which keys only off the substate, attempt delivery on a
+    // non-terminal issue. This keeps `plan_recovery` total over every Phase×
+    // Substate pairing, as its doc promises.
+    //
+    //  - `answer_pending` / `answer_unreachable` → **re-attempt**. There is no
+    //    workspace or landing action to take; the pump's answer sweep re-reads
+    //    the preserved substate on the next tick and re-delivers. So the plan is
+    //    `NoAction` (recovery leaves the substate in place) and the sweep does the
+    //    actual re-send — safe because crossbridge dedups on the source side, so a
+    //    re-send never double-answers (spec §1.4). We keep NO local sent-ledger.
+    //  - `answer_sent` → **complete the close** ([`RecoveryPlan::CompleteAnswerClose`]).
+    //    The answer landed, but `record_success` persists `answer_sent` BEFORE the
+    //    idempotent courtesy-label + `close_issue`; a crash in that window leaves
+    //    the answered issue dangling OPEN forever (review #3). Recovery re-applies
+    //    the label + close idempotently so it can't zombie.
+    match substate {
+        Some(sub @ PhaseSubstate::AnswerPending)
+        | Some(sub @ PhaseSubstate::AnswerUnreachable)
+        | Some(sub @ PhaseSubstate::AnswerSent) => {
+            if !is_terminal(phase) {
+                return Err(RecoveryError::StateDbInconsistent {
+                    detail: format!(
+                        "answer substate `{}` on non-terminal phase `{}` — impossible pairing",
+                        sub.as_str(),
+                        phase
+                    ),
+                });
+            }
+            return Ok(match sub {
+                PhaseSubstate::AnswerSent => RecoveryPlan::CompleteAnswerClose,
+                // AnswerPending / AnswerUnreachable: the sweep re-delivers.
+                _ => RecoveryPlan::NoAction,
+            });
+        }
+        _ => {}
+    }
 
     // Terminal phases are never recovered, whatever substate they carry.
     if is_terminal(phase) {
@@ -393,7 +478,14 @@ fn recover_with(
 
     let mut actions = Vec::new();
     for issue in issues {
-        if is_terminal(issue.phase) {
+        // Terminal issues are done and skipped — EXCEPT an `xb:inbound` issue still
+        // carrying an answer substate. Those need reconciliation: `answer_sent` may
+        // be an un-closed crash-window zombie (review #3), and `answer_pending` /
+        // `answer_unreachable` are left in place (NoAction) for the sweep to
+        // re-deliver. Route only those terminal issues into `recover_issue`; the
+        // bulk of terminal issues (a merged issue with no answer substate) still
+        // short-circuits here.
+        if is_terminal(issue.phase) && !carries_answer_substate(&issue) {
             continue;
         }
         // Recover this one issue in isolation. On error, quarantine it and keep
@@ -542,6 +634,21 @@ fn recover_issue(
                 outcome,
             });
         }
+
+        RecoveryPlan::CompleteAnswerClose => {
+            // Crash-window zombie (review #3): the answer was recorded
+            // (`answer_sent`) but a crash may have preceded the idempotent
+            // courtesy-label + close. Re-apply both. Needs a crosslink handle;
+            // without one (recovery invoked with `None`) leave it for a later
+            // restart that has crosslink — never worse than the pre-fix behavior.
+            if let Some(crosslink) = crosslink {
+                if complete_answer_close(crosslink, &issue.issue_id)? {
+                    actions.push(RecoveryAction::CompletedAnswerClose {
+                        issue_id: issue.issue_id.clone(),
+                    });
+                }
+            }
+        }
     }
 
     // Reap any EXTRA worker rows for this issue beyond the one the plan handled
@@ -558,6 +665,48 @@ fn recover_issue(
     }
 
     Ok(actions)
+}
+
+/// Complete a crash-window answer close idempotently (review #3): if the answered
+/// issue is still **open**, re-apply the `xb-status:answered` courtesy label and
+/// close it. Returns whether it actually reconciled a zombie (`true` if the issue
+/// was open and is now closed, `false` if it was already closed — the second-pass
+/// / no-crash case), so [`recover`] records a
+/// [`RecoveryAction::CompletedAnswerClose`] only for a real reconciliation.
+///
+/// The open/closed decision reads the issue status directly rather than trusting
+/// `close_issue`'s return value, whose "did something" bool is unreliable through
+/// the shared-writer (hub-mode) path — an already-closed close still reports
+/// success there. A crosslink fault maps to [`RecoveryError::StateDbInconsistent`],
+/// which the caller quarantines.
+fn complete_answer_close(crosslink: &CrosslinkRepo, issue_id: &str) -> Result<bool, RecoveryError> {
+    let numeric_id: i64 = issue_id
+        .parse()
+        .map_err(|_| RecoveryError::StateDbInconsistent {
+            detail: format!("answer issue id `{issue_id}` is not an integer"),
+        })?;
+    let info =
+        crosslink
+            .read_issue(numeric_id)
+            .map_err(|source| RecoveryError::StateDbInconsistent {
+                detail: format!("answer-close read for issue `{issue_id}` failed: {source}"),
+            })?;
+    // Already closed/archived — the close completed before the crash, or a prior
+    // recovery pass did it. Nothing to reconcile; keep this idempotent.
+    if info.status != "open" {
+        return Ok(false);
+    }
+    crosslink
+        .label_add(numeric_id, XB_STATUS_ANSWERED)
+        .map_err(|source| RecoveryError::StateDbInconsistent {
+            detail: format!("answer-close label for issue `{issue_id}` failed: {source}"),
+        })?;
+    crosslink
+        .close_issue(numeric_id)
+        .map_err(|source| RecoveryError::StateDbInconsistent {
+            detail: format!("answer-close for issue `{issue_id}` failed: {source}"),
+        })?;
+    Ok(true)
 }
 
 /// Whether the worker's workspace holds a verified `_orchestrator/DONE`.
@@ -1050,6 +1199,69 @@ mod tests {
     }
 
     #[test]
+    fn answer_pending_and_unreachable_are_reattempted_by_the_sweep_not_recovery() {
+        // Crash mid-answer (spec §1.4): an inbound issue at a terminal phase with
+        // an `answer_pending` / `answer_unreachable` substate is left in place
+        // (NoAction) so the pump's answer sweep re-delivers on the next tick —
+        // crossbridge source-side dedup makes the re-send safe.
+        for phase in [
+            Phase::Merged,
+            Phase::PrOpen,
+            Phase::AwaitingHumanMerge,
+            Phase::OrchestratorError,
+        ] {
+            for token in ["answer_pending", "answer_unreachable"] {
+                assert_eq!(
+                    plan_recovery(phase, Some(token), false, false).unwrap(),
+                    RecoveryPlan::NoAction,
+                    "{phase}/{token} must be left for the sweep to re-attempt",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn answer_sent_completes_the_crash_window_close() {
+        // A completed answer is never re-sent, but its idempotent close may not
+        // have happened before a crash (review #3) — recovery completes it.
+        for phase in [
+            Phase::Merged,
+            Phase::PrOpen,
+            Phase::AwaitingHumanMerge,
+            Phase::OrchestratorError,
+        ] {
+            assert_eq!(
+                plan_recovery(phase, Some("answer_sent"), false, false).unwrap(),
+                RecoveryPlan::CompleteAnswerClose,
+                "{phase}/answer_sent must complete the idempotent close",
+            );
+        }
+    }
+
+    #[test]
+    fn answer_substate_on_non_terminal_phase_is_inconsistent() {
+        // Review #5: an answer substate can only ride a TERMINAL phase. On a
+        // non-terminal phase it is a corrupt row → StateDbInconsistent, NOT
+        // NoAction (which would let the sweep attempt delivery on a live issue).
+        for phase in [
+            Phase::Graphed,
+            Phase::Implementing,
+            Phase::QaGate,
+            Phase::AdversaryReview,
+            Phase::Converged,
+            Phase::Landing,
+        ] {
+            for token in ["answer_pending", "answer_unreachable", "answer_sent"] {
+                let err = plan_recovery(phase, Some(token), false, false).unwrap_err();
+                assert!(
+                    matches!(err, RecoveryError::StateDbInconsistent { .. }),
+                    "{phase}/{token} is an impossible pairing — must be StateDbInconsistent, got {err:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn converged_starts_landing() {
         assert_eq!(
             plan_recovery(Phase::Converged, None, false, false).unwrap(),
@@ -1129,6 +1341,9 @@ mod tests {
             Some("push_started"),
             Some("push_done_pr_pending"),
             Some("pr_created"),
+            Some("answer_pending"),
+            Some("answer_sent"),
+            Some("answer_unreachable"),
         ];
         for phase in phases {
             for substate in substates {

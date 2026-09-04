@@ -344,6 +344,35 @@ impl CrosslinkRepo {
         })
     }
 
+    /// Close issue `id`, returning `true` if it was open and is now closed,
+    /// `false` if it was already closed (or absent from the update).
+    ///
+    /// The crossbridge answer-back machine closes an `xb:inbound` issue once its
+    /// worked result has been delivered to the source peer (spec §1.3). Like
+    /// [`label_add`](Self::label_add), the write goes through crosslink's
+    /// `SharedWriter` in multi-agent (hub) mode and directly to the database
+    /// otherwise — the same branch crosslink's own `close` command takes, so a
+    /// direct write in hub mode is not lost to the next hydration.
+    pub fn close_issue(&self, id: i64) -> Result<bool> {
+        let db = self.db()?;
+        self.require_issue(&db, id)?;
+        match self.shared_writer()? {
+            // SharedWriter::close_issue returns `()` on success; a hub-mode close
+            // that reached the writer is treated as an effective close (`true`).
+            Some(writer) => writer
+                .close_issue(&db, id)
+                .map(|()| true)
+                .map_err(|source| CrosslinkError::Write {
+                    operation: format!("close issue #{id}"),
+                    source: source.into(),
+                }),
+            None => db.close_issue(id).map_err(|source| CrosslinkError::Write {
+                operation: format!("close issue #{id}"),
+                source: source.into(),
+            }),
+        }
+    }
+
     /// Sign `payload` (a set of key/value fields) under `namespace`, returning
     /// the base64 signature.
     ///

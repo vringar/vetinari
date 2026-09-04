@@ -67,6 +67,11 @@ pub const DEFAULT_MAX_CONCURRENT_AGENTS: u32 = 1;
 /// Default QA-gate wall-clock budget, in seconds (mirrors `qa::DEFAULT_QA_TIMEOUT`).
 pub const DEFAULT_QA_TIMEOUT_SECS: u64 = 600;
 
+/// Default minimum seconds between `answer_unreachable` retries (spec §1.3,
+/// `crossbridge_answer_retry_interval_s` ~300s). Five minutes is a courteous
+/// re-poll of an offline peer without hammering its socket.
+pub const DEFAULT_ANSWER_RETRY_INTERVAL_S: u64 = 300;
+
 /// Default per-worker wall-clock budget, in seconds, before the pump treats a
 /// still-running worker as a stall.
 pub const DEFAULT_WORKER_TIMEOUT_SECS: u64 = 120;
@@ -145,6 +150,24 @@ pub enum ConfigError {
         /// The maximum reachable threshold ([`crate::pump::MAX_ADVERSARY_ROUNDS`]).
         max: i64,
     },
+
+    /// `[crossbridge] answer_retry_interval_s = 0` disables the answer-back retry
+    /// rate limit. The sweep's rate limit is `now - updated_at >= interval`; with
+    /// `interval = 0` that is always true, so every `answer_unreachable` issue is
+    /// re-attempted on **every** tick — a tight retry loop that burns through
+    /// [`crate::answer::MAX_ANSWER_ATTEMPTS`] in as many ticks and hammers an
+    /// offline peer. It is only meaningful (and only validated) when
+    /// `[crossbridge] enabled = true`. Rejected at load so the footgun surfaces
+    /// once, up front, rather than as a fleet-wide answer-retry storm.
+    #[error(
+        "crossbridge answer_retry_interval_s = 0 disables the answer-back retry \
+         rate limit (every tick would re-attempt); set it to at least 1 second"
+    )]
+    #[diagnostic(
+        code(vetinari::config::answer_retry_interval_zero),
+        help("Set `[crossbridge] answer_retry_interval_s` to a positive value (the default is ~300s).")
+    )]
+    AnswerRetryIntervalZero,
 }
 
 /// Which kind of worker the build pump dispatches (S7).
@@ -385,7 +408,7 @@ impl Default for OrchestratorConfig {
 /// open + unblocked) ignores them until a human graphs them (spec §1.2). This
 /// step only makes the server *run*; ingesting inbound work into the pump is
 /// deliberately deferred to a later step (the approval gate).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CrossbridgeConfig {
     /// Whether to start the embedded crossbridge server (spec §1.4). Default
@@ -414,6 +437,47 @@ pub struct CrossbridgeConfig {
     /// [`crossbridge_api::default_socket_root`]: vetinari_crossbridge_api::default_socket_root
     #[serde(default)]
     pub socket_root: Option<PathBuf>,
+    /// Minimum seconds between `SubmitAnswer` retries for an inbound issue stuck
+    /// in `answer_unreachable` (spec §1.3). The answer sweep retries at most once
+    /// per this interval so a permanently-offline peer never busy-loops the pump.
+    /// Default [`DEFAULT_ANSWER_RETRY_INTERVAL_S`] (~5 min). Only meaningful when
+    /// [`enabled`](Self::enabled) is `true`. The overall *attempt* bound (after
+    /// which the issue stays `answer_unreachable` for human attention) is a
+    /// state-machine invariant, not operator-tunable — see
+    /// [`crate::answer::MAX_ANSWER_ATTEMPTS`].
+    #[serde(default = "default_answer_retry_interval_s")]
+    pub answer_retry_interval_s: u64,
+}
+
+impl Default for CrossbridgeConfig {
+    fn default() -> Self {
+        CrossbridgeConfig {
+            enabled: false,
+            group: String::new(),
+            slug: None,
+            socket_root: None,
+            answer_retry_interval_s: DEFAULT_ANSWER_RETRY_INTERVAL_S,
+        }
+    }
+}
+
+impl CrossbridgeConfig {
+    /// The answer-retry rate-limit interval as a [`Duration`].
+    pub fn answer_retry_interval(&self) -> Duration {
+        Duration::from_secs(self.answer_retry_interval_s)
+    }
+
+    /// Reject a zero answer-retry interval when crossbridge is enabled — a `0`
+    /// disables the retry rate limit and makes the answer sweep re-attempt every
+    /// tick ([`ConfigError::AnswerRetryIntervalZero`]). Only enforced when
+    /// `enabled` (a disabled section never runs the sweep, so its interval is
+    /// inert and left alone).
+    fn ensure_valid(&self) -> Result<(), ConfigError> {
+        if self.enabled && self.answer_retry_interval_s == 0 {
+            return Err(ConfigError::AnswerRetryIntervalZero);
+        }
+        Ok(())
+    }
 }
 
 /// How the orchestrator decides an issue's review loop has converged (REQ-10).
@@ -539,6 +603,9 @@ impl OrchestratorConfig {
         // Reject an out-of-range `n_rounds` (0 = no review; > cap = always
         // poisons) before any issue is driven — a fleet-wide footgun otherwise.
         config.convergence.ensure_rounds_reachable()?;
+        // Reject a zero answer-retry interval (disables the rate limit → tight
+        // per-tick retry) when crossbridge is enabled.
+        config.crossbridge.ensure_valid()?;
         Ok(config)
     }
 
@@ -620,6 +687,10 @@ fn default_max_concurrent_agents() -> u32 {
 
 fn default_qa_timeout_secs() -> u64 {
     DEFAULT_QA_TIMEOUT_SECS
+}
+
+fn default_answer_retry_interval_s() -> u64 {
+    DEFAULT_ANSWER_RETRY_INTERVAL_S
 }
 
 fn default_worker_timeout_secs() -> u64 {
@@ -969,6 +1040,59 @@ mod tests {
         assert_eq!(cfg.crossbridge.group, "reversing");
         assert_eq!(cfg.crossbridge.slug, None);
         assert_eq!(cfg.crossbridge.socket_root, None);
+    }
+
+    #[test]
+    fn crossbridge_answer_retry_interval_defaults_and_overrides() {
+        // Default (absent field) is DEFAULT_ANSWER_RETRY_INTERVAL_S.
+        assert_eq!(
+            CrossbridgeConfig::default().answer_retry_interval_s,
+            DEFAULT_ANSWER_RETRY_INTERVAL_S
+        );
+        // An explicit value in the section overrides it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[crossbridge]\nenabled = true\ngroup = \"reversing\"\nanswer_retry_interval_s = 42\n",
+        )
+        .expect("write config");
+        let cfg = OrchestratorConfig::load(dir.path()).expect("parse");
+        assert_eq!(cfg.crossbridge.answer_retry_interval_s, 42);
+        assert_eq!(
+            cfg.crossbridge.answer_retry_interval(),
+            Duration::from_secs(42)
+        );
+    }
+
+    #[test]
+    fn crossbridge_rejects_zero_answer_retry_interval_when_enabled() {
+        // 0 disables the retry rate limit → every-tick re-attempt. Rejected at load.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[crossbridge]\nenabled = true\ngroup = \"reversing\"\nanswer_retry_interval_s = 0\n",
+        )
+        .expect("write config");
+        let err = OrchestratorConfig::load(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::AnswerRetryIntervalZero),
+            "a zero retry interval on an enabled section must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn crossbridge_zero_answer_retry_interval_is_inert_when_disabled() {
+        // A disabled section never runs the sweep, so its (unused) interval is not
+        // validated — a 0 there is harmless and must not fail load.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[crossbridge]\nenabled = false\nanswer_retry_interval_s = 0\n",
+        )
+        .expect("write config");
+        let cfg = OrchestratorConfig::load(dir.path()).expect("disabled section with 0 loads");
+        assert!(!cfg.crossbridge.enabled);
+        assert_eq!(cfg.crossbridge.answer_retry_interval_s, 0);
     }
 
     #[test]
