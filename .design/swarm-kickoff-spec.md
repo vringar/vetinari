@@ -206,6 +206,51 @@ and it is what "federation" buys.
   decomposition.** Those are not in this design and should not be implied to a
   stakeholder. The swarm is coordinated *by the humans/chiefs at the seams.*
 
+### 1.6 Worker follow-up work — propose, never author (REQ-SWARM-2)
+
+A worker driving an issue (local or inbound) routinely *discovers* follow-up work:
+"we also need to parse sub-record Y", "X is blocked on recovering enum Z". That
+discovery must not be lost — but a worker must **never write the graph**. Workers
+get crosslink **read-only** (already enforced: the per-role mount matrix binds
+`<root>/.crosslink/` RO for every role, `spawn.rs:426-459`). Three walls forbid a
+direct write:
+
+1. **Trust / graph-integrity.** An inbound (untrusted) worker that can create
+   issues + blocker edges can inject arbitrary backlog, build a block-cycle or
+   block-bomb (DoS the DAG), or shape the graph so malicious work is prioritized
+   or auto-landed — the T4 injection surface the threat model keeps on the
+   strictest gate. The graph is the one lever that decides what runs and what
+   lands; an untrusted agent never gets it.
+2. **Single-writer invariant (REQ-3).** Pickup is DAG-derived (`open_blockers`,
+   `repo.rs:178`) and recovery assumes the graph is authored out-of-band. A worker
+   writing crosslink is a second writer racing the pump and makes the graph
+   self-modify mid-run — recovery can no longer re-derive deterministically.
+3. **Runaway.** Free self-spawned follow-ups let the backlog explode unbounded;
+   the pump would chase an ever-growing self-authored graph no human can keep up
+   with — the opposite of verification-driven.
+
+**The mechanism (propose-don't-commit).** Workers already speak to the
+orchestrator through crosslink comment *kinds* (`--kind result`/`--kind blocker`).
+Add **`--kind followup`** (or a structured `proposed_followups` block in the
+worker's output): title + rationale + suggested blocker edges + a *sketch* of the
+verifiable gate. It rides the existing worker→orchestrator result channel the pump
+already reads — **no new write path out of the sandbox.** The orchestrator records
+these as **proposals** (a `followup:proposed` label / draft), never active graphed
+issues. **Promotion is the single writer's job, gated:**
+- *Trusted-origin (local) node work:* the chief/human promotes, or a chief-preapproved
+  policy auto-promotes within a bounded research area (the human still authored the
+  area and the gate).
+- *Untrusted/inbound:* promotion is always human-gated (same posture as
+  `awaiting-inbound-approval`, §1.2).
+- *Cross-node* ("need X from repo B") is **not** a worker write either — it becomes
+  a crossbridge `submit` **issued by the orchestrator**, landing in B as an
+  `xb:inbound` that B's human gates.
+
+Net: the graph grows only through the trusted single writer, worker discoveries are
+first-class (nothing lost), and "chief authors the graph, pump executes it" holds.
+Build slot: the `followup` kind lands with ingestion (step 4); promotion tooling is
+a chief/`vetinari`-skill concern (step 2) plus the human gate (step 6).
+
 ---
 
 ## GAP 2 — section chief + `vetinari` skill + directive decomposition
