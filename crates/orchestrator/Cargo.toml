@@ -54,6 +54,12 @@ tokio = { version = "1", features = ["rt", "net", "time"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The `vetinari` CLI's graph/crossbridge integration tests build a throwaway
+# crosslink repository on disk directly via the library (issues, blockers,
+# labels), mirroring `crosslink_api`'s own adapter test — no jj/crosslink CLI
+# shell-out. Same pinned source already in the graph (via `crosslink_api`), so
+# it resolves to one `crosslink` (no `links` conflict).
+crosslink = { path = "../../.crosslink-src/crosslink" }
 # Property-based tests for the workspace-name scheme (round-trip, collision-
 # freedom, filesystem-safety) and idempotent-cleanup observational equivalence.
 # `kani` is unavailable in the dev shell, so proptest is the proof tool.
@@ -68,3 +74,12 @@ libc = "0.2"
 [[bin]]
 name = "orchestrator"
 path = "src/main.rs"
+
+# The read-only introspection CLI for the VDD section chief
+# (`.design/swarm-kickoff-spec.md` §2.2). A second, deliberately thin binary:
+# it opens `state.db` read-only + crosslink for the DAG and NEVER writes, so the
+# single-writer invariant (REQ-3) holds. Second bin (not a subcommand) reads
+# cleaner for the `vetinari` skill and the zellij pane title.
+[[bin]]
+name = "vetinari"
+path = "src/bin/vetinari.rs"

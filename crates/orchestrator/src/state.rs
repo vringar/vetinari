@@ -223,6 +223,12 @@ str_enum! {
 /// migration; an existing version is never rewritten.
 const SCHEMA_VERSION: u32 = 1;
 
+/// How long a read-only reader ([`StateDb::open_read_only`]) waits out a
+/// transient SQLite lock before giving up. The pump's writer opener sets no
+/// busy_timeout, so the reader carries its own so a momentary exclusive lock
+/// (e.g. a WAL checkpoint) never fails the CLI mid-query.
+const READ_ONLY_BUSY_TIMEOUT_MS: u64 = 5_000;
+
 /// Schema v1 — the initial table set. Applied inside a single transaction by
 /// [`StateDb::open`] when an empty (`user_version = 0`) database is opened.
 const MIGRATION_V1: &str = r#"
@@ -444,6 +450,78 @@ impl StateDb {
         let mut db = StateDb { conn };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Open the `state.db` at `path` **read-only**, for a second reader — the
+    /// `vetinari` query CLI (`.design/swarm-kickoff-spec.md` §2.2) — while the
+    /// running orchestrator holds the primary WAL writer open.
+    ///
+    /// This constructor exists because [`StateDb::open`] *writes*: it creates
+    /// the file if absent and runs pending migrations. A read-only introspection
+    /// surface must never do either — writes stay through the pump so the
+    /// single-writer invariant (REQ-3) holds. So this:
+    ///
+    /// - opens the connection with `SQLITE_OPEN_READ_ONLY` (no create, no
+    ///   migration): every write or DDL a caller could reach is refused by
+    ///   SQLite itself, not merely by convention;
+    /// - sets a `busy_timeout` so a transient WAL lock from the live writer is
+    ///   waited out rather than surfaced as `SQLITE_BUSY` — the pump's own
+    ///   opener sets none, so this reader supplies its own discipline and never
+    ///   blocks the writer (a reader in WAL mode does not take a lock the writer
+    ///   waits on; the timeout only guards the brief exclusive moments such as a
+    ///   checkpoint);
+    /// - verifies the on-disk schema matches this binary **without migrating**,
+    ///   degrading to a clear error against a newer/older `state.db` rather than
+    ///   panicking or rewriting it.
+    ///
+    /// All the existing typed getters ([`get_issue`](Self::get_issue),
+    /// [`list_issues`](Self::list_issues),
+    /// [`list_active_workers`](Self::list_active_workers),
+    /// [`recent_events`](Self::recent_events), …) work unchanged on the returned
+    /// handle; only the mutating methods will fail (at the SQLite layer) if ever
+    /// called, which the read-only CLI never does.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<StateDb, StateError> {
+        let path = path.as_ref();
+        // READ_ONLY drops the default CREATE flag: opening an absent file is an
+        // error (a missing state.db is a real condition the CLI reports), and
+        // every write path is rejected by SQLite. URI + NO_MUTEX mirror the
+        // driver defaults `Connection::open` would otherwise apply.
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags).map_err(open_err(path))?;
+        // Connection-local setting (PRAGMA busy_timeout / sqlite3_busy_timeout);
+        // it configures this handle's lock-wait behaviour and writes nothing to
+        // the database file.
+        conn.busy_timeout(std::time::Duration::from_millis(READ_ONLY_BUSY_TIMEOUT_MS))
+            .map_err(open_err(path))?;
+        let db = StateDb { conn };
+        db.verify_schema_version()?;
+        Ok(db)
+    }
+
+    /// Confirm the on-disk `user_version` equals [`SCHEMA_VERSION`] **without**
+    /// applying (or being able to apply) any migration — the read-only twin of
+    /// [`migrate`](Self::migrate). A database written by a different orchestrator
+    /// build (older or newer) yields a precise [`StateError::Migration`] the CLI
+    /// prints, never a partial read or a panic.
+    fn verify_schema_version(&self) -> Result<(), StateError> {
+        let current: u32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .map(|v| v as u32)
+            .map_err(migration_err(SCHEMA_VERSION))?;
+        if current != SCHEMA_VERSION {
+            return Err(StateError::Migration {
+                target_version: SCHEMA_VERSION,
+                source: format!(
+                    "state.db is at schema v{current}, but this build expects v{SCHEMA_VERSION}; \
+                     the read-only CLI never migrates — run it with a matching orchestrator build"
+                )
+                .into(),
+            });
+        }
+        Ok(())
     }
 
     /// Apply forward migrations until the schema reaches [`SCHEMA_VERSION`].
@@ -937,6 +1015,67 @@ mod tests {
         StateDb::open(&path).expect("first open");
         // Reopening an already-migrated db is a no-op, not an error.
         StateDb::open(&path).expect("second open");
+    }
+
+    #[test]
+    fn open_read_only_reads_a_live_writers_rows_without_migrating() {
+        // Mirrors the deployed shape: the pump holds the WAL writer open while
+        // the `vetinari` CLI opens a SECOND, read-only connection concurrently.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let writer = StateDb::open(&path).expect("writer open");
+        writer
+            .upsert_issue(&IssueRow::new("7", Phase::Implementing))
+            .unwrap();
+
+        // Reader opens while the writer is still alive.
+        let reader = StateDb::open_read_only(&path).expect("read-only open");
+        assert_eq!(
+            reader.get_issue("7").unwrap().map(|i| i.phase),
+            Some(Phase::Implementing)
+        );
+
+        // A write attempted through the read-only handle is refused by SQLite
+        // itself — the invariant the CLI leans on.
+        let write_err = reader.upsert_issue(&IssueRow::new("8", Phase::Graphed));
+        assert!(
+            write_err.is_err(),
+            "a read-only connection must reject every write"
+        );
+        // The writer's own row set is unchanged — nothing leaked through.
+        assert_eq!(writer.list_issues().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_read_only_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // No state.db was ever created (READ_ONLY does not create).
+        // `StateDb` is not `Debug`, so match on the Result rather than
+        // `unwrap_err` (which would require `T: Debug`).
+        assert!(matches!(
+            StateDb::open_read_only(dir.path().join("absent.db")),
+            Err(StateError::Open { .. })
+        ));
+    }
+
+    #[test]
+    fn open_read_only_reads_after_the_writer_closed() {
+        // The "stopped node" case: the orchestrator is not running, so the CLI
+        // reads a checkpointed WAL database with no live writer.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let writer = StateDb::open(&path).expect("writer open");
+            writer
+                .upsert_issue(&IssueRow::new("42", Phase::Converged))
+                .unwrap();
+            // writer dropped here → connection closed, WAL checkpointed.
+        }
+        let reader = StateDb::open_read_only(&path).expect("read-only open after close");
+        assert_eq!(
+            reader.get_issue("42").unwrap().map(|i| i.phase),
+            Some(Phase::Converged)
+        );
     }
 
     #[test]
