@@ -1,0 +1,20 @@
+# Orchestrator deployment config for this node.
+#
+# Enables the embedded crossbridge federation server for the live pilot. The
+# orchestrator starts the server AFTER crash recovery (so a peer can't create an
+# inbound issue mid-recovery-scan). It does NOT start the host-wide
+# crossbridge-supervisor — that runs separately (REQ-20c).
+#
+# Trust posture (already enforced in code): an inbound (xb:inbound) issue is
+# untrusted. On first adoption its peer-injectable privileged labels are stripped
+# (a peer cannot self-approve), a human must graph it, and it NEVER auto-lands —
+# a converged inbound issue parks at `awaiting-inbound-approval` until a human
+# adds `inbound-approved:land`. See .design/crossbridge-label-trust.md and
+# tests/federation_e2e.rs.
+[crossbridge]
+enabled = true
+group = "orchestration"     # matches `crossbridge_up orchestration` in .envrc
+# slug: unset -> derived (CROSSBRIDGE_OWN_SLUG from the direnv helper, else the
+#   origin remote name). socket_root: unset -> crossbridge default
+#   ($CROSSBRIDGE_SOCKET_ROOT > $XDG_RUNTIME_DIR/crossbridge > /run/crossbridge).
+#   answer_retry_interval_s: unset -> ~5 min default.

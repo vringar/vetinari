@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Two binaries live here (the orchestrator and the read-only `vetinari` CLI), so
+# a bare `cargo run -p orchestrator` (and the `just orchestrate` recipe) would be
+# ambiguous. Default to the orchestrator; `vetinari` is run explicitly via
+# `cargo run --bin vetinari` / the installed `vetinari` binary.
+default-run = "orchestrator"
 
 [dependencies]
 vetinari-error.workspace = true
