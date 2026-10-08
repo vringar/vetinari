@@ -2,18 +2,20 @@
 
 Optimized for a short review window. Each decision: the options, my recommendation, what it blocks, and effort once decided. Skim the table; read only the rows you disagree with. Companion to `.design/swarm-kickoff-spec.md`.
 
+> **Update:** the socket-based federation transport (D2, D8 and the steps built on it) was removed. Cross-repo coordination is now via the message board (`board` CLI) plus a human-started comms-agent session (skill-driven, outside the orchestrator) that translates board messages into graphed crosslink issues. D2 and D8 are void; the other decisions stand.
+
 Legend — **Your call**: genuinely needs you (domain / commitment / trust). **Proceeding**: I've made the reversible call and am building on it; override if wrong.
 
 | # | Decision | My pick | Blocks | Kind |
 |---|----------|---------|--------|------|
 | D1 | First RE target + can a *verifiable gate* be written for it | (needs you — a narrow round-trippable subsystem) | **live kickoff** | Your call |
-| D2 | Unify crossbridge's crosslink onto vetinari's rev | **RESOLVED** — unify in vetinari (`[patch]` first, fork only if the spike shows real API drift) **and keep them in sync** going forward | step 3 | ✓ decided |
+| D2 | ~~Unify the federation transport's crosslink onto vetinari's rev~~ | **VOID** — transport removed | — | void |
 | D3 | `vetinari` as a second bin vs. `orchestrator` subcommand | Second bin | step 1 | Proceeding |
 | D4 | Worker follow-up work: propose-don't-commit vs. direct write | Propose-don't-commit (read-only crosslink + `followup` proposal channel) | step 4–5 | Your call (sanction) |
 | D5 | Who authors the issue graph from a directive | Chief drafts the DAG; **human** applies `phase:graphed` | seeding workflow | Proceeding |
 | D6 | `auto_graph` in the pilot | Drop it entirely for the pilot | pilot scope | Proceeding |
 | D7 | `busy_timeout` on the pump's `state.db` opener | Add it (reader + 2nd writer both need it) | step 1, 5 | Proceeding |
-| D8 | crossbridge server shutdown: reimplement `run` vs. wait for upstream | Reimplement ~50 lines for the pilot; file upstream | step 4 | Proceeding |
+| D8 | ~~Federation server shutdown~~ | **VOID** — transport removed | — | void |
 
 ---
 
@@ -25,36 +27,29 @@ Vetinari can only autonomously drive a sub-task reducible to a deterministic `st
 
 **What I need from you:** one concrete target subsystem + which gate pattern fits (or "none fits — it's exploration"). If none fits, the pilot shrinks to the gate-able fraction and the rest stays chief/human work. *Defining the gate is itself the reversing insight — it can't be automated.*
 
-## D2 — Unify crossbridge's crosslink onto vetinari's rev  *(RESOLVED 2026-09-03: unify + keep in sync)*
-There must be exactly **one** `crosslink` in the graph: `crosslink` pulls `libsqlite3-sys` (`links = "sqlite3"`, see `orchestrator/Cargo.toml:25`), and cargo hard-errors on two packages sharing a `links` value — so two crosslink revs cannot coexist. (Correction to an earlier overstatement here: this is *not* "not a `[patch]` away" — a `[patch]` is exactly how you collapse crossbridge's `crosslink` onto vetinari's one `dbbe2ed3` path copy. Whether that suffices depends only on whether crossbridge's source compiles against `dbbe2ed3`.)
-
-**Decision (user):** *"unify them in vetinari, but also make an effort to keep them in sync."*
-- **Unify:** add crossbridge as a dep; `[patch]` its `crosslink` onto vetinari's `.crosslink-src/crosslink` (`dbbe2ed3`). Fork crossbridge **only if** a compat spike shows real crosslink-API drift (or the D8 shutdown edit forces a source change). A spike is running to determine patch-suffices vs fork-needed with evidence.
-- **Keep in sync (ongoing discipline):** ship the `AC-28a` single-crosslink `cargo metadata` guard so a divergence fails the build loudly; when vetinari bumps `crosslink`, re-verify (and, if forked, rebase the fork + realign its crosslink rev in the same change); file the upstream shutdown-channel fix (D8) so any fork delta shrinks toward zero. Do not let a fork silently rot behind upstream.
+## D2 — void
+The federation transport this decision unified onto vetinari's crosslink was removed, so there is nothing to unify. The `AC-28a` single-crosslink guard (`xtask check-crosslink`) stays as a general check.
 
 ## D3 — Second bin `vetinari`  *(Proceeding)*
 A thin second binary `vetinari` in the orchestrator crate reads cleaner for the skill and the zellij pane title than an `orchestrator status` subcommand. Reversible (it's just packaging). **Building on this.**
 
 ## D4 — Follow-up work: propose-don't-commit  *(Your call — sanction the model)*
-Workers get crosslink **read-only** (already enforced — the sandbox binds `.crosslink/` RO). They **surface** follow-up work as a structured `--kind followup` proposal through the existing result channel; the **single writer (orchestrator)**, gated by the chief/human, promotes a proposal into a real graphed issue. Cross-node follow-up becomes an **orchestrator-issued crossbridge ask**, human-gated on the far side. Rationale (three walls): (1) an untrusted worker that can author the graph can inject backlog / block-bomb / bias what auto-lands (T4); (2) a second writer to crosslink breaks the single-writer + deterministic-recovery invariant; (3) free self-spawned follow-ups make the backlog explode unbounded. Full write-up folded into the spec (GAP 1). **Confirm this is the model** and I'll build the `followup` kind + promotion path into steps 4–5.
+Workers get crosslink **read-only** (already enforced — the sandbox binds `.crosslink/` RO). They **surface** follow-up work as a structured `--kind followup` proposal through the existing result channel; the **single writer (orchestrator)**, gated by the chief/human, promotes a proposal into a real graphed issue. Cross-node follow-up becomes a message-board post by a human or the comms agent, graphed by a human on the far side. Rationale (three walls): (1) an untrusted worker that can author the graph can inject backlog / block-bomb / bias what auto-lands (T4); (2) a second writer to crosslink breaks the single-writer + deterministic-recovery invariant; (3) free self-spawned follow-ups make the backlog explode unbounded. Full write-up in the spec (§1.6). **Confirm this is the model** and I'll build the `followup` kind + promotion path into steps 4–5.
 
 ## D5 — Graph authorship: chief drafts, human gates  *(Proceeding)*
-The chief (optionally via a the-architect-style decomposition agent) drafts the issue DAG; the **human applies `phase:graphed`** as the single entry gate (REQ-16), shared with the inbound-approval gate. The pump never authors graphs. **Building on this.**
+The chief (optionally via a the-architect-style decomposition agent) drafts the issue DAG; the **human applies `phase:graphed`** as the single entry gate (REQ-16), shared with cross-repo requests. The pump never authors graphs. **Building on this.**
 
 ## D6 — Drop `auto_graph` from the pilot  *(Proceeding)*
 The pilot doesn't need peer-driven auto-graphing; dropping it removes a trust-surface and a code path. Reintroduce only if a peer-driven autonomous-verify workflow proves necessary *after* the answer loop is trusted. **Building on this.**
 
 ## D7 — `busy_timeout` on the state.db opener  *(Proceeding)*
-`state.db` is WAL (`state.rs:440`) but sets no `busy_timeout`, so a second connection (the read CLI now, the crossbridge writer later) can hit `SQLITE_BUSY` instead of waiting. The CLI sets its own busy_timeout in step 1; the pump's opener should also get one before step 5's second writer. Pure correctness, no judgment. **Will land as a one-line pump-opener fix.**
+`state.db` is WAL (`state.rs:440`) but sets no `busy_timeout`, so a second connection (the read CLI) can hit `SQLITE_BUSY` instead of waiting. The CLI sets its own busy_timeout in step 1; the pump's opener should also get one. Pure correctness, no judgment. **Will land as a one-line pump-opener fix.**
 
-## D8 — crossbridge shutdown: reimplement for the pilot  *(Proceeding)*
-The embedded server needs a clean-shutdown channel so SIGINT still stops the orchestrator (the server thread must not `process::exit`). Upstream crossbridge lacks it. **Recommendation:** reimplement the ~50-line `run` loop inside `crossbridge_api` for the pilot and file the upstream fix; swap to upstream when it lands. **Building on this.**
+## D8 — void
+The embedded server this decision covered was removed.
 
 ---
 
 ## What I'm building while you're away (decision-free)
-1. **Step 1 — read-only `vetinari status/graph/workers/events/crossbridge` CLI** (in progress).
+1. **Step 1 — read-only `vetinari status/graph/workers/events` CLI** (in progress).
 2. **Step 2 — `vetinari` skill** wrapping it (seeding protocol + gate discipline).
-3. **Design sketches** for steps 3–6 (crossbridge_api surface, inbound ingestion, answer state machine, inbound-approval gate) — reviewable doc-level, so the moment D1/D2/D4 are decided the implementation is mechanical.
-
-I will **not** start step 3 (crossbridge_api) implementation until D2 is decided — pinning a fork is your commitment to make.

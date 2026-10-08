@@ -143,9 +143,7 @@ use crate::qa::{QaGate, QaOutcome, QaSandbox};
 use crate::roles::adversary::{render_inputs, RenderParams, RenderedAdversaryInputs};
 use crate::roles::merger::{render_conflict_input, ConflictContext};
 use crate::spawn::{SandboxHost, SpawnOutcome, Spawner, WorkerCommand};
-use crate::state::{
-    ActiveWorkerRow, EventKind, IssueRow, Phase, PhaseSubstate, StateDb, WorkerRole,
-};
+use crate::state::{ActiveWorkerRow, EventKind, IssueRow, Phase, StateDb, WorkerRole};
 use crate::workspace::{WorkspaceManager, WorkspaceName};
 
 /// The crosslink label prefix the pump moves as it advances an issue (REQ-2:
@@ -156,21 +154,6 @@ pub const PHASE_LABEL_PREFIX: &str = "phase:";
 /// The label the build pump picks up on: open issues carrying it are the pump's
 /// work queue (Q1 strict policy — unphased issues are ignored).
 pub const GRAPHED_LABEL: &str = "phase:graphed";
-
-/// The explicit human trust-gate label that authorizes an `xb:inbound`
-/// (untrusted-origin) issue to land (REQ-SWARM-1, spec §1.2).
-///
-/// A converged inbound issue parks at [`Phase::AwaitingInboundApproval`] and is
-/// **never** auto-landed — in *either* `tracker_remote` mode, regardless of any
-/// `auto_graph` policy — because its origin peer is derived from a socket path,
-/// not authenticated (the threat model's "untrusted origin ⇒ HARD NO-GO on
-/// auto-land", which the QA sandbox does not lift for intent-level T2/T4 attacks).
-/// A human adds this label after reviewing the work; the pump's approval sweep
-/// ([`BuildPump::resume_approved_inbound`]) then re-drives the parked issue into
-/// landing, mirroring the `AwaitingHumanMerge` label-gated resume (REQ-15a).
-/// Locally-authored issues never carry `xb:inbound`, so this gate never touches
-/// them.
-pub const INBOUND_APPROVED_LABEL: &str = "inbound-approved:land";
 
 /// The label the pump applies to an issue for which a worker surfaced ≥1
 /// follow-up **proposal** (REQ-SWARM-2, spec §1.6), so the chief can find issues
@@ -189,63 +172,6 @@ pub const INBOUND_APPROVED_LABEL: &str = "inbound-approved:land";
 /// orchestrator's — see [`crate::artifacts::FOLLOWUPS_FILE`].
 pub const FOLLOWUP_PROPOSED_LABEL: &str = "followup:proposed";
 
-/// The `xb-status:*` lifecycle prefix crossbridge stamps on an inbound issue.
-///
-/// When the embedded server materializes a peer's `SubmitIssue` it stamps
-/// exactly one status, [`XB_STATUS_OPEN_LABEL`], at creation
-/// (`.crossbridge-src/crossbridge-server/src/handler.rs`, `handle_submit`); the
-/// answer machine later mirrors `xb-status:answered` as a courtesy
-/// ([`crate::answer`]). Neither is ever *authority* — the orchestrator drives
-/// entirely off `state.db` (review B5). Any OTHER `xb-status:*` value on a
-/// freshly-adopted inbound issue can therefore only have ridden in on the
-/// peer-controlled `SubmitIssue.labels`, so the inbound sanitize strips it.
-const XB_STATUS_PREFIX: &str = "xb-status:";
-
-/// The single `xb-status:*` value the embedded server itself stamps when it
-/// creates an inbound issue (`handle_submit`). Preserved by the inbound sanitize
-/// as a legitimate server-set audit label; every other `xb-status:*` is stripped.
-const XB_STATUS_OPEN_LABEL: &str = "xb-status:open";
-
-/// True if `label` is one an **untrusted inbound peer must never be able to
-/// set** on the `xb:inbound` issue the embedded crossbridge server creates from
-/// its `SubmitIssue` — the set the inbound sanitize strips on first adoption
-/// ([`BuildPump::sanitize_inbound_labels`]).
-///
-/// # Why this is necessary (the upstream trust gap)
-///
-/// A peer's wire `submit` carries `pub labels: Vec<String>`
-/// (`.crossbridge-src/crossbridge-protocol/src/lib.rs`, `struct SubmitIssue`),
-/// and the server **echoes every one of them** onto the issue it creates,
-/// deduped only against its own five server-derived labels (`type:request`,
-/// `xb:inbound`, `xb-status:open`, `xb-source:<slug>`, `xb-ref:<uuid>`) —
-/// `.crossbridge-src/crossbridge-server/src/handler.rs`, `handle_submit`
-/// ("Include any extra labels the client requested, deduped against ours").
-/// Nothing upstream filters the privileged names below. So absent this gate a
-/// peer could pre-stamp its own [`INBOUND_APPROVED_LABEL`] and the step-6 land
-/// gate ([`BuildPump::land`]) would read it as a human's approval and auto-land
-/// untrusted work — exactly the "untrusted origin ⇒ HARD NO-GO on auto-land"
-/// boundary REQ-SWARM-1 exists to enforce.
-///
-/// The orchestrator therefore never trusts a peer-supplied privileged label; it
-/// strips, on our side, regardless of what crossbridge does:
-///
-/// - [`INBOUND_APPROVED_LABEL`] — the human land-approval; a peer setting it is
-///   the direct step-6 gate bypass. This is the load-bearing one.
-/// - [`FOLLOWUP_PROPOSED_LABEL`] — the pending-proposal marker; only a worker's
-///   `followups.jsonl` (via the pump) may raise it, never a peer.
-/// - Any `phase:*` **except** [`GRAPHED_LABEL`] — a peer must not dictate an
-///   issue's lifecycle phase. `phase:graphed` is preserved because it is the
-///   label the trusted section-chief adds to enqueue the issue and the one this
-///   sanitize's own ingest call site keyed off; the pump's phase mirror owns it
-///   from there.
-/// - Any `xb-status:*` except [`XB_STATUS_OPEN_LABEL`] — see [`XB_STATUS_PREFIX`].
-fn is_peer_forbidden_inbound_label(label: &str) -> bool {
-    label == INBOUND_APPROVED_LABEL
-        || label == FOLLOWUP_PROPOSED_LABEL
-        || (label.starts_with(PHASE_LABEL_PREFIX) && label != GRAPHED_LABEL)
-        || (label.starts_with(XB_STATUS_PREFIX) && label != XB_STATUS_OPEN_LABEL)
-}
-
 /// The role attribution recorded on translated crosslink comments (AC-16). The
 /// worker is the fake/real Implementer; the pump posts on its behalf.
 pub const WORKER_ROLE_TAG: &str = "implementer";
@@ -261,12 +187,6 @@ pub const ADVERSARY_ROLE_TAG: &str = "adversary";
 /// (and, in a later iteration, the `--kind resolution` summary) is attributed to
 /// the Merger, not the Implementer.
 pub const MERGER_ROLE_TAG: &str = "merger";
-
-/// The role attribution recorded on the inbound approval-gate blocker (AC-16):
-/// the "parked for human approval" blocker a converged `xb:inbound` issue carries
-/// (REQ-SWARM-1) is posted by the orchestrator itself on behalf of the crossbridge
-/// trust boundary, not by any worker.
-pub const INBOUND_ROLE_TAG: &str = "crossbridge";
 
 /// The base revset a fresh worker workspace is rooted on: `main`, so the
 /// worker's change is a child of trunk and lands as a clean fast-forward
@@ -322,14 +242,6 @@ pub enum PumpError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Landing(#[from] vetinari_error::LandingError),
-
-    /// A crossbridge adapter operation failed — deriving this node's own slug
-    /// when the embedded server is enabled (spec §1.3). A `SubmitAnswer` *wire*
-    /// failure is NOT this: it is handled in-band by the answer state machine
-    /// (`answer_unreachable`), never propagated as a tick-aborting `PumpError`.
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    Crossbridge(#[from] vetinari_crossbridge_api::CrossbridgeError),
 
     /// A worker artifact could not be verified or translated.
     #[error(transparent)]
@@ -405,11 +317,6 @@ pub enum IssueOutcome {
     /// fail, or a non-fast-forward retry), or a non-fast-forward bookmark move
     /// (REQ-19, REQ-15a).
     AwaitingHumanMerge,
-    /// A converged `xb:inbound` (untrusted-origin) issue was parked at
-    /// `phase:awaiting-inbound-approval` by the inbound trust-gate instead of
-    /// landing (REQ-SWARM-1). It stays parked — in either `tracker_remote` mode —
-    /// until a human adds `inbound-approved:land`, which resumes it into landing.
-    AwaitingInboundApproval,
     /// The issue was re-queued at `phase:implementing` after a QA failure
     /// (blocker posted; a later tick re-drives it).
     Requeued,
@@ -526,69 +433,10 @@ impl BuildPump {
         let mut outcomes = Vec::new();
         for issue_id in self.drivable_issue_ids()?.into_iter().take(budget) {
             let outcome = self.drive_issue(issue_id)?;
-            // Answer-back trigger (spec §1.3): the moment an issue reaches a
-            // terminal phase, if it is `xb:inbound` arm it for answer delivery.
-            // A no-op for every locally-authored issue (the trigger reads the
-            // crosslink labels and leaves non-inbound issues untouched), and only
-            // consulted at all when the embedded crossbridge server is enabled.
-            if self.config.crossbridge.enabled && outcome.is_terminal() {
-                crate::answer::on_issue_terminal(
-                    &self.state,
-                    &self.crosslink,
-                    &self.log,
-                    issue_id,
-                )?;
-            }
             outcomes.push((issue_id, outcome));
         }
 
-        // Step 2b — inbound approval resume (REQ-SWARM-1): re-drive any `xb:inbound`
-        // issue parked at `awaiting-inbound-approval` that a human has now labeled
-        // `inbound-approved:land` into landing, from its durably-stored reviewed
-        // change. The parked phase is terminal + non-drivable, so the drive step
-        // above never re-selects it — this label-gated sweep is its only resume,
-        // mirroring the `AwaitingHumanMerge` resume model (REQ-15a).
-        let mut resumed = self.resume_approved_inbound()?;
-        outcomes.append(&mut resumed);
-
-        // Step 3 — answer sweep (spec §1.3): deliver any inbound issue awaiting
-        // an answer, and retry the degraded `answer_unreachable` ones (bounded,
-        // rate-limited). Gated on the embedded server being enabled, so a
-        // crossbridge-unaware node does exactly nothing here.
-        if self.config.crossbridge.enabled {
-            self.sweep_answers()?;
-        }
         Ok(outcomes)
-    }
-
-    /// Deliver pending crossbridge answers for terminal inbound issues (spec
-    /// §1.3), resolving this node's slug + socket root from config the same way
-    /// `main::start_crossbridge` does. Errors from the wire round-trip are handled
-    /// in-band by the state machine; only a slug-derivation / state.db / crosslink
-    /// fault surfaces as a `PumpError`.
-    fn sweep_answers(&self) -> Result<(), PumpError> {
-        let own_slug = vetinari_crossbridge_api::own_slug(
-            self.manager.root(),
-            self.config.crossbridge.slug.as_deref(),
-        )?;
-        let socket_root = self
-            .config
-            .crossbridge
-            .socket_root
-            .clone()
-            .unwrap_or_else(vetinari_crossbridge_api::default_socket_root);
-        let retry_interval = self.config.crossbridge.answer_retry_interval_s as i64;
-        crate::answer::deliver_pending(
-            &self.state,
-            &self.crosslink,
-            &self.log,
-            &crate::answer::CrossbridgeTransport,
-            &own_slug,
-            &socket_root,
-            retry_interval,
-            now_unix(),
-        )?;
-        Ok(())
     }
 
     /// Drive [`tick`](Self::tick) repeatedly until no drivable work remains in
@@ -644,83 +492,11 @@ impl BuildPump {
             }
             let key = issue.id.to_string();
             if self.state.get_issue(&key)?.is_none() {
-                // First adoption of this issue (it has no `state.db` row yet).
-                // If it is `xb:inbound` (untrusted origin), neutralize any
-                // privileged label the peer smuggled in via `SubmitIssue.labels`
-                // BEFORE the row exists and BEFORE any drive/land runs — so the
-                // step-6 land gate (and every phase/status reader) can only ever
-                // see labels the server, the trusted section-chief, or a human
-                // applied. This is the pump's single one-shot: it is inside the
-                // `is_none()` branch, so a later human `inbound-approved:land`
-                // (applied only after the issue parks) is never stripped.
-                if crate::answer::is_inbound(&issue.labels) {
-                    self.sanitize_inbound_labels(issue.id, &issue.labels)?;
-                }
                 self.state
                     .upsert_issue(&IssueRow::new(&key, Phase::Graphed))?;
             }
         }
         Ok(())
-    }
-
-    /// Strip every peer-forbidden privileged label
-    /// ([`is_peer_forbidden_inbound_label`]) from an `xb:inbound` issue, closing
-    /// the upstream label-echo gap (see that predicate's docs for the crossbridge
-    /// `handle_submit` trail). Returns the number of labels removed.
-    ///
-    /// This is the orchestrator's structural guarantee that a peer can never
-    /// pre-approve its own inbound work: the load-bearing case is a
-    /// peer-supplied [`INBOUND_APPROVED_LABEL`], which — left in place — the
-    /// step-6 land gate ([`land`](Self::land)) would misread as a human's
-    /// approval and auto-land untrusted work.
-    ///
-    /// **One-shot is the caller's job, not this method's.** [`ingest`](Self::ingest)
-    /// invokes it exactly once, in the `state.db`-untracked branch, at the moment
-    /// the pump first adopts the issue — so a *human's* later
-    /// `inbound-approved:land` (applied only after the issue parks at
-    /// [`Phase::AwaitingInboundApproval`]) is never touched. This method itself is
-    /// an unconditional stripper (mirroring how [`land_change`](Self::land_change)
-    /// is the seam and [`land`](Self::land) owns the gating), which keeps it a
-    /// pure, directly-testable operation: the caller supplies the labels it
-    /// already holds, and re-poisoning is impossible because a peer's only write
-    /// path — a duplicate `submit` — is idempotent on `xb-ref:<uuid>` and
-    /// re-applies no labels (`handle_submit`).
-    ///
-    /// `labels` is the issue's current label set (the pump passes the snapshot
-    /// [`ingest`](Self::ingest) already listed, avoiding a re-read). Each removal
-    /// goes through `crosslink` `label_remove` only (AC-24: no shell-out) and
-    /// emits a [`EventKind::Transition`] audit row so the trust-boundary action is
-    /// legible in `events.jsonl`. A `crosslink` write fault `?`-propagates as a
-    /// typed [`PumpError`]; because it runs before the seed, a fault leaves the
-    /// issue un-adopted (no `state.db` row) to be retried on a later tick, never
-    /// half-sanitized-then-driven.
-    pub fn sanitize_inbound_labels(
-        &self,
-        issue_id: i64,
-        labels: &[String],
-    ) -> Result<usize, PumpError> {
-        let key = issue_id.to_string();
-        let mut stripped = 0usize;
-        for label in labels {
-            if !is_peer_forbidden_inbound_label(label) {
-                continue;
-            }
-            self.crosslink.label_remove(issue_id, label)?;
-            stripped += 1;
-            emit(
-                &self.state,
-                &self.log,
-                EventKind::Transition,
-                Some(&key),
-                None,
-                &json!({
-                    "inbound_sanitize": "stripped_peer_label",
-                    "label": label,
-                    "reason": "untrusted xb:inbound origin — a peer must not set this privileged label",
-                }),
-            )?;
-        }
-        Ok(stripped)
     }
 
     // --- drive selection (authority = state.db, REQ-2) ----------------------
@@ -740,136 +516,6 @@ impl BuildPump {
             .collect();
         ids.sort_unstable();
         Ok(ids)
-    }
-
-    // --- inbound approval resume (REQ-SWARM-1) ------------------------------
-
-    /// Re-drive every `xb:inbound` issue parked at `awaiting-inbound-approval`
-    /// that a human has now approved with the [`INBOUND_APPROVED_LABEL`] label,
-    /// landing it (spec §1.2, REQ-SWARM-1).
-    ///
-    /// This is the label-gated resume that mirrors the `AwaitingHumanMerge` model:
-    /// the parked phase is terminal and NOT drivable, so the drive step never
-    /// re-selects it; instead this sweep scans `state.db` for parked inbound issues
-    /// and, for each one whose crosslink labels now carry `inbound-approved:land`,
-    /// lands **exactly the reviewed change** it converged on — read back from the
-    /// durable `landing_change` handle the park stored ([`park_for_inbound_approval`]
-    /// (Self::park_for_inbound_approval)), never a fresh re-implementation the human
-    /// did not approve. Re-entering [`land`](Self::land) now falls straight through
-    /// the gate (the approval label is present) into the normal landing path, in
-    /// whichever `tracker_remote` mode is configured.
-    ///
-    /// Deliberately **not** gated on `[crossbridge] enabled`: an approval a human
-    /// applied must always be honored, even against a stale parked issue on a node
-    /// whose crossbridge server is currently disabled.
-    ///
-    /// # Answer exactly once across `park → approve → merge`
-    ///
-    /// The source peer must be answered **exactly once**, whenever delivery actually
-    /// succeeds. The FIRST terminal an inbound issue reaches — the approval park
-    /// (spec §1.3) — arms the answer via the drive loop's terminal trigger in
-    /// [`tick`](Self::tick), and the step-3 sweep tries to deliver it. Two cases
-    /// diverge when this resume then lands the approved change (landing clears
-    /// `phase_substate` to `None` on the merge terminal, which the answer sweep keys
-    /// entirely off):
-    ///
-    /// - **Park answer already delivered (`answer_sent`).** The peer has its result;
-    ///   nothing more is owed. This path therefore does **not** re-fire
-    ///   [`crate::answer::on_issue_terminal`] and does **not** re-arm — re-arming
-    ///   would defeat the answer machine's "already in an answer substate" guard and
-    ///   send a SECOND delivery. Not re-arming is the structural guarantee of "at
-    ///   most once".
-    /// - **Park answer never delivered (`answer_pending` / `answer_unreachable`).**
-    ///   The peer was offline during the approval window, so the merge just erased
-    ///   the very substate the retry sweep needs — silently degrading "answer at most
-    ///   once" into "answer zero times". So before landing we capture whether the
-    ///   answer is still undelivered, and after the land clears the substate we
-    ///   **re-arm `answer_pending`** (preserving the existing `answer_attempts` retry
-    ///   bookkeeping) so the step-3 sweep delivers it now, at the merge terminal.
-    ///
-    /// Re-firing `on_issue_terminal` is deliberately still avoided in BOTH cases: the
-    /// re-arm is an explicit, substate-conditioned `answer_pending` write, not the
-    /// unconditional trigger, so the `answer_sent` case is never disturbed.
-    ///
-    /// A parked issue with no stored `landing_change` (an impossible state the park
-    /// always writes, guarded here defensively) is left parked rather than landed
-    /// from a guessed target. Returns the `(issue_id, outcome)` for each issue this
-    /// sweep resumed.
-    fn resume_approved_inbound(&self) -> Result<Vec<(i64, IssueOutcome)>, PumpError> {
-        let mut outcomes = Vec::new();
-        for row in self.state.list_issues()? {
-            if row.phase != Phase::AwaitingInboundApproval {
-                continue;
-            }
-            let Ok(issue_id) = row.issue_id.parse::<i64>() else {
-                continue;
-            };
-            let info = self.crosslink.read_issue(issue_id)?;
-            if !has_label(&info.labels, INBOUND_APPROVED_LABEL) {
-                // Still parked: no human approval yet. Leave it exactly as is.
-                continue;
-            }
-            let Some(change) = row.landing_change.clone() else {
-                // Defensive: the park always persists the reviewed change before
-                // flipping the phase, so this should be unreachable. If it ever
-                // happens, refuse to land from a guessed target — stay parked.
-                emit(
-                    &self.state,
-                    &self.log,
-                    EventKind::Transition,
-                    Some(&row.issue_id),
-                    None,
-                    &json!({
-                        "inbound_approval": "resume_skipped",
-                        "reason": "approved but no stored landing_change — cannot resume; staying parked",
-                    }),
-                )?;
-                continue;
-            };
-            // Capture whether the peer's park-time answer is STILL undelivered
-            // BEFORE the land clears `phase_substate` on the merge terminal. Only a
-            // not-yet-delivered answer (`answer_pending`/`answer_unreachable`) is an
-            // outstanding obligation; `answer_sent` is already done and must never be
-            // re-armed (that would be a second delivery). See this method's doc.
-            let answer_still_owed = matches!(
-                row.phase_substate
-                    .as_deref()
-                    .and_then(PhaseSubstate::from_db_str),
-                Some(PhaseSubstate::AnswerPending | PhaseSubstate::AnswerUnreachable)
-            );
-
-            // Land exactly the reviewed change. The answer-back TRIGGER
-            // (`on_issue_terminal`) is deliberately NOT fired here — see this
-            // method's doc; the re-arm below is the narrow, substate-conditioned
-            // replacement that leaves an already-`answer_sent` issue untouched.
-            let outcome = self.land(issue_id, &row.issue_id, &change)?;
-
-            if answer_still_owed {
-                // The merge wiped the `answer_unreachable`/`answer_pending` substate
-                // the retry sweep keys off, so the peer would otherwise be answered
-                // ZERO times. Re-arm `answer_pending` (a plain substate write —
-                // `answer_attempts` is preserved, so the retry bound still holds) so
-                // the step-3 sweep in this same tick delivers it, now that the issue
-                // has reached its merge terminal.
-                self.state
-                    .set_phase_substate(&row.issue_id, Some(PhaseSubstate::AnswerPending))?;
-                emit(
-                    &self.state,
-                    &self.log,
-                    EventKind::Transition,
-                    Some(&row.issue_id),
-                    None,
-                    &json!({
-                        "answer": "re_armed_pending",
-                        "reason": "park-time answer was never delivered (peer offline); \
-                                   merge cleared the substate — re-arm so the peer is \
-                                   answered exactly once at the merge terminal",
-                    }),
-                )?;
-            }
-            outcomes.push((issue_id, outcome));
-        }
-        Ok(outcomes)
     }
 
     // --- per-issue state machine --------------------------------------------
@@ -1490,39 +1136,6 @@ impl BuildPump {
     /// review — #1). The committed change is durable in `.jj/`, so landing needs
     /// no workspace DIR; there is nothing left to clean up here.
     fn land(&self, issue_id: i64, key: &str, change: &str) -> Result<IssueOutcome, PumpError> {
-        // === REQ-SWARM-1: the inbound approval gate (untrusted origin → NEVER auto-land) ===
-        //
-        // This runs FIRST, before the `tracker_remote` mode-select below, so it
-        // covers BOTH landing paths — local fast-forward AND remote push+PR. An
-        // `xb:inbound` issue's origin peer is derived from a socket path and is NOT
-        // authenticated (REQ-20f); the threat model's verdict on untrusted work is
-        // HARD NO-GO on auto-land, and the QA sandbox (P0) does not lift it for the
-        // intent-level attacks (T2 deferred payload, T4 prompt-injected gate) that
-        // survive it. So a converged inbound issue is parked at
-        // `awaiting-inbound-approval` and requires the explicit human
-        // `inbound-approved:land` label before it may land — this park is the single
-        // structural enforcement point of that boundary, regardless of mode or any
-        // `auto_graph` policy.
-        //
-        // A NON-inbound (locally-authored) issue, or an inbound issue that ALREADY
-        // carries `inbound-approved:land` (a human approved it; the approval sweep
-        // re-drives it here), falls straight through to land exactly as before.
-        //
-        // This tracker read now runs for EVERY land, including the local-FF path
-        // that was previously tracker-independent (a new coupling; the local land
-        // takes one extra crosslink round-trip). A read failure `?`-propagates as a
-        // typed [`PumpError`] (never a panic) and ABORTS the land attempt: the issue
-        // stays at its current drivable phase to be retried on a later tick — it does
-        // NOT fall through the gate (no auto-land) and does NOT park. A transient
-        // crosslink hiccup therefore stalls this one land, fail-closed, and never
-        // mis-classifies inbound vs. non-inbound.
-        let info = self.crosslink.read_issue(issue_id)?;
-        if crate::answer::is_inbound(&info.labels)
-            && !has_label(&info.labels, INBOUND_APPROVED_LABEL)
-        {
-            return self.park_for_inbound_approval(issue_id, key, change);
-        }
-
         // Mode gate (REQ-17): crosslink's `tracker_remote` selects local FF vs.
         // remote push+PR. Read at land time (never a compile-time cfg, REQ-2a);
         // empty/unset ⇒ local mode (the default, unchanged).
@@ -1954,64 +1567,6 @@ impl BuildPump {
         )?;
         self.post_conflict_blocker(issue_id, reason)?;
         Ok(IssueOutcome::AwaitingHumanMerge)
-    }
-
-    /// Park a converged `xb:inbound` (untrusted-origin) issue at
-    /// `phase:awaiting-inbound-approval` instead of landing it (REQ-SWARM-1).
-    ///
-    /// This is the single structural enforcement of the threat model's "untrusted
-    /// origin ⇒ HARD NO-GO on auto-land": reached from [`land`](Self::land) BEFORE
-    /// the `tracker_remote` mode-select, so it forecloses BOTH the local-FF and the
-    /// remote-PR landing paths — neither can auto-land untrusted work.
-    ///
-    /// Ordering is crash-safety-critical: the reviewed `change` is persisted
-    /// ([`StateDb::set_landing_change`]) **before** the phase is flipped to
-    /// `AwaitingInboundApproval`, so the instant the issue is observably parked the
-    /// approval sweep can land *exactly* the reviewed change — the Implementer
-    /// workspace is already forgotten by landing time, so the change cannot be
-    /// re-derived from a workspace, and the store must outlive a restart-while-parked.
-    ///
-    /// A `--kind blocker` records, for a human, the exact label
-    /// ([`INBOUND_APPROVED_LABEL`]) that authorizes landing. The park is a terminal
-    /// phase, so the pump's answer-back trigger then answers the source peer once
-    /// (spec §1.3) — the peer learns the work is pending approval and is never left
-    /// waiting; the later merge does NOT answer a second time (the answer machine's
-    /// first-terminal-wins guard).
-    fn park_for_inbound_approval(
-        &self,
-        issue_id: i64,
-        key: &str,
-        change: &str,
-    ) -> Result<IssueOutcome, PumpError> {
-        // Persist the reviewed change FIRST (before the phase flip) — see the doc.
-        self.state.set_landing_change(key, change)?;
-        self.state
-            .set_phase(key, Phase::AwaitingInboundApproval, None)?;
-        self.set_phase_label(issue_id, Phase::AwaitingInboundApproval)?;
-        emit(
-            &self.state,
-            &self.log,
-            EventKind::Transition,
-            Some(key),
-            None,
-            &json!({
-                "from_phase": Phase::Converged.as_str(),
-                "to_phase": Phase::AwaitingInboundApproval.as_str(),
-                "reason": "xb:inbound (untrusted origin) — parked for human approval; never auto-lands",
-                "gate": "REQ-SWARM-1",
-            }),
-        )?;
-        let body = format!(
-            "Parked at `phase:awaiting-inbound-approval`: this is an `xb:inbound` issue \
-             (untrusted-origin work submitted by a peer over crossbridge). It has passed \
-             implement → QA → adversary review and converged, but untrusted work **never \
-             auto-lands** (regardless of local-FF or remote-PR mode).\n\n\
-             A human must review the converged change and then apply the `{INBOUND_APPROVED_LABEL}` \
-             label to authorize landing (REQ-SWARM-1). Until then it stays parked."
-        );
-        self.crosslink
-            .comment_write(issue_id, "blocker", &body, Some(INBOUND_ROLE_TAG))?;
-        Ok(IssueOutcome::AwaitingInboundApproval)
     }
 
     /// Post a `--kind blocker` recording the conflict context on an issue parked
@@ -2487,12 +2042,6 @@ fn parse_finding_from_body(text: &str) -> Option<Finding> {
     })
 }
 
-/// Whether a crosslink label set contains `label` exactly — the presence check
-/// the inbound approval gate (REQ-SWARM-1) uses for [`INBOUND_APPROVED_LABEL`].
-fn has_label(labels: &[String], label: &str) -> bool {
-    labels.iter().any(|l| l == label)
-}
-
 /// Append the accumulated Adversary `prior_findings` to a fresh Implementer's
 /// task (REQ-8): the findings reach the worker as task input, so a re-implement
 /// round addresses them, never as agent session memory. Empty findings leave the
@@ -2550,67 +2099,11 @@ mod tests {
     fn issue_outcome_terminality() {
         assert!(IssueOutcome::Merged.is_terminal());
         assert!(IssueOutcome::AwaitingHumanMerge.is_terminal());
-        assert!(
-            IssueOutcome::AwaitingInboundApproval.is_terminal(),
-            "an inbound issue parked for approval is a terminal (parked) outcome"
-        );
         assert!(IssueOutcome::OrchestratorError.is_terminal());
         assert!(
             !IssueOutcome::Requeued.is_terminal(),
             "requeue is re-driven"
         );
-    }
-
-    #[test]
-    fn has_label_is_exact_match() {
-        let labels = vec![
-            "xb:inbound".to_owned(),
-            "inbound-approved:land".to_owned(),
-            "phase:converged".to_owned(),
-        ];
-        assert!(has_label(&labels, INBOUND_APPROVED_LABEL));
-        assert!(has_label(&labels, "xb:inbound"));
-        // Not a prefix / substring match — the exact label must be present.
-        assert!(!has_label(&labels, "inbound-approved"));
-        assert!(!has_label(&labels, "phase:merged"));
-        assert!(!has_label(&[], INBOUND_APPROVED_LABEL));
-    }
-
-    /// The inbound-label trust classifier: a peer must not be able to smuggle a
-    /// privileged label past the sanitize, and legitimate server/section-chief
-    /// labels must survive it (else the sanitize would corrupt honest issues).
-    #[test]
-    fn peer_forbidden_inbound_label_classifies_the_privileged_set() {
-        // Forbidden — a peer must never set these on its inbound issue.
-        assert!(
-            is_peer_forbidden_inbound_label(INBOUND_APPROVED_LABEL),
-            "the human land-approval is the load-bearing bypass; must be stripped"
-        );
-        assert!(is_peer_forbidden_inbound_label(FOLLOWUP_PROPOSED_LABEL));
-        assert!(is_peer_forbidden_inbound_label("phase:merged"));
-        assert!(is_peer_forbidden_inbound_label(
-            "phase:awaiting-inbound-approval"
-        ));
-        assert!(is_peer_forbidden_inbound_label("xb-status:answered"));
-        assert!(is_peer_forbidden_inbound_label("xb-status:approved"));
-
-        // Preserved — the server's own creation-time labels, the section-chief's
-        // enqueue label, and benign routing/peer labels are NOT privileged.
-        assert!(
-            !is_peer_forbidden_inbound_label(GRAPHED_LABEL),
-            "phase:graphed is the trusted enqueue label + the ingest trigger — keep it"
-        );
-        assert!(
-            !is_peer_forbidden_inbound_label(XB_STATUS_OPEN_LABEL),
-            "xb-status:open is stamped by the server itself at creation — keep it"
-        );
-        assert!(!is_peer_forbidden_inbound_label("xb:inbound"));
-        assert!(!is_peer_forbidden_inbound_label("xb-source:firmware"));
-        assert!(!is_peer_forbidden_inbound_label("xb-ref:uuid-abc"));
-        assert!(!is_peer_forbidden_inbound_label("type:request"));
-        // Not a prefix/substring false-positive: only the exact privileged names.
-        assert!(!is_peer_forbidden_inbound_label("inbound-approved"));
-        assert!(!is_peer_forbidden_inbound_label("followup:proposed-later"));
     }
 
     #[test]

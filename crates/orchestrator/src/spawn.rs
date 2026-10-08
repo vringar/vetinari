@@ -212,9 +212,8 @@ pub const HEADLESS_BOOTSTRAP: &str = "Read _orchestrator/task.md and complete th
 
 /// The minimal set of environment variable *names* a worker is allowed to
 /// inherit from the orchestrator's ambient environment. Everything else — API
-/// keys, tokens, `GH_TOKEN`, the [`BWRAP_PIN_ENV`] pin, `CROSSBRIDGE_*`
-/// secrets — is scrubbed before the worker starts (env hygiene). A worker only
-/// needs enough to find its interpreter (`PATH`), resolve `$HOME`-relative
+/// keys, tokens, `GH_TOKEN`, the [`BWRAP_PIN_ENV`] pin — is scrubbed
+/// before the worker starts (env hygiene). A worker only needs enough to find its interpreter (`PATH`), resolve `$HOME`-relative
 /// config, and render a terminal (`TERM`); anything role-specific is passed
 /// explicitly via the command kind's `env` list.
 ///
@@ -1057,9 +1056,8 @@ impl SandboxHost {
     ///   <workspace>`.
     ///
     /// Deliberately omitted from `claude-sandbox`'s fuller policy (not needed to
-    /// run a headless `claude`): the D-Bus/keyring socket, crossbridge socket
-    /// (crossbridge is deferred), SSH agent/keys/known_hosts, zsh history,
-    /// c8ctl, Maven, the podman service, and the non-NixOS `/usr`,`/lib*`,`/opt`
+    /// run a headless `claude`): the D-Bus/keyring socket, SSH
+    /// agent/keys/known_hosts, zsh history, c8ctl, Maven, the podman service, and the non-NixOS `/usr`,`/lib*`,`/opt`
     /// compat binds (this host is NixOS-style, everything is under `/nix`).
     /// The workspace RW and `.jj/`/`.git/`/`.crosslink/` binds are **not** here —
     /// they are the per-role [`MountMatrix`], appended after this.

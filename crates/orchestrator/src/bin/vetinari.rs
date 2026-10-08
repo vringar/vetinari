@@ -35,7 +35,6 @@
 //! vetinari graph                         each issue's crosslink open-blockers × its state.db phase
 //! vetinari workers                       active workers: role, round, workspace, pid, heartbeat age
 //! vetinari events [--issue N] [--tail K]  recent events (spawn / transition / qa_result / …)
-//! vetinari crossbridge                   inbound/outbound xb issues (integration not yet active)
 //! ```
 //!
 //! Each subcommand prints a human-readable table by default and structured JSON
@@ -49,7 +48,7 @@ use std::path::{Path, PathBuf};
 
 use miette::{bail, miette, IntoDiagnostic, Result, WrapErr};
 use serde_json::{json, Value};
-use vetinari_crosslink_api::{CrosslinkRepo, IssueInfo};
+use vetinari_crosslink_api::CrosslinkRepo;
 
 use orchestrator::events::ORCHESTRATOR_DIR;
 use orchestrator::state::{ActiveWorkerRow, EventRow, IssueRow, StateDb};
@@ -57,24 +56,6 @@ use orchestrator::state::{ActiveWorkerRow, EventRow, IssueRow, StateDb};
 /// The crosslink label a graphed, pump-pickable issue carries — the DAG the
 /// `graph` view enumerates over (mirrors `pump.rs` `GRAPHED_LABEL`).
 const GRAPHED_LABEL: &str = "phase:graphed";
-
-/// crossbridge marker labels. crossbridge ingestion is NOT built yet (a later
-/// step of the swarm-kickoff spec, §1.2); these are the labels an embedded
-/// server *will* stamp on the inbound/outbound issues it creates, and which the
-/// `crossbridge` view reads today from whatever is already present. When the
-/// `crossbridge_api` crate lands it will own these (`crossbridge_api::labels::*`)
-/// and this binary should re-export from there rather than redefine them.
-const XB_INBOUND_LABEL: &str = "xb:inbound";
-/// See [`XB_INBOUND_LABEL`].
-const XB_OUTBOUND_LABEL: &str = "xb:outbound";
-/// Prefix of the `xb-source:<peer-slug>` label recording the submitting peer.
-const XB_SOURCE_PREFIX: &str = "xb-source:";
-/// Prefix of the `xb-status:<state>` courtesy label (authority is `state.db`,
-/// never this label — review B5).
-const XB_STATUS_PREFIX: &str = "xb-status:";
-/// Prefix of the `xb-ref:<id>` label correlating an inbound issue to its
-/// source-side request.
-const XB_REF_PREFIX: &str = "xb-ref:";
 
 /// Heartbeat-age threshold (seconds) beyond which the `workers` view flags a
 /// worker as `stale`. Mirrors the default `worker_timeout_secs` (config.rs): a
@@ -93,7 +74,6 @@ fn main() -> Result<()> {
         Command::Graph => cmd_graph(&args),
         Command::Workers => cmd_workers(&args),
         Command::Events => cmd_events(&args),
-        Command::Crossbridge => cmd_crossbridge(&args),
     }
 }
 
@@ -101,14 +81,13 @@ fn main() -> Result<()> {
 // Argument parsing (hand-rolled — clap is not a dependency of this crate)
 // ============================================================================
 
-/// The five read-only subcommands.
+/// The four read-only subcommands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Status,
     Graph,
     Workers,
     Events,
-    Crossbridge,
 }
 
 /// Parsed command line.
@@ -183,7 +162,6 @@ impl Cli {
                         "graph" => Command::Graph,
                         "workers" => Command::Workers,
                         "events" => Command::Events,
-                        "crossbridge" => Command::Crossbridge,
                         _ => bail!("unknown subcommand `{other}`\n\n{USAGE}"),
                     });
                 }
@@ -213,7 +191,6 @@ SUBCOMMANDS:
     graph                        each issue's open blockers joined with its execution phase
     workers                      active workers: role, round, workspace, pid, heartbeat age
     events [--issue N] [--tail K]  recent events (default K = 20)
-    crossbridge                  inbound/outbound crossbridge issues (integration not yet active)
 
 FLAGS:
     --json                 emit structured JSON instead of a table
@@ -557,133 +534,6 @@ fn event_json(e: &EventRow) -> Value {
         "worker_uuid": e.worker_uuid,
         "payload": e.payload,
     })
-}
-
-// ============================================================================
-// crossbridge
-// ============================================================================
-
-/// `vetinari crossbridge` — inbound/outbound crossbridge issues as they exist
-/// *today*, before the crossbridge integration is built.
-///
-/// crossbridge ingestion (the embedded server, the answer state machine, the
-/// `phase:awaiting-inbound-approval` gate) is a later step of the swarm-kickoff
-/// spec (§1). Until then there is no live socket, no answer substate authority,
-/// and no degraded flag. This view therefore reads only what is already
-/// representable: crosslink issues carrying the `xb:*` marker labels. It prints
-/// a clear "integration not yet active" note and never stubs fake data.
-///
-/// Forward-compatibility note: the answer substate (`answer_pending` /
-/// `answer_sent` / `answer_unreachable`) and the `degraded` flag will become
-/// authoritative `state.db` columns in a later step (review B5). They are shown
-/// as `-` here; when they land, join them in from the issue's `phase_substate`.
-fn cmd_crossbridge(args: &Cli) -> Result<()> {
-    let dir = resolve_orchestrator_dir(args.orchestrator_dir.as_deref())?;
-    let crosslink = open_crosslink(&dir)?;
-
-    // Best-effort join to the issue's persisted substate — forward-compatible
-    // with the answer-substate columns that arrive in a later step. A stopped or
-    // absent state.db is not fatal to this crosslink-only view.
-    let substate_of: std::collections::BTreeMap<i64, String> = match open_state(&dir) {
-        Ok(state) => state
-            .list_issues()
-            .into_diagnostic()?
-            .into_iter()
-            .filter_map(|r| {
-                let id = r.issue_id.parse::<i64>().ok()?;
-                Some((id, r.phase_substate.unwrap_or_else(|| "-".to_string())))
-            })
-            .collect(),
-        Err(_) => std::collections::BTreeMap::new(),
-    };
-
-    let inbound = crosslink
-        .list_by_label("open", XB_INBOUND_LABEL)
-        .into_diagnostic()
-        .wrap_err("list inbound crossbridge issues")?;
-    let outbound = crosslink
-        .list_by_label("open", XB_OUTBOUND_LABEL)
-        .into_diagnostic()
-        .wrap_err("list outbound crossbridge issues")?;
-
-    if args.json {
-        return write_json(&json!({
-            "integration_active": false,
-            "note": "crossbridge integration not yet active (swarm-kickoff spec §1, not built)",
-            "inbound": inbound.iter().map(|i| xb_issue_json(i, &substate_of)).collect::<Vec<_>>(),
-            "outbound": outbound.iter().map(|i| xb_issue_json(i, &substate_of)).collect::<Vec<_>>(),
-        }));
-    }
-
-    let mut out = String::new();
-    out.push_str("crossbridge integration not yet active (swarm-kickoff spec §1, not built).\n");
-    out.push_str("Showing crosslink issues carrying xb:* marker labels only.\n\n");
-    out.push_str(&xb_section("INBOUND", &inbound, &substate_of));
-    out.push('\n');
-    out.push_str(&xb_section("OUTBOUND", &outbound, &substate_of));
-    write_out(&out)
-}
-
-/// Render one labelled crossbridge section (inbound or outbound) as a table.
-fn xb_section(
-    title: &str,
-    issues: &[IssueInfo],
-    substate_of: &std::collections::BTreeMap<i64, String>,
-) -> String {
-    if issues.is_empty() {
-        return format!("{title}: none\n");
-    }
-    let rows: Vec<Vec<String>> = issues
-        .iter()
-        .map(|i| {
-            vec![
-                format!("#{}", i.id),
-                i.title.clone(),
-                label_value(&i.labels, XB_SOURCE_PREFIX),
-                label_value(&i.labels, XB_STATUS_PREFIX),
-                label_value(&i.labels, XB_REF_PREFIX),
-                substate_of
-                    .get(&i.id)
-                    .cloned()
-                    .unwrap_or_else(|| "-".to_string()),
-            ]
-        })
-        .collect();
-    format!(
-        "{title}:\n{}",
-        render_table(
-            &[
-                "ISSUE",
-                "TITLE",
-                "SOURCE",
-                "XB_STATUS",
-                "XB_REF",
-                "SUBSTATE"
-            ],
-            &rows,
-        )
-    )
-}
-
-/// The JSON projection of one crossbridge issue.
-fn xb_issue_json(i: &IssueInfo, substate_of: &std::collections::BTreeMap<i64, String>) -> Value {
-    json!({
-        "id": i.id,
-        "title": i.title,
-        "peer_slug": label_value(&i.labels, XB_SOURCE_PREFIX),
-        "xb_status": label_value(&i.labels, XB_STATUS_PREFIX),
-        "xb_ref": label_value(&i.labels, XB_REF_PREFIX),
-        "answer_substate": substate_of.get(&i.id).cloned().unwrap_or_else(|| "-".to_string()),
-    })
-}
-
-/// The suffix of the first label starting with `prefix`, or `-` if none.
-fn label_value(labels: &[String], prefix: &str) -> String {
-    labels
-        .iter()
-        .find_map(|l| l.strip_prefix(prefix))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "-".to_string())
 }
 
 // ============================================================================

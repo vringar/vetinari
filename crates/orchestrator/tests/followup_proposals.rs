@@ -15,7 +15,6 @@
 //!
 //! - **no blocker edge** is wired (the `suggested_blockers` field is comment
 //!   TEXT only, never a real `crosslink issue block`);
-//! - **no privileged label** is applied (`inbound-approved:land` absent);
 //! - **no `phase:graphed`** is (re-)applied by the proposal path.
 //!
 //! "No new issue is created" holds by construction, not by assertion: the whole
@@ -30,9 +29,7 @@ use common::{build_fixture, fake_adversary_clean, fake_implementer_followups, un
 use orchestrator::config::{ConvergenceConfig, OrchestratorConfig, WorkerConfig};
 use orchestrator::events::EventLog;
 use orchestrator::events::ORCHESTRATOR_DIR;
-use orchestrator::pump::{
-    BuildPump, IssueOutcome, FOLLOWUP_PROPOSED_LABEL, GRAPHED_LABEL, INBOUND_APPROVED_LABEL,
-};
+use orchestrator::pump::{BuildPump, IssueOutcome, FOLLOWUP_PROPOSED_LABEL, GRAPHED_LABEL};
 use orchestrator::spawn::Spawner;
 use orchestrator::state::StateDb;
 use orchestrator::workspace::WorkspaceManager;
@@ -141,12 +138,6 @@ fn followup_proposals_post_comments_and_label_but_never_author_the_graph() {
             .expect("read blockers")
             .is_empty(),
         "a follow-up proposal must NEVER wire a real blocker edge"
-    );
-    // No privileged trust-gate label.
-    assert!(
-        !info.labels.iter().any(|l| l == INBOUND_APPROVED_LABEL),
-        "a proposal must never apply the `{INBOUND_APPROVED_LABEL}` privileged label, got {:?}",
-        info.labels
     );
     // The proposal path never (re-)applies `phase:graphed`; the issue merged.
     assert!(

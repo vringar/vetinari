@@ -68,7 +68,7 @@ Local FF landing (`landing.rs:360-394`): `main` is moved only via a fast-forward
 
 ### 1e. Untrusted-input flow (prompt injection surface)
 
-Issue title/description → `task_from_issue` (`implementer.rs:235-238`) → `_orchestrator/task.md` verbatim → both the Implementer's instructions and (via `render_inputs`) the Adversary's review context. The issue body is fully attacker-controlled for inbound/crossbridge issues and reaches two LLMs as instructions.
+Issue title/description → `task_from_issue` (`implementer.rs:235-238`) → `_orchestrator/task.md` verbatim → both the Implementer's instructions and (via `render_inputs`) the Adversary's review context. The issue body is fully attacker-controlled for issues originating in another repo and reaches two LLMs as instructions.
 
 ---
 
@@ -145,7 +145,7 @@ The entire bwrap mount matrix, the env scrub, the store-path pin — all of it i
 ### (a) Trusted-origin issues — CONDITIONAL GO, only after P0
 Auto-landing trusted issues still runs machine-generated `build.rs`/test code on the host today (T1/T2). If the pipeline and issue authors are trusted, residual risk is "our own generated code runs on our host," which is tolerable **only once P0 lands** (QA in a network-denied sandbox, grader executed from trunk, non-orchestrator UID). Without P0: **NO-GO** — a single buggy or compromised generation is host RCE.
 
-### (b) Untrusted / inbound (crossbridge) issues — HARD NO-GO
+### (b) Untrusted / inbound (cross-repo) issues — HARD NO-GO
 Do not enable unsupervised auto-landing of untrusted issues under the current code. An attacker fully controls the code under test and the QA script, both of which run on the host outside the sandbox (T1), can exfiltrate operator Anthropic creds over unrestricted egress (T5), can corrupt the shared repo (T3), and faces only an injectable LLM as the content gate (T4). This is remotely-triggered arbitrary code execution on the control plane, wormable across the 5-server federation. **P0 + both P1 items + P2 are prerequisites**, and even then untrusted auto-landing warrants a human-in-the-loop checkpoint until the sandboxed pipeline has a track record.
 
 ---

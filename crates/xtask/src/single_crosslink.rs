@@ -1,10 +1,8 @@
 //! Single-crosslink guard (AC-28a).
 //!
-//! vetinari and crossbridge each depend on `crosslink`, and `crosslink` pulls
-//! `libsqlite3-sys` (`links = "sqlite3"`). cargo forbids two packages sharing a
-//! `links` value, so the whole dependency graph must resolve to exactly ONE
-//! `crosslink`. The workspace `[patch]` collapses crossbridge's crosslink
-//! git-dependency onto vetinari's single copy to make that true.
+//! `crosslink` pulls `libsqlite3-sys` (`links = "sqlite3"`). cargo forbids two
+//! packages sharing a `links` value, so the whole dependency graph must resolve
+//! to exactly ONE `crosslink`.
 //!
 //! This check is the guardrail that makes a future divergence fail *loudly*:
 //! it runs `cargo metadata` and fails the build if more than one distinct

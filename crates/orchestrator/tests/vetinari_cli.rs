@@ -241,35 +241,3 @@ fn graph_joins_open_blockers_with_state_db_phase() {
     assert_eq!(target_node["open_blockers"][0]["id"], open_blocker);
     assert_eq!(target_node["open_blockers"][0]["phase"], "graphed");
 }
-
-#[test]
-fn crossbridge_shows_inbound_labels_with_not_active_note() {
-    let tmp = tempfile::tempdir().unwrap();
-    let crosslink_dir = tmp.path().join(".crosslink");
-    std::fs::create_dir_all(&crosslink_dir).unwrap();
-    let inbound = {
-        let cdb = Database::open(&crosslink_dir.join("issues.db")).unwrap();
-        let inbound = cdb.create_issue("Inbound request", None, "medium").unwrap();
-        cdb.add_label(inbound, "xb:inbound").unwrap();
-        cdb.add_label(inbound, "xb-source:peer-node-b").unwrap();
-        cdb.add_label(inbound, "xb-status:pending").unwrap();
-        inbound
-    };
-    // A state.db is present but need not track the inbound issue.
-    let _db = seed_state(tmp.path());
-
-    let out = run_vetinari(tmp.path(), &["crossbridge"]);
-    assert!(
-        out.contains("not yet active"),
-        "clear integration-not-active note: {out}"
-    );
-    assert!(out.contains(&format!("#{inbound}")), "{out}");
-    assert!(out.contains("peer-node-b"), "peer slug shown: {out}");
-    assert!(out.contains("pending"), "xb-status shown: {out}");
-
-    let json = run_vetinari(tmp.path(), &["crossbridge", "--json"]);
-    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["integration_active"], false);
-    assert_eq!(v["inbound"][0]["peer_slug"], "peer-node-b");
-    assert_eq!(v["inbound"][0]["xb_status"], "pending");
-}

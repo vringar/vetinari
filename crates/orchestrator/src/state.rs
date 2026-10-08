@@ -118,15 +118,6 @@ str_enum! {
         PrOpen => "pr-open",
         /// Landing failed and needs a human merge — terminal until resumed.
         AwaitingHumanMerge => "awaiting-human-merge",
-        /// A converged **`xb:inbound`** (untrusted-origin) issue, parked at the
-        /// human trust-gate: it has passed implement → QA → adversary → converged
-        /// but MUST NOT auto-land (REQ-SWARM-1). It stays here — a parked, terminal,
-        /// non-drivable phase (the `AwaitingHumanMerge` model) — until a human adds
-        /// the explicit `inbound-approved:land` label, which resumes it into
-        /// landing. This is the single structural enforcement of the threat model's
-        /// "untrusted origin ⇒ HARD NO-GO on auto-land", holding regardless of
-        /// `tracker_remote` mode or any `auto_graph` policy.
-        AwaitingInboundApproval => "awaiting-inbound-approval",
         /// An unrecoverable orchestrator-side fault — terminal.
         OrchestratorError => "orchestrator-error",
     }
@@ -156,31 +147,12 @@ impl Phase {
     /// Whether this phase is **terminal**: the issue's lifecycle has ended and
     /// neither the pump's drive step nor crash-recovery advances it further.
     ///
-    /// This is the **single terminal-set definition**. The crossbridge answer-back
-    /// trigger ([`crate::answer::phase_delivers_answer`]) and crash-recovery
-    /// ([`crate::recovery`]'s `is_terminal`) both delegate here, so the two can
-    /// never drift out of sync about what "terminal" means (a delivered answer and
-    /// a recovery no-op must agree on the same set).
-    ///
-    /// **Step 6** (the human inbound gate) adds the `awaiting-inbound-approval`
-    /// terminal here, as a single new arm — this is the one and only place the
-    /// terminal set is enumerated, so that change touches exactly this function.
-    ///
-    /// `AwaitingInboundApproval` is a **parked terminal**: like `AwaitingHumanMerge`
-    /// it is not driven and not advanced by the pump's drive step or by
-    /// crash-recovery. Being in the terminal set makes the crossbridge answer-back
-    /// trigger fire when an inbound issue parks here, so the source peer is answered
-    /// once at the park (spec §1.3, "so a peer is never left waiting"); the
-    /// label-gated resume back into landing is driven separately by the pump's
-    /// approval sweep, not by the drive step (so `is_drivable` stays `false`).
+    /// This is the **single terminal-set definition**; crash-recovery
+    /// ([`crate::recovery`]'s `is_terminal`) delegates here.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Phase::Merged
-                | Phase::PrOpen
-                | Phase::AwaitingHumanMerge
-                | Phase::AwaitingInboundApproval
-                | Phase::OrchestratorError
+            Phase::Merged | Phase::PrOpen | Phase::AwaitingHumanMerge | Phase::OrchestratorError
         )
     }
 }
@@ -211,26 +183,6 @@ str_enum! {
         /// `landing`: the PR has been created.
         PrCreated => "pr_created",
 
-        // --- crossbridge answer-back (spec §1.3/§1.4) ---
-        //
-        // These substates ride a TERMINAL phase: an `xb:inbound` issue that has
-        // reached `Merged`/`PrOpen`/`AwaitingHumanMerge`/`OrchestratorError`
-        // carries one of these to track delivery of its worked result back to the
-        // originating peer. Authority is this column, NEVER the `xb-status:*`
-        // crosslink label (review B5 — that label is written incoherently by
-        // three crossbridge binaries and is a courtesy mirror only).
-        /// answer-back: the result is gathered and ready to send, but no
-        /// `SubmitAnswer` has succeeded yet — the pump's answer sweep delivers it.
-        AnswerPending => "answer_pending",
-        /// answer-back: the `SubmitAnswer` round-trip succeeded — TERMINAL for the
-        /// answer machine (recovery no-ops it; crossbridge source-side dedup means
-        /// even a stray re-send would not double-answer).
-        AnswerSent => "answer_sent",
-        /// answer-back: the source peer could not be reached (offline / stalled /
-        /// wire failure). A **degraded, non-terminal** waiting state — retried on
-        /// poll ticks, rate-limited and bounded; a `--kind blocker` stands on the
-        /// issue for human attention while it waits.
-        AnswerUnreachable => "answer_unreachable",
     }
 }
 
@@ -284,23 +236,18 @@ str_enum! {
 /// migration; an existing version is never rewritten.
 ///
 /// - v1 — the initial four-table set ([`MIGRATION_V1`]).
-/// - v2 — adds `issues.answer_attempts` ([`MIGRATION_V2`]), the durable retry
-///   counter the crossbridge answer-back state machine bounds against
-///   (`.design/swarm-kickoff-spec.md` §1.3).
-/// - v3 — adds `issues.landing_change` ([`MIGRATION_V3`]), the durable
-///   converged-change handle an `xb:inbound` issue parked at
-///   `awaiting-inbound-approval` (REQ-SWARM-1) is landed from once a human
-///   approves it — persisted so the label-gated resume survives a restart.
+/// - v2 — adds `issues.answer_attempts` ([`MIGRATION_V2`]). Unused since the
+///   removal of the federation machinery; the column is kept so existing databases stay valid.
+/// - v3 — adds `issues.landing_change` ([`MIGRATION_V3`]). Unused since the
+///   removal of the federation machinery; the column is kept so existing databases stay valid.
 const SCHEMA_VERSION: u32 = 3;
 
 /// How long a connection waits out a transient SQLite lock before giving up
 /// (D7). Applied to **both** openers:
 ///
-/// - [`StateDb::open`] — the pump's **writer**. A second sanctioned writer now
-///   exists (the embedded crossbridge server writes `.crosslink/issues.db`, and
-///   this machine writes `state.db` from the same process), and a `state.db`
-///   WAL checkpoint can briefly take an exclusive lock; without a busy_timeout a
-///   momentary lock would surface as `SQLITE_BUSY` and fail a write mid-tick.
+/// - [`StateDb::open`] — the pump's **writer**. A `state.db` WAL checkpoint can
+///   briefly take an exclusive lock; without a busy_timeout a momentary lock
+///   would surface as `SQLITE_BUSY` and fail a write mid-tick.
 /// - [`StateDb::open_read_only`] — the `vetinari` query CLI (§2.2), so a
 ///   momentary exclusive lock never fails a read mid-query.
 ///
@@ -375,43 +322,16 @@ CREATE TABLE events (
 );
 "#;
 
-/// Schema v2 — the crossbridge answer-back retry counter
-/// (`.design/swarm-kickoff-spec.md` §1.3). Adds one column to `issues`:
-/// `answer_attempts`, the count of `SubmitAnswer` delivery attempts that have
-/// failed for an `xb:inbound` issue. It is the durable bound the
-/// `answer_unreachable` retry loop checks so a permanently-offline peer can
-/// never make the sweep spin — after the bound is hit the issue REMAINS
-/// `answer_unreachable` (blocker standing) rather than being retried forever.
-///
-/// The paired rate-limit clock reuses the existing `updated_at` column rather
-/// than adding a second timestamp: once an inbound issue is terminal the answer
-/// sweep is its *sole* writer, so every `set_phase_substate` /
-/// `record_answer_unreachable` stamp of `updated_at` IS the last-attempt time,
-/// and a separate column would only duplicate it. `answer_attempts` has no such
-/// existing home, so it earns a column.
-///
-/// `ALTER TABLE … ADD COLUMN … DEFAULT 0` is a metadata-only change: existing
-/// rows read back `0` with no table rewrite (forward-only, REQ-2).
+/// Schema v2 — adds `issues.answer_attempts` (retry counter of the removed
+/// answer-back machine). The column is no longer read or written;
+/// the migration stays because schema versions are forward-only.
 const MIGRATION_V2: &str = r#"
 ALTER TABLE issues ADD COLUMN answer_attempts INTEGER NOT NULL DEFAULT 0;
 "#;
 
-/// Schema v3 — the durable converged-change handle for the inbound human-gate
-/// (`.design/swarm-kickoff-spec.md` §1.2, REQ-SWARM-1). Adds one **nullable**
-/// column to `issues`: `landing_change`, the resolved jj change/commit id of the
-/// reviewed change an `xb:inbound` issue converged on.
-///
-/// It is written the moment the approval gate parks a converged inbound issue at
-/// `awaiting-inbound-approval` (the Implementer workspace is already forgotten by
-/// then, so the reviewed change can no longer be re-derived from a workspace) and
-/// read back when a human's `inbound-approved:land` label resumes it — so the pump
-/// lands **exactly the reviewed change the human approved**, never a fresh
-/// re-implementation, and the approval survives an orchestrator restart while
-/// parked. `NULL` for every non-inbound issue and every inbound issue that has not
-/// yet parked for approval.
-///
-/// `ALTER TABLE … ADD COLUMN` with no `NOT NULL`/default is a metadata-only change:
-/// existing rows read back `NULL` with no table rewrite (forward-only, REQ-2).
+/// Schema v3 — adds the nullable `issues.landing_change` (converged-change handle
+/// of the removed inbound approval gate). The column is no longer read or
+/// written; the migration stays because schema versions are forward-only.
 const MIGRATION_V3: &str = r#"
 ALTER TABLE issues ADD COLUMN landing_change TEXT;
 "#;
@@ -448,19 +368,6 @@ pub struct IssueRow {
     pub landing_retry_count: i64,
     /// Unix seconds of the last update to this row.
     pub updated_at: i64,
-    /// Number of failed crossbridge `SubmitAnswer` delivery attempts for an
-    /// `xb:inbound` issue (spec §1.3). `0` for every non-inbound issue. The
-    /// `answer_unreachable` retry loop is bounded against this; paired with
-    /// [`updated_at`](Self::updated_at) (the last-attempt clock) it rate-limits
-    /// and caps the retry so a permanently-offline peer never makes the sweep
-    /// spin.
-    pub answer_attempts: i64,
-    /// The resolved jj change/commit id an `xb:inbound` issue converged on, stored
-    /// when the approval gate parks it at `awaiting-inbound-approval` (REQ-SWARM-1)
-    /// so the label-gated resume lands **exactly that reviewed change** (never a
-    /// fresh re-implementation) even across an orchestrator restart. `None` for
-    /// every non-inbound issue and every inbound issue not yet parked for approval.
-    pub landing_change: Option<String>,
 }
 
 impl IssueRow {
@@ -477,8 +384,6 @@ impl IssueRow {
             last_diff_hash: None,
             landing_retry_count: 0,
             updated_at: now_unix(),
-            answer_attempts: 0,
-            landing_change: None,
         }
     }
 }
@@ -553,8 +458,7 @@ pub struct EventRow {
 // ============================================================================
 
 const ISSUE_COLUMNS: &str = "issue_id, phase, phase_substate, round, convergence_mode, \
-     empty_round_streak, last_diff_hash, landing_retry_count, updated_at, answer_attempts, \
-     landing_change";
+     empty_round_streak, last_diff_hash, landing_retry_count, updated_at";
 
 const WORKER_COLUMNS: &str = "worker_uuid, issue_id, role, round, workspace_path, pid, \
      spawned_at, last_heartbeat";
@@ -586,10 +490,9 @@ impl StateDb {
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(open_err(path))?;
         // D7: the writer sets a busy_timeout too, not only the read-only opener.
-        // A second sanctioned writer now shares this process (the embedded
-        // crossbridge server writes `.crosslink/issues.db`), and a `state.db` WAL
-        // checkpoint can briefly hold an exclusive lock; without this a momentary
-        // lock would surface as `SQLITE_BUSY` and fail a write mid-tick.
+        // A `state.db` WAL checkpoint can briefly hold an exclusive lock; without
+        // this a momentary lock would surface as `SQLITE_BUSY` and fail a write
+        // mid-tick.
         conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))
             .map_err(open_err(path))?;
         let mut db = StateDb { conn };
@@ -718,9 +621,8 @@ impl StateDb {
             .execute(
                 "INSERT INTO issues
                    (issue_id, phase, phase_substate, round, convergence_mode,
-                    empty_round_streak, last_diff_hash, landing_retry_count, updated_at,
-                    answer_attempts, landing_change)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    empty_round_streak, last_diff_hash, landing_retry_count, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(issue_id) DO UPDATE SET
                    phase               = excluded.phase,
                    phase_substate      = excluded.phase_substate,
@@ -729,9 +631,7 @@ impl StateDb {
                    empty_round_streak  = excluded.empty_round_streak,
                    last_diff_hash      = excluded.last_diff_hash,
                    landing_retry_count = excluded.landing_retry_count,
-                   updated_at          = excluded.updated_at,
-                   answer_attempts     = excluded.answer_attempts,
-                   landing_change      = excluded.landing_change",
+                   updated_at          = excluded.updated_at",
                 params![
                     issue.issue_id,
                     issue.phase,
@@ -742,8 +642,6 @@ impl StateDb {
                     issue.last_diff_hash,
                     issue.landing_retry_count,
                     issue.updated_at,
-                    issue.answer_attempts,
-                    issue.landing_change,
                 ],
             )
             .map_err(query_err("upsert issue"))?;
@@ -792,119 +690,6 @@ impl StateDb {
             )
             .map_err(query_err("set issue phase"))?;
         Ok(())
-    }
-
-    /// Update only an issue's `phase_substate` (leaving its terminal `phase`
-    /// intact), stamping `updated_at` to now — the crossbridge answer-back write
-    /// (spec §1.3).
-    ///
-    /// [`set_phase`](Self::set_phase) always rewrites `phase`; the answer machine
-    /// must NOT, because the answer substate rides an already-terminal phase
-    /// (`Merged`/`PrOpen`/…). This is the trigger's `answer_pending` write and the
-    /// success path's `answer_sent` write. The `updated_at` stamp doubles as the
-    /// retry-rate-limit clock (see [`IssueRow::answer_attempts`]).
-    pub fn set_phase_substate(
-        &self,
-        issue_id: &str,
-        substate: Option<PhaseSubstate>,
-    ) -> Result<(), StateError> {
-        self.conn
-            .execute(
-                "UPDATE issues SET phase_substate = ?1, updated_at = ?2 WHERE issue_id = ?3",
-                params![substate.map(|s| s.as_str()), now_unix(), issue_id],
-            )
-            .map_err(query_err("set issue phase_substate"))?;
-        Ok(())
-    }
-
-    /// Persist the converged-change handle an `xb:inbound` issue is parked on at
-    /// `awaiting-inbound-approval` (REQ-SWARM-1), stamping `updated_at` to now.
-    ///
-    /// Written the moment the approval gate parks the issue — **before** its phase
-    /// is flipped to `awaiting-inbound-approval` — so the reviewed change is durable
-    /// the instant the issue is observably parked, and the label-gated resume can
-    /// always land exactly it (even after an orchestrator restart). A targeted
-    /// `UPDATE` (not an `upsert_issue`) so it never disturbs the row's other
-    /// columns, and `phase`/`phase_substate` here are intentionally left untouched.
-    pub fn set_landing_change(&self, issue_id: &str, change: &str) -> Result<(), StateError> {
-        self.conn
-            .execute(
-                "UPDATE issues SET landing_change = ?1, updated_at = ?2 WHERE issue_id = ?3",
-                params![change, now_unix(), issue_id],
-            )
-            .map_err(query_err("set landing change"))?;
-        Ok(())
-    }
-
-    /// Record a failed answer delivery: increment `answer_attempts`, set the
-    /// substate to `answer_unreachable`, and stamp `updated_at` to now — all in
-    /// one write. Returns the new attempt count (the bound is checked against it).
-    ///
-    /// The terminal `phase` is left untouched (the answer substate rides it). The
-    /// stamped `updated_at` is the last-attempt clock the sweep's rate-limit reads.
-    pub fn record_answer_unreachable(&self, issue_id: &str) -> Result<i64, StateError> {
-        self.conn
-            .execute(
-                "UPDATE issues
-                   SET answer_attempts = answer_attempts + 1,
-                       phase_substate  = ?1,
-                       updated_at      = ?2
-                 WHERE issue_id = ?3",
-                params![
-                    PhaseSubstate::AnswerUnreachable.as_str(),
-                    now_unix(),
-                    issue_id
-                ],
-            )
-            .map_err(query_err("record answer unreachable"))?;
-        self.conn
-            .query_row(
-                "SELECT answer_attempts FROM issues WHERE issue_id = ?1",
-                params![issue_id],
-                |r| r.get(0),
-            )
-            .map_err(query_err("read answer_attempts"))
-    }
-
-    /// Retire an inbound issue's answer as **permanently undeliverable**: set
-    /// `answer_unreachable` and raise `answer_attempts` to at least `attempts_floor`
-    /// in one write, stamping `updated_at`. Returns the resulting attempt count.
-    ///
-    /// Unlike [`record_answer_unreachable`](Self::record_answer_unreachable) (a
-    /// transient peer outage that is retried), this is for a failure a retry can
-    /// **never** fix — e.g. an `xb-source:` slug that is not a valid crossbridge
-    /// slug, so no socket path can be formed. Forcing the attempt count to the
-    /// bound makes the sweep's `MAX_ANSWER_ATTEMPTS` guard park it immediately with
-    /// its blocker standing, rather than burning a dozen doomed retry ticks. The
-    /// `MAX(...)` floor keeps the write idempotent (a re-run never lowers the
-    /// count). The terminal `phase` is left untouched (the substate rides it).
-    pub fn retire_answer_unreachable(
-        &self,
-        issue_id: &str,
-        attempts_floor: i64,
-    ) -> Result<i64, StateError> {
-        self.conn
-            .execute(
-                "UPDATE issues
-                   SET answer_attempts = MAX(answer_attempts, ?1),
-                       phase_substate  = ?2,
-                       updated_at      = ?3
-                 WHERE issue_id = ?4",
-                params![
-                    attempts_floor,
-                    PhaseSubstate::AnswerUnreachable.as_str(),
-                    now_unix(),
-                    issue_id
-                ],
-            )
-            .map_err(query_err("retire answer unreachable"))?;
-        self.conn
-            .query_row(
-                "SELECT answer_attempts FROM issues WHERE issue_id = ?1",
-                params![issue_id],
-                |r| r.get(0),
-            )
-            .map_err(query_err("read answer_attempts"))
     }
 
     // --- active workers -----------------------------------------------------
@@ -1205,8 +990,6 @@ fn map_issue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IssueRow> {
         last_diff_hash: row.get(6)?,
         landing_retry_count: row.get(7)?,
         updated_at: row.get(8)?,
-        answer_attempts: row.get(9)?,
-        landing_change: row.get(10)?,
     })
 }
 
@@ -1389,67 +1172,6 @@ mod tests {
         // Clearing the substate back to NULL must also work.
         db.set_phase("#1", Phase::Merged, None).unwrap();
         assert_eq!(db.get_issue("#1").unwrap().unwrap().phase_substate, None);
-    }
-
-    #[test]
-    fn answer_setters_track_substate_and_attempts_without_touching_phase() {
-        let (_dir, db) = temp_db();
-        // An inbound issue that reached a terminal phase (Merged) — the answer
-        // machine only ever writes its substate/attempts, never its phase.
-        db.upsert_issue(&IssueRow::new("5", Phase::Merged)).unwrap();
-
-        // Trigger: mark answer_pending. Phase stays Merged.
-        db.set_phase_substate("5", Some(PhaseSubstate::AnswerPending))
-            .unwrap();
-        let row = db.get_issue("5").unwrap().unwrap();
-        assert_eq!(row.phase, Phase::Merged);
-        assert_eq!(row.phase_substate.as_deref(), Some("answer_pending"));
-        assert_eq!(row.answer_attempts, 0);
-
-        // A failed delivery: attempts climb, substate flips to unreachable, phase
-        // is still Merged.
-        assert_eq!(db.record_answer_unreachable("5").unwrap(), 1);
-        assert_eq!(db.record_answer_unreachable("5").unwrap(), 2);
-        let row = db.get_issue("5").unwrap().unwrap();
-        assert_eq!(row.phase, Phase::Merged);
-        assert_eq!(row.phase_substate.as_deref(), Some("answer_unreachable"));
-        assert_eq!(row.answer_attempts, 2);
-
-        // Success: substate → answer_sent (attempts untouched), phase intact.
-        db.set_phase_substate("5", Some(PhaseSubstate::AnswerSent))
-            .unwrap();
-        let row = db.get_issue("5").unwrap().unwrap();
-        assert_eq!(row.phase, Phase::Merged);
-        assert_eq!(row.phase_substate.as_deref(), Some("answer_sent"));
-        assert_eq!(row.answer_attempts, 2);
-    }
-
-    #[test]
-    fn set_landing_change_persists_the_converged_handle_without_touching_phase() {
-        let (_dir, db) = temp_db();
-        // A converged inbound issue about to park for approval (REQ-SWARM-1).
-        db.upsert_issue(&IssueRow::new("7", Phase::Converged))
-            .unwrap();
-        assert_eq!(db.get_issue("7").unwrap().unwrap().landing_change, None);
-
-        // The gate stores the reviewed change, then (separately) parks the phase.
-        db.set_landing_change("7", "zzqqrr").unwrap();
-        let row = db.get_issue("7").unwrap().unwrap();
-        assert_eq!(row.landing_change.as_deref(), Some("zzqqrr"));
-        assert_eq!(
-            row.phase,
-            Phase::Converged,
-            "the setter must not move phase"
-        );
-
-        // Parking the phase leaves the stored change intact (set_phase is a
-        // targeted UPDATE that never clears landing_change) — so the resume can
-        // still find the reviewed change.
-        db.set_phase("7", Phase::AwaitingInboundApproval, None)
-            .unwrap();
-        let row = db.get_issue("7").unwrap().unwrap();
-        assert_eq!(row.phase, Phase::AwaitingInboundApproval);
-        assert_eq!(row.landing_change.as_deref(), Some("zzqqrr"));
     }
 
     #[test]
