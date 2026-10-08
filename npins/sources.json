@@ -4,13 +4,13 @@
       "type": "Git",
       "repository": {
         "type": "GitHub",
-        "owner": "forecast-bio",
+        "owner": "Corvidae-Coding-Projects",
         "repo": "crosslink"
       },
-      "branch": "develop",
+      "branch": "main",
       "submodules": false,
       "revision": "dbbe2ed34748e55eea41dfc843137b1863738b27",
-      "url": "https://github.com/forecast-bio/crosslink/archive/dbbe2ed34748e55eea41dfc843137b1863738b27.tar.gz",
+      "url": "https://github.com/Corvidae-Coding-Projects/crosslink/archive/dbbe2ed34748e55eea41dfc843137b1863738b27.tar.gz",
       "hash": "sha256-j4UxCRCUm7b4BgtptlbuR4REnW1nE4mEHfJYPCWVqsI="
     },
     "nixpkgs": {

@@ -49,8 +49,8 @@ in
       # dependency to `$JJ_SRC/lib` so the orchestrator links the *exact* same
       # jj version the workers drive via the `jj` CLI (REQ-1, REQ-1c).
       JJ_SRC = "${pkgs.jujutsu.src}";
-      # Source tree of the npins-pinned crosslink (forecast-bio/crosslink,
-      # `develop`). `just bootstrap` symlinks this to `.crosslink-src` so the
+      # Source tree of the npins-pinned crosslink (Corvidae-Coding-Projects/crosslink,
+      # `main`). `just bootstrap` symlinks this to `.crosslink-src` so the
       # `crosslink_api` insulation crate can path-depend on the `crosslink`
       # library crate (REQ-1, REQ-3a). Bump with `npins update crosslink`.
       CROSSLINK_SRC = "${sources.crosslink}";
